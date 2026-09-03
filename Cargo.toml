@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/service-calendar",
+    "crates/app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+calendarchy-core = { path = "crates/core" }
+calendarchy-service-calendar = { path = "crates/service-calendar" }
+
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }

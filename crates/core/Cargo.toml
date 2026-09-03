@@ -1,0 +1,15 @@
+[package]
+name = "calendarchy-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+tokio.workspace = true
+rusqlite.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true

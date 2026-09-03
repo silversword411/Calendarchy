@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Calendarchy
+GenericName=Calendar
+Comment=Multi-account Google Calendar client for Omarchy
+Exec=calendarchy
+Icon=org.calendarchy.Calendarchy
+Terminal=false
+Categories=Office;Calendar;GTK;
+StartupNotify=true
+StartupWMClass=org.calendarchy.Calendarchy

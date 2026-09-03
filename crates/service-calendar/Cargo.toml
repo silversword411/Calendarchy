@@ -1,0 +1,12 @@
+[package]
+name = "calendarchy-service-calendar"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+calendarchy-core.workspace = true
+async-trait.workspace = true
+rusqlite.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+chrono.workspace = true
