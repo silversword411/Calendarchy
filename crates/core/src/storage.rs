@@ -63,6 +63,12 @@ fn migrate_core(conn: &Connection) -> anyhow::Result<()> {
             enabled_at      TEXT NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY (account_id, service_type)
         );
+
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key         TEXT PRIMARY KEY,
+            value       TEXT NOT NULL,
+            updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
         "#,
     )?;
     Ok(())
@@ -78,12 +84,13 @@ mod tests {
         let table_count: i64 = storage
             .with_conn(|conn| {
                 Ok(conn.query_row(
-                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('accounts', 'account_services')",
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' \
+                     AND name IN ('accounts', 'account_services', 'app_settings')",
                     [],
                     |row| row.get(0),
                 )?)
             })
             .expect("query");
-        assert_eq!(table_count, 2);
+        assert_eq!(table_count, 3);
     }
 }

@@ -15,7 +15,7 @@ calendarchy-core = { path = "crates/core" }
 calendarchy-service-calendar = { path = "crates/service-calendar" }
 
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "process", "sync"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 anyhow = "1"
 thiserror = "1"

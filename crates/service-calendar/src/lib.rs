@@ -1,6 +1,14 @@
 use async_trait::async_trait;
-use calendarchy_core::{Service, ServiceContext, ServiceKind};
+use calendarchy_core::{GoogleOAuthConfig, Service, ServiceContext, ServiceKind};
 use rusqlite::Connection;
+
+use google_api::{GoogleApiError, GoogleCalendarClient};
+use token_provider::KeyringAccessTokenProvider;
+
+pub mod google_api;
+pub mod query;
+mod storage;
+mod token_provider;
 
 /// The Calendar `Service`: the first (and for v1, only) implementation of the
 /// account/service split in DESIGN_SPEC.md §6. Owns the `calendars`, `events`,
@@ -17,6 +25,73 @@ impl CalendarService {
 impl Default for CalendarService {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl CalendarService {
+    fn client_for(&self, ctx: &ServiceContext) -> anyhow::Result<GoogleCalendarClient> {
+        let oauth_config = GoogleOAuthConfig::from_env()?;
+        let provider = KeyringAccessTokenProvider::new(ctx.account_id, ctx.keyring.clone(), oauth_config);
+        Ok(GoogleCalendarClient::new(Box::new(provider)))
+    }
+
+    /// Runs one incremental (or, on a first sync / expired sync token, full) sync
+    /// pass for a single calendar, paging through results and persisting the new
+    /// `syncToken` once the last page has been fetched (DESIGN_SPEC.md §9).
+    async fn sync_one_calendar(
+        &self,
+        ctx: &ServiceContext,
+        client: &GoogleCalendarClient,
+        calendar_row_id: i64,
+        google_calendar_id: &str,
+    ) -> anyhow::Result<()> {
+        let mut sync_token = ctx
+            .storage
+            .with_conn(|conn| storage::load_sync_token(conn, ctx.account_id, calendar_row_id))?;
+        let mut page_token: Option<String> = None;
+        let mut final_sync_token: Option<String> = None;
+        let mut retried_after_expired_token = false;
+
+        loop {
+            let page = match client
+                .list_events(google_calendar_id, sync_token.as_deref(), page_token.as_deref())
+                .await
+            {
+                Ok(page) => page,
+                Err(GoogleApiError::SyncTokenExpired) if !retried_after_expired_token => {
+                    tracing::warn!(
+                        calendar_id = calendar_row_id,
+                        "sync token expired, falling back to a full resync"
+                    );
+                    sync_token = None;
+                    page_token = None;
+                    retried_after_expired_token = true;
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
+
+            ctx.storage.with_conn(|conn| {
+                for event in &page.items {
+                    storage::upsert_event(conn, calendar_row_id, event)?;
+                }
+                Ok(())
+            })?;
+
+            if page.next_sync_token.is_some() {
+                final_sync_token = page.next_sync_token;
+            }
+            match page.next_page_token {
+                Some(next) => page_token = Some(next),
+                None => break,
+            }
+        }
+
+        if let Some(token) = final_sync_token {
+            ctx.storage
+                .with_conn(|conn| storage::store_sync_token(conn, ctx.account_id, calendar_row_id, &token))?;
+        }
+        Ok(())
     }
 }
 
@@ -93,14 +168,27 @@ impl Service for CalendarService {
     }
 
     async fn on_enabled(&self, ctx: &ServiceContext) -> anyhow::Result<()> {
-        // First-run calendar list fetch + initial full sync lands with the Google
-        // Calendar API client (DESIGN_SPEC.md §9, roadmap phase 1).
-        tracing::info!(account_id = ctx.account_id.0, "calendar service enabled, sync not yet implemented");
+        let client = self.client_for(ctx)?;
+        let calendars = client.list_calendars().await?;
+
+        ctx.storage.with_conn(|conn| {
+            for entry in &calendars {
+                storage::upsert_calendar(conn, ctx.account_id, entry)?;
+            }
+            Ok(())
+        })?;
+
+        tracing::info!(account_id = ctx.account_id.0, count = calendars.len(), "fetched calendar list");
         Ok(())
     }
 
     async fn sync(&self, ctx: &ServiceContext) -> anyhow::Result<()> {
-        tracing::debug!(account_id = ctx.account_id.0, "calendar sync tick, no-op until API client lands");
+        let client = self.client_for(ctx)?;
+        let calendars = ctx.storage.with_conn(|conn| storage::list_calendar_ids(conn, ctx.account_id))?;
+
+        for (calendar_row_id, google_calendar_id) in calendars {
+            self.sync_one_calendar(ctx, &client, calendar_row_id, &google_calendar_id).await?;
+        }
         Ok(())
     }
 

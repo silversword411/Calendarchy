@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use rusqlite::Connection;
 
 use crate::account::AccountId;
+use crate::keyring::Keyring;
 use crate::storage::Storage;
 
 /// Identifies a pluggable capability an account can provide. New services are added
@@ -36,9 +37,12 @@ impl fmt::Display for ServiceKind {
 }
 
 /// Everything a `Service` needs to act on behalf of one (account, service) pair.
+/// `keyring` is here (rather than each service reaching for its own) because every
+/// OAuth-based service needs the same account-scoped token lookup/refresh dance.
 pub struct ServiceContext {
     pub account_id: AccountId,
     pub storage: Storage,
+    pub keyring: Arc<dyn Keyring>,
 }
 
 /// A pluggable account capability (Calendar today; Contacts/Notes/Tasks are meant to

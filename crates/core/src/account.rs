@@ -71,6 +71,18 @@ impl AccountManager {
         &self.keyring
     }
 
+    /// Builds the `ServiceContext` a `Service` needs to act on behalf of one account.
+    /// Used by callers driving `Service::on_enabled`/`sync` directly — e.g. right
+    /// after `enable_service`, or from the per-(account, service) sync loop
+    /// (DESIGN_SPEC.md §9).
+    pub fn service_context(&self, account_id: AccountId) -> crate::service::ServiceContext {
+        crate::service::ServiceContext {
+            account_id,
+            storage: self.storage.clone(),
+            keyring: self.keyring.clone(),
+        }
+    }
+
     /// Register a new account identity. Does not enable any service — the caller
     /// (the "Add Google Account" flow, once §7's OAuth exchange completes) enables
     /// whichever services the user asked for via `enable_service`.
@@ -126,11 +138,11 @@ impl AccountManager {
     /// data, the keyring entry is dropped, then the account row itself (cascading to
     /// `account_services`) is deleted. Google-side token revocation happens in the
     /// OAuth layer (§7), which calls this after a successful revoke.
-    pub fn remove_account(&self, account_id: AccountId) -> anyhow::Result<()> {
+    pub async fn remove_account(&self, account_id: AccountId) -> anyhow::Result<()> {
         for kind in self.enabled_services(account_id)? {
             self.disable_service(account_id, kind)?;
         }
-        self.keyring.delete_tokens(account_id)?;
+        self.keyring.delete_tokens(account_id).await?;
         self.storage.with_conn(|conn| {
             conn.execute("DELETE FROM accounts WHERE id = ?1", [account_id.0])?;
             Ok(())
@@ -176,6 +188,7 @@ impl AccountManager {
             let ctx = crate::service::ServiceContext {
                 account_id,
                 storage: self.storage.clone(),
+                keyring: self.keyring.clone(),
             };
             service.on_disabled(&ctx)?;
         }
@@ -211,8 +224,8 @@ mod tests {
         AccountManager::new(storage, registry, keyring)
     }
 
-    #[test]
-    fn add_list_and_remove_account() {
+    #[tokio::test]
+    async fn add_list_and_remove_account() {
         let mgr = manager();
         let id = mgr
             .add_account(Provider::Google, "jane@gmail.com", Some("Jane"), None)
@@ -223,7 +236,7 @@ mod tests {
         assert_eq!(accounts[0].id, id);
         assert_eq!(accounts[0].email, "jane@gmail.com");
 
-        mgr.remove_account(id).expect("remove");
+        mgr.remove_account(id).await.expect("remove");
         assert!(mgr.list_accounts().expect("list").is_empty());
     }
 
