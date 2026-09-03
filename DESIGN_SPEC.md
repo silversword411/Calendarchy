@@ -26,17 +26,18 @@ Calendarchy is a native, offline-capable calendar client for Omarchy Linux. It a
 ## 2. Non-Goals (v1)
 
 - **CalDAV, Outlook, or other providers.** Google Calendar only for account-based sync. The account/sync layer is written so this isn't foreclosed later, but it's not in scope now. (One narrow exception: read-only ICS-URL calendar subscriptions, §11 — not a provider integration, since it involves no account, no OAuth, and no write support.)
-- **True real-time push.** See §9 — this would require a hosted relay service, which is explicitly deferred (§19).
+- **True real-time push.** See §9 — this would require a hosted relay service, which is explicitly deferred (§20).
 - **Mobile companion app.**
 - **Calendar administration** (creating shared calendars, managing ACLs/sharing permissions with other people). Users can still do this in the Google web UI; Calendarchy consumes calendars, it doesn't administer them.
-- **Deep recurring-event editing UI** beyond what's needed for basic "this event / all events / this and following" edits (see §19 for why this is hard).
-- **Google Workspace smart features** (auto-detected events from Gmail, smart chip suggestions, out-of-office/working-hours insights). These are computed by Google's own backend against broader Workspace scopes (Gmail, Drive) this app deliberately doesn't request, and aren't exposed through the Calendar API a pure-calendar client consumes (§11).
+- **Deep recurring-event editing UI** beyond what's needed for basic "this event / all events / this and following" edits (see §20 for why this is hard).
+- **Google Workspace smart features** (auto-detected events from Gmail, smart chip suggestions, out-of-office/working-hours insights). These are computed by Google's own backend against broader Workspace scopes (Gmail, Drive) this app deliberately doesn't request, and aren't exposed through the Calendar API a pure-calendar client consumes (§12).
+- **Booking pages.** Google Workspace's appointment-scheduling links are a scheduling product layered on top of Calendar, not a calendar-viewing/editing capability — no booking-page creation or management (§10).
 
 ## 3. Target Platform
 
 - **Omarchy v4 "Quattro"** (Quickshell-based shell) — released Aug 2026. Quattro replaced the previous Waybar + Mako + Walker + SwayOSD stack with a single long-running Quickshell process (bar, launcher, notification center, OSDs, lock screen, polkit agent) exposed over an IPC-scriptable interface. This design targets Quattro, not the legacy stack.
 - **Hyprland** as the compositor (Wayland).
-- **Arch Linux**, distributed as an AUR package (§15).
+- **Arch Linux**, distributed as an AUR package (§16).
 - GTK4 + libadwaita for UI, so the app automatically inherits Omarchy's GTK4 theme, accent color, and light/dark mode — no custom theming layer needed.
 
 ## 4. Tech Stack
@@ -93,7 +94,7 @@ Modeled after macOS's Internet Accounts pane: an **account** is just a signed-in
 
 **Account setup UX** mirrors macOS's Internet Accounts: an **Accounts** settings screen lists connected accounts on the left; selecting one shows its available services as toggles — `Calendar` (available, on by default when the account is added), with `Contacts` / `Notes` / `Tasks` shown as **greyed-out "coming soon" toggles** in v1 rather than omitted entirely, so the extensibility is visible in the UI before those services exist. Turning a service on is what triggers that service's OAuth scope request (§7) — a disabled service's scopes are never requested.
 
-**Multi-account behavior** (still true regardless of the above): every connected account can have several calendars (primary, secondary, shared-with-me), each with an assigned display color, user-overridable. The main view is a **unified agenda/calendar** overlaying all enabled calendars from all accounts with Calendar enabled, similar to how the Google Calendar PWA lets you toggle calendars on/off in a sidebar. An account switcher lists each connected account with an avatar/initial and a "Remove account" action. Adding a second, third, etc. account repeats the same OAuth flow (§7); nothing about the flow is account-count-aware.
+**Multi-account behavior** (still true regardless of the above): every connected account can have several calendars (primary, secondary, shared-with-me), each with an assigned display color, user-overridable via the sidebar color picker (§10). The main view is a **unified agenda/calendar** overlaying all enabled calendars from all accounts with Calendar enabled, similar to how the Google Calendar PWA lets you toggle calendars on/off in a sidebar. An account switcher lists each connected account with an avatar/initial and a "Remove account" action. Adding a second, third, etc. account repeats the same OAuth flow (§7); nothing about the flow is account-count-aware.
 
 **Why build the split now, not later:** even though v1 only ships the Calendar service, keeping the Account Manager scoped to identity-only (never assuming "account" implies "calendar account") avoids a rewrite when Contacts/Notes/Tasks get added — those become new `Service` implementations sharing the same account/token/keyring plumbing, added incrementally without touching the Account Manager itself.
 
@@ -124,17 +125,17 @@ Rough schema — field lists are illustrative, not exhaustive:
 
 - **`accounts`** — `id`, `google_account_email`, `display_name`, `avatar_url`, `created_at`. Identity only — no service-specific fields. (Tokens live in the OS keyring, keyed by `account.id` — not in this table.)
 - **`account_services`** — `account_id` (FK), `service_type` (`calendar`, and future `contacts`/`notes`/`tasks`), `enabled`, `granted_scopes`, `enabled_at`. Composite PK on `(account_id, service_type)`. This is the join table that makes services independently toggleable per account.
-- **`calendars`** — `id`, `account_id` (FK, **nullable**), `google_calendar_id` (nullable), `source_url` (nullable — set only for ICS-URL calendars, §11), `display_name`, `color`, `is_visible`, `access_role` (owner/writer/reader — controls whether edits are allowed; always `reader` for ICS-URL calendars). Owned by the Calendar service; a future Contacts service would add its own `contacts` table following the same per-service-ownership pattern rather than growing this table. `account_id`/`google_calendar_id` are only null for the ICS-URL case (§11) — every Google-backed calendar still has both.
-- **`events`** — `id`, `calendar_id` (FK), `google_event_id`, `title`, `description`, `location`, `start`, `end`, `all_day`, `recurrence_rule`, `status`, `etag`, `updated_at`.
+- **`calendars`** — `id`, `account_id` (FK, **nullable**), `google_calendar_id` (nullable), `source_url` (nullable — set only for ICS-URL calendars, §11), `display_name`, `color`, `is_visible` (mirrors Google's `calendarList.selected` field, §10), `access_role` (owner/writer/reader — controls whether edits are allowed; always `reader` for ICS-URL calendars). Owned by the Calendar service; a future Contacts service would add its own `contacts` table following the same per-service-ownership pattern rather than growing this table. `account_id`/`google_calendar_id` are only null for the ICS-URL case (§11) — every Google-backed calendar still has both.
+- **`events`** — `id`, `calendar_id` (FK), `google_event_id`, `title`, `description`, `location`, `start`, `end`, `all_day`, `recurrence_rule`, `status`, `self_response_status` (accepted/declined/tentative/needsAction — the signed-in account's own RSVP, read off the event's `attendees[]` array; drives "Show declined events" in §12), `etag`, `updated_at`.
 - **`sync_state`** — `account_id` (FK), `service_type`, `resource_id` (e.g. a specific `calendar_id` for the Calendar service), `sync_token`, `last_synced_at`, `last_full_sync_at`. Keyed so each (account, service, resource) tuple has independent sync state.
 - **`pending_edits`** — `id`, `account_id` (FK), `service_type`, `event_id` (nullable — null for a not-yet-created event), `calendar_id`, `operation` (create/update/delete), `payload` (JSON), `created_at`, `attempt_count`. This is the offline write queue described in §9.
-- **`app_settings`** — `key`, `value` (JSON), `updated_at`. A single key/value table backing the Preferences window (§11) — language/region overrides, time zone display settings, event/view/notification defaults, etc. — so preferences sync with the rest of the app's state instead of living in a separate config file.
+- **`app_settings`** — `key`, `value` (JSON), `updated_at`. A single key/value table backing the Preferences window (§12) — language/region overrides, time zone display settings, event/view/notification defaults, etc. — so preferences sync with the rest of the app's state instead of living in a separate config file.
 
 ## 9. Sync Engine
 
 This section describes the Calendar service's sync engine specifically — per §6, each enabled (account, service) pair gets its own independent instance of the pattern below, so a future Contacts/Notes/Tasks service would follow the same shape without sharing state with Calendar's.
 
-**Why polling, not push:** Google Calendar API's `events.watch` push mechanism only delivers change notifications to a public HTTPS webhook — unlike the Gmail API, which also supports a *pull*-based Cloud Pub/Sub subscription, Calendar API has no such pull option. A purely local, backend-free desktop app has no public endpoint to receive a webhook at, so true push is not achievable without hosting a relay service (deferred — see §19). Instead, Calendarchy uses **cheap, delta-only polling**.
+**Why polling, not push:** Google Calendar API's `events.watch` push mechanism only delivers change notifications to a public HTTPS webhook — unlike the Gmail API, which also supports a *pull*-based Cloud Pub/Sub subscription, Calendar API has no such pull option. A purely local, backend-free desktop app has no public endpoint to receive a webhook at, so true push is not achievable without hosting a relay service (deferred — see §20). Instead, Calendarchy uses **cheap, delta-only polling**.
 
 - **Initial sync** (new account or new calendar becoming visible): a full `events.list` fetch, storing the resulting `nextSyncToken`.
 - **Incremental sync**: subsequent `events.list` calls pass `syncToken`, so Google returns only what changed since last time — cheap enough to poll frequently without hitting quota.
@@ -146,11 +147,13 @@ This section describes the Calendar service's sync engine specifically — per �
 
 ## 10. Calendar UI/UX
 
-- **Views**: Month, Week, Day, and Agenda (list) — matching the core Google Calendar PWA view set.
+- **Left sidebar**: collapsible via a hamburger icon in the headerbar (hides/shows the whole pane, independent of any individual calendar's visibility). Top to bottom: a **Create** button opening the event editor below — its dropdown arrow mirrors Google's quick-create menu, but only the "Event" entry does anything in v1 (Task is greyed out pending the future Tasks service, §6; Appointment schedule and Out of office are Workspace-booking features and out of scope, see below); a **mini-month date navigator** (click a date to jump the main view there, arrows to page months, independent of whichever main view is active); the **World clock** module (§12) directly underneath, when enabled; a **Search for people** box — an ad hoc, non-persistent overlay that looks up a colleague by email and temporarily shows their availability in the main grid without adding anything to a calendar list (contrast with §11's Subscribe to calendar, which does persist); and two collapsible checklists, **My calendars** (this account's own primary/secondary calendars) and **Other calendars** (anything added via §11's Subscribe/Browse/From-URL flows), each row wired to the per-calendar sidebar menu below. **Booking pages** — Google Workspace's appointment-scheduling links — is out of scope; it's a scheduling product layered on top of Calendar, not a calendar-viewing/editing capability (§2).
+- **Views**: Month, Week, Day, Year, and Agenda (list) — matching the core Google Calendar PWA view set — plus a **5-day work week** view (Mon–Fri, Google's "5 days" option). Year is the cheapest of the six to implement: a grid of 12 mini-months for navigation, with no per-event rendering needed.
 - **Event editor**: a libadwaita dialog for title, time (with all-day toggle), location, description, calendar/account picker, and reminder lead time.
 - **Multi-calendar overlay**: all visible calendars render together, color-coded, with a sidebar checklist to toggle visibility per calendar (mirrors the Google Calendar PWA sidebar).
+- **Per-calendar sidebar menu**: each sidebar row's "⋮" menu adds **Display this only** (isolate — flip `selected=true` on this calendar and `false` on every other enabled one) and **Hide from list** (the same visibility flag the checklist checkbox already flips, §8's `is_visible`), both applied via `calendarList.patch`, plus a **color picker**: the fixed palette from `colors().get()` (calendar colors, not event colors) applied via `calendarList.patch({colorId})`, with a "+" custom swatch that sets `backgroundColor`/`foregroundColor` directly instead. **Settings and sharing** opens a per-calendar dialog covering only the in-scope half of what Google's own dialog shows — name, description, notification defaults (§12) — the sharing/ACL half is out of scope per §2 (Calendarchy consumes calendars, it doesn't administer them).
 - **Search**: simple local full-text filter over cached event titles/descriptions/locations (searches the local store, so it works offline too, at the cost of only covering already-synced events).
-- **Keyboard navigation**: arrow keys / vim-style `hjkl` to move between days/weeks, `n` for new event, `/` to search, `1`-`4` to switch views — in keeping with Omarchy's keyboard-driven design ethos.
+- **Keyboard navigation**: arrow keys / vim-style `hjkl` to move between days/weeks, `n` for new event, `/` to search, and Google's own single-letter view shortcuts reused as-is — `D`/`W`/`M`/`Y`/`A`/`X` for Day/Week/Month/Year/Agenda/5-day work week — rather than inventing Calendarchy-specific bindings.
 
 ## 11. Adding Calendars
 
@@ -165,25 +168,25 @@ Google Calendar's own "+ Add calendar" affordance covers four distinct ways of g
 
 A single libadwaita **Preferences** window (`Ctrl+,`, or from the app menu) holds every user-configurable knob that doesn't belong to a specific object (an account, a calendar, an event). It's organized around the same categories Google Calendar's own gear-icon Settings menu exposes, so anyone coming from the PWA finds the same knobs in roughly the same places. Values are stored in the `app_settings` key/value table (§8) rather than a separate config file, so preferences travel with the rest of the app's state.
 
-- **Language and region** — no separate in-app picker in v1. Calendarchy reads the system locale (`$LANG`/`LC_TIME`), the same way it inherits Omarchy's GTK4 theme (§13) rather than shipping its own — UI language, date order, first-day-of-week, and 12h/24h clock all follow whatever the desktop is already set to. An in-app override is future work, only if someone wants the app's language independent of their desktop locale.
+- **Language and region** — no separate in-app picker in v1. Calendarchy reads the system locale (`$LANG`/`LC_TIME`), the same way it inherits Omarchy's GTK4 theme (§14) rather than shipping its own — UI language, date order, first-day-of-week, and 12h/24h clock all follow whatever the desktop is already set to. An in-app override is future work, only if someone wants the app's language independent of their desktop locale.
 - **Time zone** — defaults to the system time zone (`/etc/localtime`) for both the calendar grid and new-event creation. A secondary "display time zone" can be set here, which adds a second time gutter to Week/Day views (§10) — useful for scheduling across zones without changing every event's zone. Per-event zone override still lives in the event editor (§10), independent of this default.
-- **World clock** — an opt-in sidebar module (off by default) listing a user-picked set of cities/zones as small clocks next to the calendar grid, mirroring Google Calendar's World Clock panel. A nice-to-have that doesn't gate any phase — picked up opportunistically alongside the other polish-phase items in §18.
-- **Event settings** — defaults applied by the event editor (§10) when creating a new event: default duration (e.g. 30/60 min), default calendar (which account+calendar a quick-add lands in), and default reminder lead time (feeds §12's Notification Scheduler unless overridden per-event). No "speedy meetings" auto-shortening or other Workspace-side event defaults — those are computed server-side by Google's own client (see Google Workspace smart features, below).
-- **Notification settings** — global defaults layered under the per-event lead time in the editor: desktop-notification on/off per calendar (mute a noisy calendar without disabling its sync), a notification sound toggle, and the default lead time used when an event doesn't specify its own. The delivery mechanism itself is §12.
-- **View options** — default view on launch (Month/Week/Day/Agenda, §10), density (comfortable/compact row height), whether weekends are shown, and whether declined events are shown/dimmed in the grid. Start-of-week here is a per-app override of the region default above, matching Google Calendar's own split between region-implied and explicitly-set start day.
-- **Google Workspace smart features** — explicitly **not implemented** (§2). Google's smart features are computed by Google's own backend against broader Workspace scopes (Gmail, Drive) this app deliberately doesn't request, kept as narrow as each service's actual usage needs (§14), and aren't exposed through the Calendar API a pure-calendar client consumes. Tracked as a non-goal rather than a setting with no effect.
+- **World clock** — an opt-in sidebar module (off by default) listing a user-picked set of cities/zones as small clocks directly under the sidebar's mini-month date navigator (§10), mirroring Google Calendar's World Clock panel. A nice-to-have that doesn't gate any phase — picked up opportunistically alongside the other polish-phase items in §19.
+- **Event settings** — defaults applied by the event editor (§10) when creating a new event: default duration (e.g. 30/60 min), default calendar (which account+calendar a quick-add lands in), and default reminder lead time (feeds §13's Notification Scheduler unless overridden per-event). No "speedy meetings" auto-shortening or other Workspace-side event defaults — those are computed server-side by Google's own client (see Google Workspace smart features, below).
+- **Notification settings** — global defaults layered under the per-event lead time in the editor: desktop-notification on/off per calendar (mute a noisy calendar without disabling its sync), a notification sound toggle, and the default lead time used when an event doesn't specify its own. The delivery mechanism itself is §13.
+- **View options** — default view on launch (any view from §10, including Year and the 5-day work week), density (comfortable/compact row height), **Show weekends**, and **Show declined events** (dimmed rather than hidden, driven by the new `self_response_status` field on `events`, §8). **Show completed tasks** appears in the same list but greyed out — "coming soon," the same treatment §6 gives the Contacts/Notes/Tasks service toggles — until the Tasks service actually exists to supply completed-task data. Start-of-week here is a per-app override of the region default above, matching Google Calendar's own split between region-implied and explicitly-set start day.
+- **Google Workspace smart features** — explicitly **not implemented** (§2). Google's smart features are computed by Google's own backend against broader Workspace scopes (Gmail, Drive) this app deliberately doesn't request, kept as narrow as each service's actual usage needs (§15), and aren't exposed through the Calendar API a pure-calendar client consumes. Tracked as a non-goal rather than a setting with no effect.
 - **Keyboard shortcuts** — a read-only `Gtk::ShortcutsWindow` cheat sheet (opened with `?` or from Preferences) listing the bindings already defined in §10. In-app rebinding is out of scope for v1; the shortcuts are fixed, not configurable.
 - **Offline** — no toggle, unlike the Calendar PWA where offline mode is opt-in. Calendarchy is offline-first by construction (§5, §9): the UI always reads from the local SQLite cache regardless of connectivity. What *does* live in this settings pane is the operational surface around that: each account's poll interval override (§9 defaults to 5 minutes), a manual "Sync now" action, and a "Clear local cache and resync" action for recovering from a corrupted cache without deleting the account.
 
-## 12. Notification Panel Integration
+## 13. Notification Panel Integration
 
 Two layers, deliberately separated by confidence level:
 
 **a) Standard desktop notifications (solid, v1)** — Event reminders are delivered via the freedesktop `org.freedesktop.Notifications` D-Bus interface. Quickshell's unified shell still implements this interface as the system's notification server (Quattro consolidated *where* notifications are handled, not the standard they're delivered over), so this integration is not Quattro-specific plumbing — it's the same standard interface any Linux desktop notification goes through, and it lands in Omarchy's native notification center like any other system notification. A background **Notification Scheduler** component watches upcoming events (from the local store — no network needed) and fires a D-Bus notification at each event's configured lead time, with actions like "Snooze" / "Dismiss" wired to the notification's action buttons.
 
-**b) Quickshell panel widget (stretch, not committed for v1)** — An "upcoming events" module living directly in Quickshell's panel/notification-center UI, driven over Quickshell's IPC. This is called out as a stretch goal because it depends on Quickshell's plugin/IPC API surface, which is newer and less documented than the freedesktop notification standard; §19 tracks this as something to scope once (a) is working and the Quickshell plugin API is better understood.
+**b) Quickshell panel widget (stretch, not committed for v1)** — An "upcoming events" module living directly in Quickshell's panel/notification-center UI, driven over Quickshell's IPC. This is called out as a stretch goal because it depends on Quickshell's plugin/IPC API surface, which is newer and less documented than the freedesktop notification standard; §20 tracks this as something to scope once (a) is working and the Quickshell plugin API is better understood.
 
-## 13. System Integration
+## 14. System Integration
 
 - **`.desktop` launcher entry** with a proper icon, so the app shows up in Omarchy's launcher like any other app.
 - **Autostart** (optional, user-toggleable) so reminders keep firing even if the main window isn't open — the app can run with the window hidden/minimized to tray-equivalent state.
@@ -191,47 +194,47 @@ Two layers, deliberately separated by confidence level:
 - **Hyprland window rules** — sensible defaults suggested in the doc/README (e.g., floating vs tiled preference), left to the user's own Hyprland config rather than the app forcing behavior.
 - **Theming** — no custom CSS theme; GTK4/libadwaita picks up Omarchy's system theme (accent color, light/dark) automatically.
 
-## 14. Security & Privacy
+## 15. Security & Privacy
 
 - PKCE means no client secret has to be trusted/embedded in a public client binary.
 - OAuth tokens live only in the OS keyring (Secret Service), never in the SQLite DB or in plaintext config files.
 - Scopes are requested per-service, only for services the user has enabled on that account, and kept as narrow as each service's actual usage needs (§7).
 - All calendar data lives locally in the user's own SQLite file; nothing is sent anywhere except directly to Google's API.
 
-## 15. Packaging & Distribution
+## 16. Packaging & Distribution
 
 - Standard `cargo build --release` producing a single native binary.
 - Distributed as an **AUR package** (`PKGBUILD`) — the natural distribution channel for an Arch/Omarchy-native app, and installable the same way users already install everything else on Omarchy.
-- Semantic versioning starting at `0.1.0` through the MVP phases in §18.
+- Semantic versioning starting at `0.1.0` through the MVP phases in §19.
 
-## 16. Error Handling & Resilience
+## 17. Error Handling & Resilience
 
 - Network loss: sync attempts fail silently in the background (surfaced subtly in the UI, e.g. a small "offline" indicator), queued edits remain queued, app stays fully usable against the local cache.
 - Revoked/expired refresh token: account is marked "needs re-authentication" in the account switcher; a click re-runs the OAuth flow (§7) rather than silently dropping the account.
 - API rate limiting: exponential backoff on 429/5xx responses from the Calendar API, scoped per-account so one rate-limited account doesn't stall others.
 - Partial failures are isolated per-account — one account's sync error is surfaced (e.g., a small warning badge) without blocking sync or UI for the other accounts.
 
-## 17. Testing Strategy
+## 18. Testing Strategy
 
 - Unit tests for the Sync Engine's delta-application and conflict-resolution logic, against a mocked Calendar API client (trait-based, so a fake implementation can be swapped in for tests).
 - Integration tests for the local SQLite layer (schema migrations, CRUD, query correctness for calendar views).
 - OAuth loopback flow is inherently hard to fully automate (it opens a real browser); document a manual test checklist for it rather than trying to fully automate.
 
-## 18. Phased Roadmap
+## 19. Phased Roadmap
 
 0. **Account/Service foundation** — Account Manager (identity + OAuth + keyring) and the `Service` trait/registry from §6 built first, with Calendar as the only registered service. Everything below is the Calendar service built on top of this foundation, so later services slot in without revisiting it.
 1. **MVP** — single account, Calendar service only, read-only Month + Agenda views, local SQLite cache, basic full sync.
 2. **Multi-account** — account switcher, unified overlay view, per-calendar color/visibility, Accounts settings screen showing the (mostly greyed-out) service toggles from §6.
 3. **Write support** — event create/edit/delete, offline edit queue, conflict handling.
 4. **Reminders & notifications** — Notification Scheduler, D-Bus desktop notifications with actions.
-5. **Polish & packaging** — Week/Day views, search, keyboard nav completeness, AUR packaging, Hyprland/theming polish.
+5. **Polish & packaging** — Week/Day/Year/5-day-work-week views, view options (§12), search, keyboard nav completeness, AUR packaging, Hyprland/theming polish.
 
-Quickshell panel widget integration (§12b) is intentionally not a numbered phase — it's picked up opportunistically once phase 4 is stable. Contacts/Notes/Tasks services (§6) are intentionally not numbered phases either — they're future work enabled by phase 0, not committed to a timeline here.
+Quickshell panel widget integration (§13b) is intentionally not a numbered phase — it's picked up opportunistically once phase 4 is stable. Contacts/Notes/Tasks services (§6) are intentionally not numbered phases either — they're future work enabled by phase 0, not committed to a timeline here.
 
-## 19. Open Questions / Future Enhancements
+## 20. Open Questions / Future Enhancements
 
 - **True push via relay backend**: if polling latency (up to the poll interval) proves unacceptable, a future version could add a small always-on relay service that owns the HTTPS webhook Google requires, registers `events.watch` channels on the user's behalf, and forwards change pings to the running app over a persistent connection. Deliberately out of scope for v1 — it turns a purely local native app into one with a hosted dependency.
 - **Recurring event edit scope**: Google's recurring-event model (single event vs. recurring series vs. "this and following") is one of the fiddlest parts of the Calendar API to get right in an editor UI; v1 should scope this down explicitly rather than attempt full parity with the Google Calendar PWA's recurrence editor on day one.
 - **New services on existing accounts** (Contacts, Notes, Tasks): the extensibility axis §6 is built for — new `Service` implementations reusing the same Account Manager, each with its own Google API (People API for Contacts, Tasks API for Tasks, etc.), own schema, own sync engine instance. No architecture changes anticipated to add one, only new code.
 - **New providers** (CalDAV, iCloud, Outlook/Microsoft Graph): a separate, orthogonal extensibility axis from services — today `accounts` implicitly assumes a Google identity; broadening `accounts` to be provider-tagged (so a `Service` implementation can be asked to work against more than one provider's API) is future work, not started in v1.
-- **Quickshell panel widget** (§12b): scope this once the freedesktop-notification path (§12a) is shipped and the Quickshell plugin/IPC API has been evaluated hands-on.
+- **Quickshell panel widget** (§13b): scope this once the freedesktop-notification path (§13a) is shipped and the Quickshell plugin/IPC API has been evaluated hands-on.

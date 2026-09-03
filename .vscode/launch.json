@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Calendarchy",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/calendarchy",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "MIMode": "gdb",
+            "miDebuggerPath": "/home/david/.local/share/mise/shims/rust-gdb",
+            "preLaunchTask": "cargo build",
+            "externalConsole": false
+        }
+    ]
+}
