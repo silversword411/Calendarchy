@@ -71,7 +71,54 @@ impl EventDateTime {
     }
 }
 
+/// The event's organizer — Google's `organizer` object, and iCalendar's `ORGANIZER`
+/// property (`CN` → `display_name`, `mailto:` → `email`).
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct EventOrganizer {
+    pub email: Option<String>,
+    #[serde(rename = "displayName")]
+    pub display_name: Option<String>,
+}
+
+/// One entry in `Event::attendees` — Google's `attendees[]`, and iCalendar's (possibly
+/// several) `ATTENDEE` properties (`CN` → `display_name`, `PARTSTAT` → `response_status`,
+/// `ROLE=OPT-PARTICIPANT` → `optional`). `is_self` is Google's own `self` field (renamed
+/// since `self` is a Rust keyword) — the signed-in account's own RSVP is read off
+/// whichever attendee has this set, rather than matched by email (see
+/// `storage::self_response_status`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EventAttendee {
+    pub email: String,
+    #[serde(rename = "displayName")]
+    pub display_name: Option<String>,
+    #[serde(rename = "responseStatus", default)]
+    pub response_status: String,
+    #[serde(rename = "self", default)]
+    pub is_self: bool,
+    #[serde(default)]
+    pub optional: bool,
+    #[serde(default)]
+    pub organizer: bool,
+}
+
+/// One file attached to an event — Google's `attachments[]` (Drive-hosted files), and
+/// iCalendar's `ATTACH` property (`FMTTYPE` → `mime_type`, `FILENAME`/the attachment's
+/// own name → `title`). `file_id`/`icon_link` are Google-Drive-specific and stay `None`
+/// for anything that didn't come from Drive (e.g. an ICS export's arbitrary URL).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EventAttachment {
+    #[serde(rename = "fileUrl")]
+    pub file_url: String,
+    pub title: Option<String>,
+    #[serde(rename = "mimeType")]
+    pub mime_type: Option<String>,
+    #[serde(rename = "iconLink")]
+    pub icon_link: Option<String>,
+    #[serde(rename = "fileId")]
+    pub file_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct Event {
     pub id: String,
     pub status: Option<String>,
@@ -82,10 +129,45 @@ pub struct Event {
     pub start: EventDateTime,
     #[serde(default)]
     pub end: EventDateTime,
+    /// RRULE, EXRULE, RDATE, and EXDATE lines, verbatim, exactly as Google's API
+    /// returns them (RFC 5545 §3.3.10) — a mix of the series' own repeat rule and any
+    /// per-instance exceptions layered on top (e.g. a daily series with one day
+    /// skipped via `EXDATE`). `storage::upsert_event` splits this into
+    /// `events.recurrence_rule` (the `RRULE` line(s) the edit dialog's recurrence
+    /// picker understands) and `events.recurrence_exceptions` (everything else,
+    /// preserved verbatim but not editable — see DESIGN_SPEC.md §20).
     #[serde(default)]
     pub recurrence: Vec<String>,
     pub etag: Option<String>,
     pub updated: Option<String>,
+    pub created: Option<String>,
+    #[serde(default)]
+    pub organizer: Option<EventOrganizer>,
+    #[serde(default)]
+    pub attendees: Vec<EventAttendee>,
+    /// The event's video-conferencing join URL — Google's `hangoutLink`, and the
+    /// value an ICS export carries as `X-GOOGLE-CONFERENCE`.
+    #[serde(rename = "hangoutLink")]
+    pub hangout_link: Option<String>,
+    /// iCalendar's `SEQUENCE` — incremented each time the organizer revises the
+    /// event; Google's API surfaces the same field under the same name.
+    #[serde(default)]
+    pub sequence: i64,
+    /// Google's `visibility` (`"default"` / `"public"` / `"private"` /
+    /// `"confidential"`) — iCalendar's `CLASS` property. Google omits this field
+    /// entirely when it's `"default"`, same as an ICS export omits `CLASS` for a
+    /// public/default event, so `None` here means "default", not "unknown".
+    pub visibility: Option<String>,
+    /// Google's `transparency` (`"opaque"` / `"transparent"`) — iCalendar's `TRANSP`.
+    /// Omitted by Google when it's `"opaque"` (Busy), Google's own default.
+    pub transparency: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<EventAttachment>,
+    /// A generic "more info" link — iCalendar's `URL` property. Not a field the Google
+    /// Calendar API exposes (it has `htmlLink`/`hangoutLink`/`attachments[].fileUrl`
+    /// instead, covered separately above), so this only ever gets populated by a
+    /// future ICS-URL calendar subscription (DESIGN_SPEC.md §11), not Google sync.
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,6 +360,47 @@ mod tests {
         assert!(all_day.start.is_all_day());
         assert!(all_day.start.parsed_date_time().is_none());
         assert_eq!(all_day.start.date.as_deref(), Some("2026-09-07"));
+    }
+
+    #[test]
+    fn parses_organizer_attendees_conference_link_and_sequence() {
+        let raw = r#"{
+            "id": "7hviprlvh7phvs31qm0fsf9ee8",
+            "status": "confirmed",
+            "summary": "repeating",
+            "start": { "dateTime": "2026-08-31T09:00:00Z" },
+            "end": { "dateTime": "2026-08-31T10:00:00Z" },
+            "created": "2026-09-03T08:42:34.000Z",
+            "updated": "2026-09-03T08:42:35.000Z",
+            "sequence": 0,
+            "hangoutLink": "https://meet.google.com/yaf-zbof-ubm",
+            "organizer": { "email": "clawmeariver@gmail.com", "displayName": "Claw Meariver" },
+            "attendees": [
+                {
+                    "email": "clawmeariver@gmail.com",
+                    "displayName": "Claw Meariver",
+                    "responseStatus": "accepted",
+                    "self": true,
+                    "organizer": true
+                },
+                {
+                    "email": "silversword@gmail.com",
+                    "responseStatus": "needsAction"
+                }
+            ]
+        }"#;
+
+        let event: Event = serde_json::from_str(raw).expect("parse");
+        assert_eq!(event.organizer.as_ref().and_then(|o| o.email.as_deref()), Some("clawmeariver@gmail.com"));
+        assert_eq!(event.hangout_link.as_deref(), Some("https://meet.google.com/yaf-zbof-ubm"));
+        assert_eq!(event.created.as_deref(), Some("2026-09-03T08:42:34.000Z"));
+        assert_eq!(event.sequence, 0);
+        assert_eq!(event.attendees.len(), 2);
+        let organizer_attendee = event.attendees.iter().find(|a| a.is_self).expect("self attendee");
+        assert_eq!(organizer_attendee.response_status, "accepted");
+        let guest = event.attendees.iter().find(|a| !a.is_self).expect("guest attendee");
+        assert_eq!(guest.response_status, "needsAction");
+        assert!(!guest.organizer);
     }
 
     #[test]

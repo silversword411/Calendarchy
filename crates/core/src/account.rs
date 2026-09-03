@@ -48,6 +48,12 @@ pub struct Account {
 /// has no calendar-specific (or contacts-specific, etc.) knowledge — that all lives in
 /// `Service` implementations reached through the `ServiceRegistry`. See
 /// DESIGN_SPEC.md §6 for why this split exists.
+///
+/// `Clone` is cheap (every field is an `Arc`-backed handle) and deliberate: the
+/// Preferences window's "Sync now"/"Clear cache and resync" actions (§12) move a
+/// clone into a background task rather than reaching back into the GTK-thread-bound
+/// `App` model.
+#[derive(Clone)]
 pub struct AccountManager {
     storage: Storage,
     registry: Arc<ServiceRegistry>,

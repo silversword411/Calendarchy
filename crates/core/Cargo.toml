@@ -15,3 +15,4 @@ serde_json.workspace = true
 chrono.workspace = true
 oo7 = { version = "0.6.0", features = ["tokio", "native_crypto"] }
 oauth2 = "5.0.0"
+zbus = "5.19"

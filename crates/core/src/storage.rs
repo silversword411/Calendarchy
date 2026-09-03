@@ -69,6 +69,28 @@ fn migrate_core(conn: &Connection) -> anyhow::Result<()> {
             value       TEXT NOT NULL,
             updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
         );
+
+        -- Notification Scheduler state (DESIGN_SPEC.md §13). `event_id` is a loose
+        -- reference, not a real FK, same as `AppSettings::default_calendar_id` — this
+        -- migration runs before the calendar service's own `migrate` (see
+        -- `crates/app/src/main.rs`'s `init_core`), so a hard FK would point at a table
+        -- that doesn't exist yet at this point, and this table is Scheduler-owned
+        -- cross-cutting state rather than data the Calendar service owns (§8).
+        -- `event_title`/`event_start` are snapshotted at fire time (not read live off
+        -- `events`) so a later event edit is treated as a fresh reminder rather than
+        -- being suppressed by an old row, and so the "past" history view still has
+        -- something to show after the event itself is edited or deleted.
+        CREATE TABLE IF NOT EXISTS reminder_notifications (
+            id                INTEGER PRIMARY KEY,
+            event_id          INTEGER NOT NULL,
+            event_title       TEXT NOT NULL,
+            event_start       TEXT NOT NULL,
+            reminder_minutes  INTEGER NOT NULL,
+            fired_at          TEXT NOT NULL DEFAULT (datetime('now')),
+            status            TEXT NOT NULL DEFAULT 'active',
+            snoozed_until     TEXT,
+            UNIQUE(event_id, reminder_minutes, event_start)
+        );
         "#,
     )?;
     Ok(())
@@ -85,12 +107,12 @@ mod tests {
             .with_conn(|conn| {
                 Ok(conn.query_row(
                     "SELECT count(*) FROM sqlite_master WHERE type = 'table' \
-                     AND name IN ('accounts', 'account_services', 'app_settings')",
+                     AND name IN ('accounts', 'account_services', 'app_settings', 'reminder_notifications')",
                     [],
                     |row| row.get(0),
                 )?)
             })
             .expect("query");
-        assert_eq!(table_count, 3);
+        assert_eq!(table_count, 4);
     }
 }
