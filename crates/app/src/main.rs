@@ -70,15 +70,30 @@ fn init_core() -> anyhow::Result<AppCore> {
     Ok(AppCore { accounts, storage })
 }
 
-/// Which main-content view is displayed (DESIGN_SPEC.md §10). Only `Month` and `Day`
-/// are wired up so far — Week/Year/Agenda/5-day work week stay "coming soon" in the
-/// header bar's view-switcher popover (`build_view_switcher_popover`) per the phased
-/// roadmap (§19).
+/// Which main-content view is displayed (DESIGN_SPEC.md §10). `Month`, `Day`, and
+/// `FiveDay` are wired up — Schedule/Week/Year stay "coming soon" in the header bar's
+/// view-switcher popover (`build_view_switcher_popover`) per the phased roadmap (§19).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Month,
     Day,
+    /// A rolling 5-day window centered on `App::current_date` (2 days before, the
+    /// anchor, 2 days after — see `five_day_window`), not a fixed Mon–Fri work week.
+    FiveDay,
 }
+
+/// Floor on the sidebar's drag-resized width — enforced by GTK itself via the
+/// sidebar `ScrolledWindow`'s `width_request` combined with `shrink_start_child:
+/// false` on the `Paned`, so a drag simply can't go narrower than this.
+const SIDEBAR_MIN_WIDTH_PX: i32 = 180;
+/// Ceiling on the sidebar's drag-resized width. Unlike the floor, GTK's `Paned` has
+/// no built-in maximum (its `max_position` is derived from the end child's minimum
+/// size, which is effectively 0), so this is enforced manually in the
+/// `notify::position` handler set up in `init`.
+const SIDEBAR_MAX_WIDTH_PX: i32 = 480;
+/// Sidebar width used before the user has ever dragged it (`AppSettings::sidebar_width_fraction`
+/// is `None`) — matches the fixed width the sidebar had before it became resizable.
+const DEFAULT_SIDEBAR_WIDTH_PX: i32 = 240;
 
 struct App {
     core: AppCore,
@@ -89,7 +104,9 @@ struct App {
     /// `Today`/`PrevMonth`/`NextMonth`, independent of the real calendar date used
     /// for the today-badge (`populate_month_grid`'s separate `today` argument). In
     /// `ViewMode::Day`, this instead identifies the exact day shown (paged by
-    /// `AppMsg::PrevPeriod`/`NextPeriod`, one day at a time rather than one month).
+    /// `AppMsg::PrevPeriod`/`NextPeriod`, one day at a time rather than one month). In
+    /// `ViewMode::FiveDay`, this is the *anchor* the 5-day window is centered on
+    /// (`five_day_window`), not a stored range — paged ±5 days/weekdays at a time.
     current_date: NaiveDate,
     /// Live text from the header bar's search popover; re-applied on every refresh
     /// so it survives month navigation instead of resetting.
@@ -229,7 +246,8 @@ impl Component for App {
                     #[name = "view_menu_button"]
                     pack_end = &gtk4::MenuButton {
                         set_label: "Month",
-                        add_css_class: "flat",
+                        add_css_class: "pill",
+                        add_css_class: "view-switcher-button",
                     },
 
                     pack_end = &gtk4::Button {
@@ -264,95 +282,90 @@ impl Component for App {
                     },
                 },
 
+                #[name = "sidebar_paned"]
                 #[wrap(Some)]
-                set_content = &gtk4::Box {
+                set_content = &gtk4::Paned {
                     set_orientation: gtk4::Orientation::Horizontal,
+                    set_wide_handle: true,
+                    set_resize_start_child: false,
+                    set_resize_end_child: true,
+                    set_shrink_start_child: false,
+                    set_shrink_end_child: true,
 
-                    #[name = "sidebar_revealer"]
-                    gtk4::Revealer {
-                        set_transition_type: gtk4::RevealerTransitionType::SlideRight,
-                        set_reveal_child: true,
+                    #[name = "sidebar_pane"]
+                    #[wrap(Some)]
+                    set_start_child = &gtk4::ScrolledWindow {
+                        set_width_request: SIDEBAR_MIN_WIDTH_PX,
+                        set_hexpand: false,
+                        set_vexpand: true,
+                        set_hscrollbar_policy: gtk4::PolicyType::Never,
 
                         gtk4::Box {
-                            set_orientation: gtk4::Orientation::Horizontal,
+                            set_orientation: gtk4::Orientation::Vertical,
+                            set_spacing: 12,
+                            set_margin_all: 12,
 
-                            gtk4::ScrolledWindow {
-                                set_width_request: 240,
-                                set_hexpand: false,
-                                set_vexpand: true,
-                                set_hscrollbar_policy: gtk4::PolicyType::Never,
+                            gtk4::Box {
+                                add_css_class: "mini-calendar",
+                                set_orientation: gtk4::Orientation::Vertical,
+                                set_spacing: 6,
 
                                 gtk4::Box {
-                                    set_orientation: gtk4::Orientation::Vertical,
-                                    set_spacing: 12,
-                                    set_margin_all: 12,
+                                    set_orientation: gtk4::Orientation::Horizontal,
+                                    set_spacing: 2,
 
-                                    gtk4::Box {
-                                        add_css_class: "mini-calendar",
-                                        set_orientation: gtk4::Orientation::Vertical,
-                                        set_spacing: 6,
-
-                                        gtk4::Box {
-                                            set_orientation: gtk4::Orientation::Horizontal,
-                                            set_spacing: 2,
-
-                                            #[name = "mini_calendar_title"]
-                                            gtk4::MenuButton {
-                                                add_css_class: "flat",
-                                                add_css_class: "mini-calendar-title",
-                                                set_hexpand: true,
-                                                set_halign: gtk4::Align::Start,
-                                                set_tooltip_text: Some("Jump to month/year"),
-                                            },
-                                            gtk4::Button {
-                                                set_icon_name: "go-previous-symbolic",
-                                                add_css_class: "flat",
-                                                set_tooltip_text: Some("Previous month"),
-                                                connect_clicked => AppMsg::PrevMonth,
-                                            },
-                                            gtk4::Button {
-                                                set_icon_name: "go-next-symbolic",
-                                                add_css_class: "flat",
-                                                set_tooltip_text: Some("Next month"),
-                                                connect_clicked => AppMsg::NextMonth,
-                                            },
-                                        },
-
-                                        #[name = "mini_calendar_grid"]
-                                        gtk4::Grid {
-                                            add_css_class: "mini-calendar-grid",
-                                            set_row_homogeneous: true,
-                                            set_column_homogeneous: true,
-                                            set_row_spacing: 2,
-                                            set_column_spacing: 2,
-                                        },
+                                    #[name = "mini_calendar_title"]
+                                    gtk4::MenuButton {
+                                        add_css_class: "flat",
+                                        add_css_class: "mini-calendar-title",
+                                        set_hexpand: true,
+                                        set_halign: gtk4::Align::Start,
+                                        set_tooltip_text: Some("Jump to month/year"),
                                     },
-
-                                    #[name = "world_clock_box"]
-                                    gtk4::Box {
-                                        add_css_class: "world-clock",
-                                        set_orientation: gtk4::Orientation::Vertical,
-                                        set_spacing: 4,
+                                    gtk4::Button {
+                                        set_icon_name: "go-previous-symbolic",
+                                        add_css_class: "flat",
+                                        set_tooltip_text: Some("Previous month"),
+                                        connect_clicked => AppMsg::PrevMonth,
                                     },
-
-                                    gtk4::Separator {},
-
-                                    #[name = "sidebar_list"]
-                                    gtk4::Box {
-                                        add_css_class: "sidebar",
-                                        set_orientation: gtk4::Orientation::Vertical,
-                                        set_spacing: 2,
+                                    gtk4::Button {
+                                        set_icon_name: "go-next-symbolic",
+                                        add_css_class: "flat",
+                                        set_tooltip_text: Some("Next month"),
+                                        connect_clicked => AppMsg::NextMonth,
                                     },
+                                },
+
+                                #[name = "mini_calendar_grid"]
+                                gtk4::Grid {
+                                    add_css_class: "mini-calendar-grid",
+                                    set_row_homogeneous: true,
+                                    set_column_homogeneous: true,
+                                    set_row_spacing: 2,
+                                    set_column_spacing: 2,
                                 },
                             },
 
-                            gtk4::Separator {
+                            #[name = "world_clock_box"]
+                            gtk4::Box {
+                                add_css_class: "world-clock",
                                 set_orientation: gtk4::Orientation::Vertical,
+                                set_spacing: 4,
+                            },
+
+                            gtk4::Separator {},
+
+                            #[name = "sidebar_list"]
+                            gtk4::Box {
+                                add_css_class: "sidebar",
+                                set_orientation: gtk4::Orientation::Vertical,
+                                set_spacing: 2,
                             },
                         },
                     },
 
-                    gtk4::Box {
+                    #[wrap(Some)]
+                    set_end_child = &gtk4::Box {
                         set_orientation: gtk4::Orientation::Vertical,
                         set_hexpand: true,
                         set_vexpand: true,
@@ -505,14 +518,14 @@ impl Component for App {
         };
         let widgets = view_output!();
 
-        widgets.view_menu_button.set_popover(Some(&build_view_switcher_popover(&sender)));
+        widgets.view_menu_button.set_popover(Some(&build_view_switcher_popover(&sender, &ctx.storage)));
         widgets.view_menu_button.set_label(view_mode_label(model.current_view));
         widgets.month_view_container.set_visible(model.current_view == ViewMode::Month);
-        widgets.day_view_container.set_visible(model.current_view == ViewMode::Day);
+        widgets.day_view_container.set_visible(matches!(model.current_view, ViewMode::Day | ViewMode::FiveDay));
 
         populate_month_grid(&widgets.month_grid, today, today, &events, &ctx);
-        populate_day_header(&widgets.day_header_box, &widgets.day_all_day_box, today, today, &events, &ctx);
-        populate_day_view(&widgets.day_overlay, today, today, &events, &ctx, settings.day_time_scale_minutes);
+        populate_day_header(&widgets.day_header_box, &widgets.day_all_day_box, &[today], today, &events, &ctx);
+        populate_day_view(&widgets.day_overlay, &[today], today, &events, &ctx, settings.day_time_scale_minutes);
         {
             // The sidebar's mini calendar isn't inside a popover of its own, so
             // there's nothing to accidentally close early here — jumping a month and
@@ -527,6 +540,12 @@ impl Component for App {
         install_preferences_shortcut(&root, &sender);
         install_view_shortcuts(&root, &sender);
         install_day_zoom_controller(&widgets.day_scroller, &sender);
+        {
+            let fraction = settings
+                .sidebar_width_fraction
+                .unwrap_or(DEFAULT_SIDEBAR_WIDTH_PX as f64 / 1100.0);
+            install_sidebar_resize_persistence(&widgets.sidebar_paned, &root, &ctx.storage, fraction);
+        }
         start_world_clock_ticker(&widgets.world_clock_box, ctx.storage.clone());
         notifications::start_scheduler(sender.clone(), ctx.storage.clone());
         // Shows any reminders still `active` from a previous run immediately, rather
@@ -548,7 +567,10 @@ impl Component for App {
 
         // Re-run continuously while the window is actively being resized, so dragging
         // keeps the month grid's event count and the day view's event-column widths
-        // matched to the space actually available.
+        // matched to the space actually available. Also re-runs while the sidebar
+        // Paned's handle is being dragged: that changes the main content's available
+        // width without changing the window's own size, so `paned.position()` is
+        // tracked alongside width/height rather than relying on a separate mechanism.
         //
         // Deliberately *not* `root.connect_notify_local(Some("default-width"/"default-height"), ...)`
         // (what this used to be): those properties are size *hints* for initial/remembered
@@ -568,11 +590,12 @@ impl Component for App {
         // fire-and-forget rather than stored/cancelled.
         {
             let sender = sender.clone();
-            let last_size: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((0, 0)));
+            let paned = widgets.sidebar_paned.clone();
+            let last_state: Rc<Cell<(i32, i32, i32)>> = Rc::new(Cell::new((0, 0, 0)));
             root.add_tick_callback(move |window, _clock| {
-                let size = (window.width(), window.height());
-                if size != last_size.get() && size.0 > 0 && size.1 > 0 {
-                    last_size.set(size);
+                let state = (window.width(), window.height(), paned.position());
+                if state != last_state.get() && state.0 > 0 && state.1 > 0 {
+                    last_state.set(state);
                     sender.input(AppMsg::Resize);
                 }
                 gtk4::glib::ControlFlow::Continue
@@ -636,6 +659,14 @@ impl Component for App {
                 self.current_date = match self.current_view {
                     ViewMode::Month => shift_month(self.current_date, -1),
                     ViewMode::Day => self.current_date - Duration::days(1),
+                    ViewMode::FiveDay => {
+                        let show_weekends = load_settings(&self.core.storage).unwrap_or_default().show_weekends;
+                        if show_weekends {
+                            self.current_date - Duration::days(5)
+                        } else {
+                            step_weekdays(self.current_date, -5)
+                        }
+                    }
                 };
                 self.refresh(widgets, &sender, root);
             }
@@ -643,24 +674,38 @@ impl Component for App {
                 self.current_date = match self.current_view {
                     ViewMode::Month => shift_month(self.current_date, 1),
                     ViewMode::Day => self.current_date + Duration::days(1),
+                    ViewMode::FiveDay => {
+                        let show_weekends = load_settings(&self.core.storage).unwrap_or_default().show_weekends;
+                        if show_weekends {
+                            self.current_date + Duration::days(5)
+                        } else {
+                            step_weekdays(self.current_date, 5)
+                        }
+                    }
                 };
                 self.refresh(widgets, &sender, root);
             }
             AppMsg::SetView(view) => {
                 self.current_view = view;
                 widgets.month_view_container.set_visible(view == ViewMode::Month);
-                widgets.day_view_container.set_visible(view == ViewMode::Day);
+                widgets.day_view_container.set_visible(matches!(view, ViewMode::Day | ViewMode::FiveDay));
                 widgets.view_menu_button.set_label(view_mode_label(view));
                 self.refresh(widgets, &sender, root);
-                if view == ViewMode::Day {
+                if matches!(view, ViewMode::Day | ViewMode::FiveDay) {
                     // `day_overlay` was hidden (inside `day_view_container`) until the
                     // `set_visible(true)` above, so the `refresh` just above computed
                     // its event columns off a stale/zero width — correct it once a
                     // real one is allocated (see `poll_for_real_width_then_resize`).
                     poll_for_real_width_then_resize(&widgets.day_overlay, &sender);
-                    if self.current_date == Local::now().date_naive() {
-                        let scale = load_settings(&self.core.storage).unwrap_or_default().day_time_scale_minutes;
-                        scroll_day_view_to_now(&widgets.day_scroller, scale);
+                    let settings = load_settings(&self.core.storage).unwrap_or_default();
+                    let today = Local::now().date_naive();
+                    let today_visible = match view {
+                        ViewMode::Day => self.current_date == today,
+                        ViewMode::FiveDay => five_day_window(self.current_date, settings.show_weekends).contains(&today),
+                        ViewMode::Month => false,
+                    };
+                    if today_visible {
+                        scroll_day_view_to_now(&widgets.day_scroller, settings.day_time_scale_minutes);
                     }
                 }
             }
@@ -693,7 +738,7 @@ impl Component for App {
             }
             AppMsg::ToggleSidebar => {
                 self.sidebar_visible = !self.sidebar_visible;
-                widgets.sidebar_revealer.set_reveal_child(self.sidebar_visible);
+                widgets.sidebar_pane.set_visible(self.sidebar_visible);
             }
             AppMsg::CreateEvent => {
                 let calendars = calendars_by_account(&self.core.storage).unwrap_or_default();
@@ -805,8 +850,12 @@ impl App {
             time_format: resolve_time_format(&settings),
         };
         populate_month_grid(&widgets.month_grid, self.current_date, today, &events, &ctx);
-        populate_day_header(&widgets.day_header_box, &widgets.day_all_day_box, self.current_date, today, &events, &ctx);
-        populate_day_view(&widgets.day_overlay, self.current_date, today, &events, &ctx, settings.day_time_scale_minutes);
+        let day_view_dates: Vec<NaiveDate> = match self.current_view {
+            ViewMode::FiveDay => five_day_window(self.current_date, settings.show_weekends),
+            ViewMode::Day | ViewMode::Month => vec![self.current_date],
+        };
+        populate_day_header(&widgets.day_header_box, &widgets.day_all_day_box, &day_view_dates, today, &events, &ctx);
+        populate_day_view(&widgets.day_overlay, &day_view_dates, today, &events, &ctx, settings.day_time_scale_minutes);
         {
             let jump = jump_to_date_callback(sender);
             populate_mini_calendar(
@@ -821,6 +870,7 @@ impl App {
         let title = match self.current_view {
             ViewMode::Month => self.current_date.format("%B %Y").to_string(),
             ViewMode::Day => self.current_date.format("%A, %B %-d, %Y").to_string(),
+            ViewMode::FiveDay => five_day_title(&day_view_dates),
         };
         widgets.window_title.set_title(&title);
 
@@ -840,6 +890,84 @@ fn shift_month(date: NaiveDate, delta: i32) -> NaiveDate {
     let year = total_months.div_euclid(12);
     let month = total_months.rem_euclid(12) as u32 + 1;
     NaiveDate::from_ymd_opt(year, month, 1).expect("valid year/month")
+}
+
+/// True for Saturday/Sunday — the only two days `AppSettings::show_weekends` affects
+/// (DESIGN_SPEC.md §12), consulted by `five_day_window`/`step_weekdays`.
+fn is_weekend(date: NaiveDate) -> bool {
+    matches!(date.weekday(), Weekday::Sat | Weekday::Sun)
+}
+
+/// Moves `date` by `delta` weekdays (skipping Sat/Sun), in either direction. Used by
+/// `AppMsg::PrevPeriod`/`NextPeriod` to page `ViewMode::FiveDay`'s anchor when
+/// `show_weekends` is off, so consecutive 5-day windows tile business days with no
+/// overlap or gap.
+fn step_weekdays(date: NaiveDate, delta: i32) -> NaiveDate {
+    let step: i64 = if delta >= 0 { 1 } else { -1 };
+    let mut d = date;
+    let mut remaining = delta.unsigned_abs();
+    while remaining > 0 {
+        d += Duration::days(step);
+        if !is_weekend(d) {
+            remaining -= 1;
+        }
+    }
+    d
+}
+
+/// The 5 dates shown in `ViewMode::FiveDay`, centered on `anchor` — 2 days before, the
+/// anchor, 2 days after — matching real Google Calendar's "5 days" view (confirmed
+/// against a reference screenshot: a Tue–Sat window with the Thursday "today" as the
+/// 3rd of 5 columns), not the fixed Mon–Fri work week DESIGN_SPEC.md §12 describes.
+/// Always returns exactly 5 dates. When `show_weekends` is false the window instead
+/// spans 5 business days (skipping Sat/Sun entirely) — if `anchor` itself falls on a
+/// weekend in that case, it's snapped forward to the following Monday first.
+fn five_day_window(anchor: NaiveDate, show_weekends: bool) -> Vec<NaiveDate> {
+    if show_weekends {
+        return (-2..=2).map(|delta| anchor + Duration::days(delta)).collect();
+    }
+
+    let anchor = if is_weekend(anchor) { step_weekdays(anchor, 1) } else { anchor };
+
+    let mut before = Vec::with_capacity(2);
+    let mut d = anchor;
+    while before.len() < 2 {
+        d -= Duration::days(1);
+        if !is_weekend(d) {
+            before.push(d);
+        }
+    }
+    before.reverse();
+
+    let mut after = Vec::with_capacity(2);
+    let mut d = anchor;
+    while after.len() < 2 {
+        d += Duration::days(1);
+        if !is_weekend(d) {
+            after.push(d);
+        }
+    }
+
+    let mut dates = before;
+    dates.push(anchor);
+    dates.extend(after);
+    dates
+}
+
+/// Window-title text for `ViewMode::FiveDay`: `"September 2026"` when the whole window
+/// sits in one month (matching Month view's own `"%B %Y"` convention at
+/// `App::refresh`), else a spanning `"Aug 31 – Sep 4, 2026"` (or, across a year
+/// boundary, `"Dec 29, 2025 – Jan 2, 2026"`).
+fn five_day_title(dates: &[NaiveDate]) -> String {
+    let first = dates[0];
+    let last = *dates.last().expect("five_day_window always returns 5 dates");
+    if first.year() == last.year() && first.month() == last.month() {
+        first.format("%B %Y").to_string()
+    } else if first.year() == last.year() {
+        format!("{} – {}", first.format("%b %-d"), last.format("%b %-d, %Y"))
+    } else {
+        format!("{} – {}", first.format("%b %-d, %Y"), last.format("%b %-d, %Y"))
+    }
 }
 
 /// Case-insensitive substring match on title, mirroring DESIGN_SPEC.md §10's "simple
@@ -952,14 +1080,14 @@ fn focus_is_editable(widget: &gtk4::Widget) -> bool {
 }
 
 /// Binds Google Calendar's own single-letter view shortcuts (DESIGN_SPEC.md §10/§12's
-/// "reused as-is" scheme) for the two views that actually exist yet — `d` for Day, `m`
-/// for Month. `w`/`y`/`a`/`x` stay unbound, matching the shortcuts legend's "documents
-/// the full intended scheme rather than only what's implemented so far" note (see
-/// `SHORTCUT_GROUPS`), until Week/Year/Agenda/5-day views themselves land (§19).
+/// "reused as-is" scheme) for the views that actually exist yet — `d` for Day, `m` for
+/// Month, `x` for 5-day. `w`/`y`/`a` stay unbound, matching the shortcuts legend's
+/// "documents the full intended scheme rather than only what's implemented so far"
+/// note (see `SHORTCUT_GROUPS`), until Week/Year/Schedule views themselves land (§19).
 ///
 /// `Global` scope, same as `install_search_shortcut`/`install_preferences_shortcut`, so
 /// it fires while the month grid or day view has focus rather than only the window
-/// chrome — but unlike Ctrl+F/Ctrl+,, a bare "d" or "m" is also ordinary text, so each
+/// chrome — but unlike Ctrl+F/Ctrl+,, a bare "d"/"m"/"x" is also ordinary text, so each
 /// callback checks `focus_is_editable` first and lets the keystroke through as normal
 /// input (`Propagation::Proceed`) whenever a text field currently has focus, rather
 /// than hijacking every "d" typed into the event title or search box.
@@ -967,7 +1095,7 @@ fn install_view_shortcuts(root: &impl IsA<gtk4::Widget>, sender: &ComponentSende
     let controller = gtk4::ShortcutController::new();
     controller.set_scope(gtk4::ShortcutScope::Global);
 
-    for (key, view) in [("d", ViewMode::Day), ("m", ViewMode::Month)] {
+    for (key, view) in [("d", ViewMode::Day), ("m", ViewMode::Month), ("x", ViewMode::FiveDay)] {
         let sender = sender.clone();
         controller.add_shortcut(gtk4::Shortcut::new(
             gtk4::ShortcutTrigger::parse_string(key),
@@ -982,6 +1110,74 @@ fn install_view_shortcuts(root: &impl IsA<gtk4::Widget>, sender: &ComponentSende
     }
 
     root.add_controller(controller);
+}
+
+/// Restores the sidebar `Paned`'s dragged width from `fraction` (a saved
+/// `sidebar_px / window_px` ratio) and wires persistence of future drags back to
+/// storage. `fraction` is applied against `window`'s width once it reports a real
+/// allocated size (same poll-until-nonzero idiom as `poll_for_real_width_then_resize`,
+/// needed because `width()` still reads 0 at `init` time, before the compositor's
+/// first layout pass) — this is what keeps the sidebar looking proportionally right
+/// even if the fraction was saved on a different-sized or differently-scaled monitor.
+///
+/// `Paned` has no drag-end signal, only `notify::position`, which fires continuously
+/// during a drag *and* for this function's own restoring `set_position()` call — so
+/// `suppress_position_save` guards every programmatic move from being mistaken for a
+/// user drag, and the actual save is debounced (cancel-and-reschedule) so a fast drag
+/// doesn't hammer storage with a write per pixel.
+fn install_sidebar_resize_persistence(paned: &gtk4::Paned, window: &adw::Window, storage: &Storage, fraction: f64) {
+    let suppress_position_save: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let pending_save: Rc<Cell<Option<gtk4::glib::SourceId>>> = Rc::new(Cell::new(None));
+
+    {
+        let storage = storage.clone();
+        let window = window.clone();
+        let suppress_position_save = suppress_position_save.clone();
+        paned.connect_position_notify(move |paned| {
+            if suppress_position_save.take() {
+                return;
+            }
+            let raw = paned.position();
+            let clamped = raw.clamp(SIDEBAR_MIN_WIDTH_PX, SIDEBAR_MAX_WIDTH_PX);
+            if clamped != raw {
+                paned.set_position(clamped); // re-enters here once with clamped == position(); no further recursion
+                return;
+            }
+            if let Some(id) = pending_save.take() {
+                id.remove();
+            }
+            let storage = storage.clone();
+            let window = window.clone();
+            let pending_save_for_timer = pending_save.clone();
+            let id = gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(350), move || {
+                pending_save_for_timer.set(None);
+                let width = window.width().max(1);
+                let mut settings = load_settings(&storage).unwrap_or_default();
+                settings.sidebar_width_fraction = Some(clamped as f64 / width as f64);
+                if let Err(err) = save_settings(&storage, &settings) {
+                    tracing::warn!(%err, "failed to save sidebar width");
+                }
+            });
+            pending_save.set(Some(id));
+        });
+    }
+
+    let paned = paned.clone();
+    let window = window.clone();
+    let mut attempts_left = 40; // ~2s cap, same as poll_for_real_width_then_resize
+    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+        attempts_left -= 1;
+        if window.width() > 0 {
+            let target = (window.width() as f64 * fraction).round() as i32;
+            suppress_position_save.set(true);
+            paned.set_position(target.clamp(SIDEBAR_MIN_WIDTH_PX, SIDEBAR_MAX_WIDTH_PX));
+            return gtk4::glib::ControlFlow::Break;
+        }
+        if attempts_left <= 0 {
+            return gtk4::glib::ControlFlow::Break;
+        }
+        gtk4::glib::ControlFlow::Continue
+    });
 }
 
 /// Binds Ctrl+scroll on the Day view's hour grid to `AppMsg::ZoomDayTimeScale`
@@ -1709,65 +1905,145 @@ fn view_mode_label(view: ViewMode) -> &'static str {
     match view {
         ViewMode::Month => "Month",
         ViewMode::Day => "Day",
+        ViewMode::FiveDay => "5 days",
     }
 }
 
-/// Builds the header bar's view-switcher popover (DESIGN_SPEC.md §10): Month and Day
-/// are live, wired to `AppMsg::SetView`; Week/Year/Agenda/5-day work week stay
-/// disabled "coming soon" rows, matching the treatment `calendar_customizer_button`
-/// gives "Settings and sharing", until those views exist (§19's phased roadmap). Each
-/// live row also carries its single-letter accelerator (`install_view_shortcuts`) in a
-/// right-aligned `.shortcut-key` badge (`menu_row_button_with_hotkey`), so the hotkey
+/// One row of the header bar's view-switcher popover (`build_view_switcher_popover`):
+/// either a live view, wired to `AppMsg::SetView` with its single-letter accelerator
+/// (`install_view_shortcuts`), or a disabled "coming soon" placeholder for a view that
+/// doesn't exist yet.
+enum SwitcherRow {
+    Live(ViewMode, &'static str),
+    ComingSoon,
+}
+
+/// One row of the view-switcher popover's view-option checkbox group: a label, a
+/// getter, and a setter for one `AppSettings` field — keeps `build_view_switcher_popover`
+/// from needing three near-identical `gtk4::CheckButton` blocks.
+type SettingsCheckboxSpec = (&'static str, fn(&AppSettings) -> bool, fn(&mut AppSettings, bool));
+
+/// Builds the header bar's view-switcher popover (DESIGN_SPEC.md §10): an ordered list
+/// of view rows — Schedule/Day/5 day/Week/Month/Year, matching the reference
+/// screenshot's order — followed by a separator and the "Show weekends"/"Show declined
+/// events"/"Show completed tasks" view-option checkboxes it also shows in the same
+/// dropdown. Day, 5 day, and Month are live, wired to `AppMsg::SetView`; Schedule/Week/
+/// Year stay disabled "coming soon" rows, matching the treatment
+/// `calendar_customizer_button` gives "Settings and sharing", until those views exist
+/// (§19's phased roadmap). Each live row also carries its single-letter accelerator in
+/// a right-aligned `.shortcut-key` badge (`menu_row_button_with_hotkey`), so the hotkey
 /// is discoverable straight from the menu rather than only from the `?` shortcuts
-/// window. Built once in `init` (mirroring `calendar_customizer_button`'s
-/// imperative-popover style) rather than declared in the `view!` macro, since popping
-/// the popover down after a click needs a handle to it that the macro's own
-/// `connect_clicked => Msg` sugar doesn't give us.
-fn build_view_switcher_popover(sender: &ComponentSender<App>) -> gtk4::Popover {
+/// window. Built once in `init` (mirroring `calendar_customizer_button`'s imperative-
+/// popover style) rather than declared in the `view!` macro, since popping the popover
+/// down after a click needs a handle to it that the macro's own `connect_clicked =>
+/// Msg` sugar doesn't give us.
+///
+/// Only "Show weekends" has any actual effect (it feeds `five_day_window` on the next
+/// refresh, via `AppMsg::EventUpdated`); "Show declined events"/"Show completed tasks"
+/// are deliberate no-op settings writes, matching the app-wide scope those two fields
+/// have everywhere else today (no view anywhere reads RSVP status or task-completion
+/// data — see their Preferences-window rows, which stay disabled/"Coming soon" even
+/// though these dropdown checkboxes for the same fields are live).
+fn build_view_switcher_popover(sender: &ComponentSender<App>, storage: &Storage) -> gtk4::Popover {
     let popover = gtk4::Popover::new();
 
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
     root.set_margin_all(6);
     root.set_width_request(200);
 
-    for (label, view, key) in [("Month", ViewMode::Month, "M"), ("Day", ViewMode::Day, "D")] {
-        let button = menu_row_button_with_hotkey(label, key);
-        let sender = sender.clone();
-        let popover_weak = popover.downgrade();
-        button.connect_clicked(move |_| {
-            sender.input(AppMsg::SetView(view));
-            if let Some(popover) = popover_weak.upgrade() {
-                popover.popdown();
+    for (label, row) in [
+        ("Schedule", SwitcherRow::ComingSoon),
+        ("Day", SwitcherRow::Live(ViewMode::Day, "D")),
+        ("5 day", SwitcherRow::Live(ViewMode::FiveDay, "X")),
+        ("Week", SwitcherRow::ComingSoon),
+        ("Month", SwitcherRow::Live(ViewMode::Month, "M")),
+        ("Year", SwitcherRow::ComingSoon),
+    ] {
+        match row {
+            SwitcherRow::Live(view, key) => {
+                let button = menu_row_button_with_hotkey(label, key);
+                let sender = sender.clone();
+                let popover_weak = popover.downgrade();
+                button.connect_clicked(move |_| {
+                    sender.input(AppMsg::SetView(view));
+                    if let Some(popover) = popover_weak.upgrade() {
+                        popover.popdown();
+                    }
+                });
+                root.append(&button);
             }
-        });
-        root.append(&button);
+            SwitcherRow::ComingSoon => {
+                let disabled = gtk4::Label::new(Some(&format!("{label} (coming soon)")));
+                disabled.set_halign(gtk4::Align::Start);
+                disabled.set_sensitive(false);
+                root.append(&disabled);
+            }
+        }
     }
 
-    for label in ["Week", "Year", "Agenda", "5 days"] {
-        let disabled = gtk4::Label::new(Some(&format!("{label} (coming soon)")));
-        disabled.set_halign(gtk4::Align::Start);
-        disabled.set_sensitive(false);
-        root.append(&disabled);
+    root.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+    let checkboxes: [SettingsCheckboxSpec; 3] = [
+        ("Show weekends", |s| s.show_weekends, |s, v| s.show_weekends = v),
+        ("Show declined events", |s| s.show_declined_events, |s, v| s.show_declined_events = v),
+        ("Show completed tasks", |s| s.show_completed_tasks, |s, v| s.show_completed_tasks = v),
+    ];
+    for (label, get, set) in checkboxes {
+        let checkbox = gtk4::CheckButton::builder().label(label).build();
+        checkbox.set_active(get(&load_settings(storage).unwrap_or_default()));
+        {
+            let storage = storage.clone();
+            let sender = sender.clone();
+            checkbox.connect_toggled(move |cb| {
+                let mut settings = load_settings(&storage).unwrap_or_default();
+                set(&mut settings, cb.is_active());
+                if let Err(err) = save_settings(&storage, &settings) {
+                    tracing::warn!(%err, "failed to save preferences");
+                }
+                sender.input(AppMsg::EventUpdated);
+            });
+        }
+        {
+            // Re-syncs the checkbox's displayed state every time the popover opens —
+            // it's built once in `init`, so without this a change made elsewhere (e.g.
+            // the Preferences window's own "Show weekends" switch) would only show up
+            // here after a restart.
+            let storage = storage.clone();
+            let checkbox_weak = checkbox.downgrade();
+            popover.connect_show(move |_| {
+                if let Some(checkbox) = checkbox_weak.upgrade() {
+                    checkbox.set_active(get(&load_settings(&storage).unwrap_or_default()));
+                }
+            });
+        }
+        root.append(&checkbox);
     }
 
     popover.set_child(Some(&root));
     popover
 }
 
-/// Fills the Day view's header row (DESIGN_SPEC.md §10): the primary timezone's
+/// Fills the Day/5-day view's header row (DESIGN_SPEC.md §10) for each date in `dates`
+/// (1 date for `ViewMode::Day`, 5 for `ViewMode::FiveDay`): the primary timezone's
 /// abbreviation (matching the width of the hour grid's gutter, so it lines up with the
 /// hour labels below it, mirroring the Google Calendar PWA's day/week view corner
-/// label) followed by the day cell itself — an uppercase weekday abbreviation over a
-/// date number, the number badged in the accent color only when `date` is `today`
-/// (same convention as `populate_month_grid`'s `.today-badge`). Also (re)builds the
-/// all-day strip directly underneath from any `all_day` events on `date`, reusing
-/// `event_row`/`wire_event_click` so an all-day event opens the same detail popover a
-/// month-view chip does; the strip hides itself via `set_visible` when there are none,
-/// rather than always reserving empty space.
+/// label) followed by one day cell per date — an uppercase weekday abbreviation over a
+/// date number, the number badged in the accent color only when that date is `today`
+/// (same convention as `populate_month_grid`'s `.today-badge`). With a single date, a
+/// trailing gutter-width spacer balances the leading `tz_label` so the one day cell is
+/// centered over the hour grid's event column rather than the whole header row — with
+/// several dates this centering trick doesn't apply (each cell already evenly divides
+/// the remaining width, matching `populate_day_hour_grid`'s per-day hour cells), so the
+/// spacer is omitted. Also (re)builds the all-day strip directly underneath from any
+/// `all_day` events on each date, reusing `event_row`/`wire_event_click` so an all-day
+/// event opens the same detail popover a month-view chip does — a single vertical stack
+/// for one date, or `dates.len()` side-by-side columns (behind a leading gutter-width
+/// spacer) for several; the strip hides itself via `set_visible` when there are no
+/// all-day events on any date shown, rather than always reserving empty space.
 fn populate_day_header(
     header: &gtk4::Box,
     all_day: &gtk4::Box,
-    date: NaiveDate,
+    dates: &[NaiveDate],
     today: NaiveDate,
     events: &[DisplayEvent],
     ctx: &EventCtx,
@@ -1781,60 +2057,97 @@ fn populate_day_header(
     tz_label.set_valign(gtk4::Align::End);
     header.append(&tz_label);
 
-    let day_cell = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-    day_cell.set_hexpand(true);
-    day_cell.set_halign(gtk4::Align::Center);
-    day_cell.set_margin_top(4);
-    day_cell.set_margin_bottom(4);
+    for &date in dates {
+        let day_cell = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        day_cell.set_hexpand(true);
+        day_cell.set_halign(gtk4::Align::Center);
+        day_cell.set_margin_top(4);
+        day_cell.set_margin_bottom(4);
+        if dates.len() > 1 {
+            day_cell.add_css_class("day-header-cell");
+        }
 
-    let weekday_label = gtk4::Label::new(Some(&date.format("%a").to_string().to_uppercase()));
-    weekday_label.add_css_class("day-header-weekday");
-    if date == today {
-        weekday_label.add_css_class("day-header-weekday-today");
+        let weekday_label = gtk4::Label::new(Some(&date.format("%a").to_string().to_uppercase()));
+        weekday_label.add_css_class("day-header-weekday");
+        if date == today {
+            weekday_label.add_css_class("day-header-weekday-today");
+        }
+        day_cell.append(&weekday_label);
+
+        let date_label = gtk4::Label::new(Some(&date.day().to_string()));
+        date_label.add_css_class("day-header-date");
+        if date == today {
+            date_label.add_css_class("today-badge-lg");
+        }
+        day_cell.append(&date_label);
+
+        header.append(&day_cell);
     }
-    day_cell.append(&weekday_label);
 
-    let date_label = gtk4::Label::new(Some(&date.day().to_string()));
-    date_label.add_css_class("day-header-date");
-    if date == today {
-        date_label.add_css_class("today-badge-lg");
+    if dates.len() == 1 {
+        // Balances the leading `tz_label` gutter so the single day cell is centered
+        // over the hour grid's event column rather than the whole header row.
+        let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        spacer.set_width_request(GUTTER_WIDTH_PX);
+        header.append(&spacer);
     }
-    day_cell.append(&date_label);
-
-    header.append(&day_cell);
-
-    // Balances the leading `tz_label` gutter so `day_cell` is centered over the hour
-    // grid's event column rather than the whole header row.
-    let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    spacer.set_width_request(GUTTER_WIDTH_PX);
-    header.append(&spacer);
 
     clear_children(all_day);
-    let date_key = date.format("%Y-%m-%d").to_string();
-    let mut has_all_day = false;
-    for event in events.iter().filter(|e| e.all_day && e.start_date() == date_key) {
-        has_all_day = true;
-        let row = event_row(event, ctx.time_format);
-        wire_event_click(&row, event, ctx);
-        all_day.append(&row);
+    if dates.len() == 1 {
+        all_day.set_orientation(gtk4::Orientation::Vertical);
+        all_day.remove_css_class("day-all-day-row-multi");
+        all_day.add_css_class("day-all-day-row");
+        let date_key = dates[0].format("%Y-%m-%d").to_string();
+        let mut has_all_day = false;
+        for event in events.iter().filter(|e| e.all_day && e.start_date() == date_key) {
+            has_all_day = true;
+            let row = event_row(event, ctx.time_format);
+            wire_event_click(&row, event, ctx);
+            all_day.append(&row);
+        }
+        all_day.set_visible(has_all_day);
+    } else {
+        all_day.set_orientation(gtk4::Orientation::Horizontal);
+        all_day.remove_css_class("day-all-day-row");
+        all_day.add_css_class("day-all-day-row-multi");
+
+        let gutter_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        gutter_spacer.set_width_request(GUTTER_WIDTH_PX);
+        all_day.append(&gutter_spacer);
+
+        let mut has_any = false;
+        for &date in dates {
+            let column = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            column.set_hexpand(true);
+            let date_key = date.format("%Y-%m-%d").to_string();
+            for event in events.iter().filter(|e| e.all_day && e.start_date() == date_key) {
+                has_any = true;
+                let row = event_row(event, ctx.time_format);
+                wire_event_click(&row, event, ctx);
+                column.append(&row);
+            }
+            all_day.append(&column);
+        }
+        all_day.set_visible(has_any);
     }
-    all_day.set_visible(has_all_day);
 }
 
-/// Fills the Day view's hour grid (DESIGN_SPEC.md §12's Time scale option) with one
-/// fixed-height row per `scale_minutes` interval (24*60/`scale_minutes` rows — always a
-/// whole number, since `DAY_TIME_SCALE_OPTIONS` all divide 60 evenly): a time label in
-/// the left gutter at every hour boundary (blank elsewhere, and blank at midnight —
-/// matching Google Calendar's own day view, which doesn't label the very top edge) and
-/// a bordered cell to its right whose top edge draws that row's line, styled slightly
-/// lighter for the sub-hour lines a finer scale adds than for the hour lines. Each row
-/// is `DAY_ROW_HEIGHT_PX` tall regardless of the grid's allocated size, since (unlike
-/// `populate_month_grid`'s row-homogeneous stretch-to-fit grid) the Day view is meant
-/// to scroll, not shrink events to fit — so a finer `scale_minutes` (more, shorter
-/// intervals) makes the whole grid taller rather than each row shorter. Called on
-/// every `App::refresh` (cheap: no measurement pass like `compute_max_visible_events`
-/// needs, just plain fixed-size widgets).
-fn populate_day_hour_grid(grid: &gtk4::Grid, time_format: TimeFormat, scale_minutes: i64) {
+/// Fills the Day/5-day view's hour grid (DESIGN_SPEC.md §12's Time scale option) with
+/// one fixed-height row per `scale_minutes` interval (24*60/`scale_minutes` rows —
+/// always a whole number, since `DAY_TIME_SCALE_OPTIONS` all divide 60 evenly): a time
+/// label in the left gutter at every hour boundary (blank elsewhere, and blank at
+/// midnight — matching Google Calendar's own day view, which doesn't label the very
+/// top edge) and `day_count` bordered cells to its right (one per day column; `1` for
+/// `ViewMode::Day`, `5` for `ViewMode::FiveDay`) whose top edge draws that row's line,
+/// styled slightly lighter for the sub-hour lines a finer scale adds than for the hour
+/// lines, plus a right-border divider between adjacent day columns when `day_count >
+/// 1`. Each row is `DAY_ROW_HEIGHT_PX` tall regardless of the grid's allocated size,
+/// since (unlike `populate_month_grid`'s row-homogeneous stretch-to-fit grid) the Day
+/// view is meant to scroll, not shrink events to fit — so a finer `scale_minutes`
+/// (more, shorter intervals) makes the whole grid taller rather than each row shorter.
+/// Called on every `App::refresh` (cheap: no measurement pass like
+/// `compute_max_visible_events` needs, just plain fixed-size widgets).
+fn populate_day_hour_grid(grid: &gtk4::Grid, time_format: TimeFormat, scale_minutes: i64, day_count: usize) {
     clear_children(grid);
 
     let row_count = 24 * 60 / scale_minutes;
@@ -1853,16 +2166,21 @@ fn populate_day_hour_grid(grid: &gtk4::Grid, time_format: TimeFormat, scale_minu
         label.set_width_request(GUTTER_WIDTH_PX);
         grid.attach(&label, 0, row as i32, 1, 1);
 
-        let cell = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        cell.add_css_class("day-hour-cell");
-        if row == 0 {
-            cell.add_css_class("day-hour-cell-first");
-        } else if minute_of_day % 60 != 0 {
-            cell.add_css_class("day-hour-cell-minor");
+        for day_index in 0..day_count {
+            let cell = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+            cell.add_css_class("day-hour-cell");
+            if row == 0 {
+                cell.add_css_class("day-hour-cell-first");
+            } else if minute_of_day % 60 != 0 {
+                cell.add_css_class("day-hour-cell-minor");
+            }
+            if day_count > 1 && day_index + 1 < day_count {
+                cell.add_css_class("day-hour-cell-divider");
+            }
+            cell.set_hexpand(true);
+            cell.set_size_request(-1, DAY_ROW_HEIGHT_PX);
+            grid.attach(&cell, 1 + day_index as i32, row as i32, 1, 1);
         }
-        cell.set_hexpand(true);
-        cell.set_size_request(-1, DAY_ROW_HEIGHT_PX);
-        grid.attach(&cell, 1, row as i32, 1, 1);
     }
 }
 
@@ -1886,15 +2204,19 @@ fn clear_day_overlay_extras(overlay: &gtk4::Overlay) {
     }
 }
 
-/// Rebuilds the Day view's scrollable body for `date`: the hour grid
-/// (`populate_day_hour_grid`), every non-all-day event on `date` positioned by time
-/// (`day_event_block`), and — only when `date` is `today` — a red current-time line
-/// and dot (mirroring Google Calendar's own day view) at the current local time's
-/// vertical offset. Safe to call on every `App::refresh`, like every other
-/// `populate_*` function in this file.
+/// Rebuilds the Day/5-day view's scrollable body for `dates` (1 date for
+/// `ViewMode::Day`, 5 for `ViewMode::FiveDay`): the hour grid
+/// (`populate_day_hour_grid`), every non-all-day event on each date positioned by time
+/// within that date's own column (`day_event_block`), and — only for whichever date
+/// equals `today`, if any is currently shown — a red current-time line and dot
+/// (mirroring Google Calendar's own day view) at the current local time's vertical
+/// offset, confined to that date's column. Safe to call on every `App::refresh`, like
+/// every other `populate_*` function in this file. With `dates.len() == 1` this
+/// computes the exact same single day-column geometry as before generalizing to N
+/// days.
 fn populate_day_view(
     overlay: &gtk4::Overlay,
-    date: NaiveDate,
+    dates: &[NaiveDate],
     today: NaiveDate,
     events: &[DisplayEvent],
     ctx: &EventCtx,
@@ -1905,47 +2227,58 @@ fn populate_day_view(
     // children (the previous call's now-line/dot/event blocks) go through
     // `clear_day_overlay_extras` instead.
     if let Some(grid) = overlay.child().and_downcast::<gtk4::Grid>() {
-        populate_day_hour_grid(&grid, ctx.time_format, scale_minutes);
+        populate_day_hour_grid(&grid, ctx.time_format, scale_minutes, dates.len());
     }
     clear_day_overlay_extras(overlay);
 
     let pixels_per_minute = DAY_ROW_HEIGHT_PX as f64 / scale_minutes as f64;
+    let day_count = dates.len().max(1) as i32;
     // `overlay.width()` reads 0 before the window's first real layout pass (same
     // Wayland/compositor-round-trip issue `compute_max_visible_events` documents for
     // the month grid's height) — `init`'s size-polling timer and the `default-width`
     // resize watcher both re-run this function once a real width is available, so a
     // brief undersized first frame self-corrects rather than needing special-casing
     // here.
-    let available_width = (overlay.width() - GUTTER_WIDTH_PX - 8).max(60);
+    let total_columns_width = (overlay.width() - GUTTER_WIDTH_PX - 8).max(60 * day_count);
+    let day_column_width = total_columns_width / day_count;
 
-    let date_key = date.format("%Y-%m-%d").to_string();
-    for layout in layout_day_events(events, &date_key) {
-        if let Some(block) =
-            day_event_block(layout.event, layout.lane, layout.columns, available_width, pixels_per_minute, scale_minutes, ctx)
-        {
-            overlay.add_overlay(&block);
+    for (day_index, &date) in dates.iter().enumerate() {
+        let day_x_offset = GUTTER_WIDTH_PX + day_index as i32 * day_column_width;
+        let date_key = date.format("%Y-%m-%d").to_string();
+        let column = DayColumnGeometry { width_px: day_column_width, x_offset_px: day_x_offset };
+        for layout in layout_day_events(events, &date_key) {
+            if let Some(block) =
+                day_event_block(layout.event, layout.lane, layout.columns, column, pixels_per_minute, scale_minutes, ctx)
+            {
+                overlay.add_overlay(&block);
+            }
         }
-    }
 
-    if date == today {
-        let now = Local::now();
-        let now_px = ((now.hour() as f64 * 60.0 + now.minute() as f64) * pixels_per_minute).round() as i32;
+        if date == today {
+            let now = Local::now();
+            let now_px = ((now.hour() as f64 * 60.0 + now.minute() as f64) * pixels_per_minute).round() as i32;
 
-        let line = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        line.add_css_class("day-now-line");
-        line.set_valign(gtk4::Align::Start);
-        line.set_halign(gtk4::Align::Fill);
-        line.set_margin_top(now_px);
-        line.set_margin_start(GUTTER_WIDTH_PX);
-        overlay.add_overlay(&line);
+            let line = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+            line.add_css_class("day-now-line");
+            line.set_valign(gtk4::Align::Start);
+            line.set_margin_top(now_px);
+            line.set_margin_start(day_x_offset);
+            if dates.len() == 1 {
+                line.set_halign(gtk4::Align::Fill);
+            } else {
+                line.set_halign(gtk4::Align::Start);
+                line.set_size_request(day_column_width, -1);
+            }
+            overlay.add_overlay(&line);
 
-        let dot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        dot.add_css_class("day-now-dot");
-        dot.set_valign(gtk4::Align::Start);
-        dot.set_halign(gtk4::Align::Start);
-        dot.set_margin_top(now_px - 4);
-        dot.set_margin_start(GUTTER_WIDTH_PX - 4);
-        overlay.add_overlay(&dot);
+            let dot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+            dot.add_css_class("day-now-dot");
+            dot.set_valign(gtk4::Align::Start);
+            dot.set_halign(gtk4::Align::Start);
+            dot.set_margin_top(now_px - 4);
+            dot.set_margin_start(day_x_offset - 4);
+            overlay.add_overlay(&dot);
+        }
     }
 }
 
@@ -2032,13 +2365,26 @@ fn layout_day_events<'a>(events: &'a [DisplayEvent], date_key: &str) -> Vec<DayE
     out
 }
 
-/// One positioned event block for the Day view's hour grid: top offset and height come
-/// from the event's start time and duration (in the viewer's local time — Google
-/// Calendar events are stored/queried in UTC/RFC 3339, per `DisplayEvent`), scaled by
-/// `pixels_per_minute` (which follows the current Time scale setting, §12). `lane`/
-/// `columns` (from `layout_day_events`) split `available_width_px` evenly so
+/// One day's horizontal slot within the Day/5-day view's hour grid — `width_px` is
+/// that day's share of the grid's total width (the whole width for `ViewMode::Day`,
+/// one-fifth of it for `ViewMode::FiveDay`), `x_offset_px` is where that slot starts
+/// (`GUTTER_WIDTH_PX` for the single Day-view column, or that plus the day's index
+/// times `width_px` for a 5-day column). Bundled into one struct, rather than two
+/// more `day_event_block` parameters, to keep its argument count down.
+#[derive(Clone, Copy)]
+struct DayColumnGeometry {
+    width_px: i32,
+    x_offset_px: i32,
+}
+
+/// One positioned event block for the Day/5-day view's hour grid: top offset and
+/// height come from the event's start time and duration (in the viewer's local time —
+/// Google Calendar events are stored/queried in UTC/RFC 3339, per `DisplayEvent`),
+/// scaled by `pixels_per_minute` (which follows the current Time scale setting, §12).
+/// `lane`/`columns` (from `layout_day_events`) split `column.width_px` evenly so
 /// overlapping events share the day column side by side instead of drawing on top of
-/// each other.
+/// each other; `column.x_offset_px` positions the whole block in the right day column
+/// to begin with (see `DayColumnGeometry`).
 ///
 /// Internally a horizontal split: a start–end time bubble pinned to the right at its
 /// own natural size, and a subject/body text column on the left with `hexpand: true`
@@ -2093,7 +2439,7 @@ fn day_event_block(
     event: &DisplayEvent,
     lane: usize,
     columns: usize,
-    available_width_px: i32,
+    column: DayColumnGeometry,
     pixels_per_minute: f64,
     scale_minutes: i64,
     ctx: &EventCtx,
@@ -2106,7 +2452,7 @@ fn day_event_block(
     let top = (start_minutes * pixels_per_minute).round() as i32;
     let height = (duration_minutes * pixels_per_minute).round() as i32;
 
-    let column_width = available_width_px / columns as i32;
+    let column_width = column.width_px / columns as i32;
     const COLUMN_GAP_PX: i32 = 2;
 
     let card = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
@@ -2123,7 +2469,7 @@ fn day_event_block(
     card.set_overflow(gtk4::Overflow::Hidden);
     let card_width = (column_width - COLUMN_GAP_PX).max(20);
     card.set_margin_top(top);
-    card.set_margin_start(GUTTER_WIDTH_PX + 4 + lane as i32 * column_width);
+    card.set_margin_start(column.x_offset_px + 4 + lane as i32 * column_width);
     card.set_size_request(card_width, height.max(18));
     card.set_cursor_from_name(Some("pointer"));
 
@@ -4841,11 +5187,12 @@ struct ShortcutGroup {
 
 /// The bindings DESIGN_SPEC.md §10 defines for Calendarchy's keyboard navigation —
 /// the header bar's `?` button (and, per §12, the `?` key itself) opens a read-only
-/// cheat sheet listing exactly this set. Not every entry is wired up yet (Week/Year/
-/// Agenda/5-day views and event creation are later roadmap phases, §19 — D/M are live,
-/// see `install_view_shortcuts`), but the legend documents the full intended scheme
-/// rather than only what's implemented so far — the same "coming soon" treatment the
-/// sidebar and header bar already give other not-yet-built features.
+/// cheat sheet listing exactly this set. Not every entry is wired up yet
+/// (Schedule/Week/Year views and event creation are later roadmap phases, §19 —
+/// D/M/X are live, see `install_view_shortcuts`), but the legend documents the full
+/// intended scheme rather than only what's implemented so far — the same "coming
+/// soon" treatment the sidebar and header bar already give other not-yet-built
+/// features.
 const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
     ShortcutGroup {
         title: "Navigation",
@@ -4862,8 +5209,8 @@ const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             ("W", "Week view"),
             ("M", "Month view"),
             ("Y", "Year view"),
-            ("A", "Agenda view"),
-            ("X", "5-day work week view"),
+            ("A", "Schedule view"),
+            ("X", "5-day view"),
         ],
     },
     ShortcutGroup {
@@ -5556,14 +5903,17 @@ fn wire_settings_scrollspy(
 /// change, matching how GNOME's own Settings app behaves).
 ///
 /// Follows the app's established "coming soon" convention (visible-but-disabled rows
-/// with an explanatory tooltip/subtitle, e.g. the header bar's Week/Day/Year view
+/// with an explanatory tooltip/subtitle, e.g. the header bar's Schedule/Week/Year view
 /// entries or the event editor's recurrence/notification controls) for settings that
-/// don't have a feature to attach to yet — desktop notifications, "Show weekends"/
-/// "Show declined events"/"Show completed tasks", and per-account poll interval
-/// overrides — rather than hiding the knob entirely, so the extensibility is visible
-/// before those features land (§6's rationale for the same treatment of the
-/// Contacts/Notes/Tasks service toggles). World Clock (below) is real, not "coming
-/// soon" — it has a sidebar module to attach to (`populate_world_clock`).
+/// don't have a feature to attach to yet — desktop notifications, "Show declined
+/// events"/"Show completed tasks", and per-account poll interval overrides — rather
+/// than hiding the knob entirely, so the extensibility is visible before those
+/// features land (§6's rationale for the same treatment of the Contacts/Notes/Tasks
+/// service toggles). World Clock (below) is real, not "coming soon" — it has a
+/// sidebar module to attach to (`populate_world_clock`). "Show weekends" is likewise
+/// real now (its row below is enabled, unlike the two "Show ..." rows after it) — it
+/// feeds `five_day_window`, though only the 5-day view (not yet Month/Week) consults
+/// it.
 ///
 /// Laid out as a persistent two-pane shell (`adw::Dialog`, not the old
 /// `adw::PreferencesDialog` view-switcher tabs) — a left nav list built by
@@ -6463,7 +6813,7 @@ fn show_preferences_window(ctx: SettingsCtx) {
     layout_group.add(
         &adw::ActionRow::builder()
             .title("Default view on launch")
-            .subtitle("Month — Week/Day/Year/Agenda/5-day are on the roadmap")
+            .subtitle("Month — Day and 5-day views exist now but aren't selectable here yet; Week/Year/Schedule are still on the roadmap")
             .build(),
     );
 
@@ -6518,14 +6868,24 @@ fn show_preferences_window(ctx: SettingsCtx) {
     add_settings_nav_item(&sidebar_list, &nav_anchors, &nav_search_rows, "View options", layout_group.upcast_ref());
 
     let view_events_group = adw::PreferencesGroup::builder().title("Events").build();
-    view_events_group.add(
-        &adw::SwitchRow::builder()
-            .title("Show weekends")
-            .subtitle("Coming soon")
-            .active(settings.borrow().show_weekends)
-            .sensitive(false)
-            .build(),
-    );
+    let show_weekends_row = adw::SwitchRow::builder()
+        .title("Show weekends")
+        .subtitle("Currently only affects the 5-day view — Month still shows every day")
+        .active(settings.borrow().show_weekends)
+        .build();
+    {
+        let settings = settings.clone();
+        let storage = ctx.storage.clone();
+        let sender = ctx.sender.clone();
+        show_weekends_row.connect_active_notify(move |row| {
+            settings.borrow_mut().show_weekends = row.is_active();
+            if let Err(err) = save_settings(&storage, &settings.borrow()) {
+                tracing::warn!(%err, "failed to save preferences");
+            }
+            sender.input(AppMsg::EventUpdated);
+        });
+    }
+    view_events_group.add(&show_weekends_row);
     view_events_group.add(
         &adw::SwitchRow::builder()
             .title("Show declined events")
@@ -6615,7 +6975,7 @@ fn show_preferences_window(ctx: SettingsCtx) {
     let custom_view_label_refs: Vec<&str> = custom_view_labels.iter().map(String::as_str).collect();
     let custom_view_combo = adw::ComboRow::builder()
         .title("Set custom view")
-        .subtitle("Coming soon — only the fixed 5-day work week view is on the roadmap (§10)")
+        .subtitle("Coming soon — the 5-day view (§10) is fixed at 5 days; picking a different day count isn't wired up yet")
         .model(&gtk4::StringList::new(&custom_view_label_refs))
         .selected((settings.borrow().custom_view_days.clamp(2, 7) - 2) as u32)
         .build();
@@ -6944,6 +7304,10 @@ fn load_static_css() {
             border-radius: 12px;
             background-color: alpha(currentColor, 0.02);
         }
+        button.view-switcher-button {
+            border: 1px solid alpha(currentColor, 0.15);
+            background-color: alpha(currentColor, 0.05);
+        }
         .description-frame {
             border: 1px solid alpha(currentColor, 0.15);
             border-radius: 8px;
@@ -7227,6 +7591,12 @@ fn load_static_css() {
         .day-all-day-row {
             padding: 2px 4px 6px calc(52px + 4px);
         }
+        .day-all-day-row-multi {
+            padding: 2px 4px 6px 0;
+        }
+        .day-header-cell {
+            border-right: 1px solid alpha(currentColor, 0.12);
+        }
         .day-hour-label {
             font-size: 0.75em;
             opacity: 0.55;
@@ -7240,6 +7610,9 @@ fn load_static_css() {
         }
         .day-hour-cell-minor {
             border-top: 1px solid alpha(currentColor, 0.06);
+        }
+        .day-hour-cell-divider {
+            border-right: 1px solid alpha(currentColor, 0.12);
         }
         .day-now-line {
             min-height: 2px;
@@ -7444,5 +7817,161 @@ mod day_view_layout_tests {
         assert_eq!(cycle_day_time_scale(5, true), 5, "already finest, stays clamped");
         assert_eq!(cycle_day_time_scale(5, false), 10);
         assert_eq!(cycle_day_time_scale(60, false), 60, "already coarsest, stays clamped");
+    }
+
+    fn d(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).expect("valid date")
+    }
+
+    #[test]
+    fn five_day_window_with_weekends_centers_on_anchor() {
+        // Thu 2026-09-03, matching the reference screenshot: Tue Sep1 .. Sat Sep5,
+        // with the anchor (today) as the 3rd of 5 columns.
+        let window = five_day_window(d(2026, 9, 3), true);
+        assert_eq!(window, vec![d(2026, 9, 1), d(2026, 9, 2), d(2026, 9, 3), d(2026, 9, 4), d(2026, 9, 5)]);
+    }
+
+    #[test]
+    fn five_day_window_without_weekends_skips_saturday_and_sunday() {
+        // Thu 2026-09-03 anchor: 2 business days before/after, no Sat/Sun.
+        let window = five_day_window(d(2026, 9, 3), false);
+        assert_eq!(window, vec![d(2026, 9, 1), d(2026, 9, 2), d(2026, 9, 3), d(2026, 9, 4), d(2026, 9, 7)]);
+    }
+
+    #[test]
+    fn five_day_window_without_weekends_snaps_a_weekend_anchor_forward() {
+        // Sat 2026-09-05 anchor snaps forward to Mon 2026-09-07 before centering.
+        let window = five_day_window(d(2026, 9, 5), false);
+        assert_eq!(window, vec![d(2026, 9, 3), d(2026, 9, 4), d(2026, 9, 7), d(2026, 9, 8), d(2026, 9, 9)]);
+    }
+
+    #[test]
+    fn step_weekdays_skips_weekends_in_both_directions() {
+        assert_eq!(step_weekdays(d(2026, 9, 3), 5), d(2026, 9, 10), "Thu +5 weekdays lands on the next Thu");
+        assert_eq!(step_weekdays(d(2026, 9, 3), -5), d(2026, 8, 27), "Thu -5 weekdays lands on the previous Thu");
+        assert_eq!(step_weekdays(d(2026, 9, 4), 1), d(2026, 9, 7), "Fri +1 weekday skips the weekend to Mon");
+    }
+
+    #[test]
+    fn five_day_title_within_one_month() {
+        let dates = five_day_window(d(2026, 9, 3), true);
+        assert_eq!(five_day_title(&dates), "September 2026");
+    }
+
+    #[test]
+    fn five_day_title_spans_a_month_boundary() {
+        // Mon 2026-08-31 anchor: window spans Aug 29 .. Sep 2.
+        let dates = five_day_window(d(2026, 8, 31), true);
+        assert_eq!(five_day_title(&dates), "Aug 29 – Sep 2, 2026");
+    }
+
+    #[test]
+    fn five_day_title_spans_a_year_boundary() {
+        // Thu 2026-01-01 anchor: window spans Dec 30, 2025 .. Jan 3, 2026.
+        let dates = five_day_window(d(2026, 1, 1), true);
+        assert_eq!(five_day_title(&dates), "Dec 30, 2025 – Jan 3, 2026");
+    }
+
+    #[test]
+    fn edge_zone_caps_at_a_third_of_card_height() {
+        assert_eq!(day_drag_edge_zone_px(60), 10, "capped at DAY_EVENT_EDGE_GRAB_PX, not a third of 60");
+        assert_eq!(day_drag_edge_zone_px(18), 6, "a third of the shortest card height (18px)");
+        assert_eq!(day_drag_edge_zone_px(1), 1, "floored at 1px even for a near-zero-height card");
+    }
+
+    #[test]
+    fn classify_day_drag_zone_resolves_edges_and_body() {
+        assert_eq!(classify_day_drag_zone(0.0, 60), DayDragZone::ResizeTop);
+        assert_eq!(classify_day_drag_zone(10.0, 60), DayDragZone::ResizeTop, "boundary is inclusive");
+        assert_eq!(classify_day_drag_zone(11.0, 60), DayDragZone::Move);
+        assert_eq!(classify_day_drag_zone(49.0, 60), DayDragZone::Move);
+        assert_eq!(classify_day_drag_zone(50.0, 60), DayDragZone::ResizeBottom);
+        assert_eq!(classify_day_drag_zone(60.0, 60), DayDragZone::ResizeBottom);
+
+        // A short (18px) card: edge zones (6px each) must not swallow the middle.
+        assert_eq!(classify_day_drag_zone(3.0, 18), DayDragZone::ResizeTop);
+        assert_eq!(classify_day_drag_zone(9.0, 18), DayDragZone::Move);
+        assert_eq!(classify_day_drag_zone(15.0, 18), DayDragZone::ResizeBottom);
+    }
+
+    #[test]
+    fn snap_minutes_rounds_to_nearest_scale_increment() {
+        assert_eq!(snap_minutes_since_midnight(7.0, 15), 0);
+        assert_eq!(snap_minutes_since_midnight(23.0, 15), 30);
+        assert_eq!(snap_minutes_since_midnight(37.0, 15), 30);
+        assert_eq!(snap_minutes_since_midnight(38.0, 15), 45);
+        assert_eq!(snap_minutes_since_midnight(29.0, 60), 0);
+        assert_eq!(snap_minutes_since_midnight(30.0, 60), 60, "half-way rounds up");
+    }
+
+    fn dt(date: NaiveDate, hour: u32, minute: u32) -> DateTime<Local> {
+        local_datetime(date, NaiveTime::from_hms_opt(hour, minute, 0).expect("valid time"))
+    }
+
+    #[test]
+    fn compute_drag_move_snaps_to_grid_and_preserves_duration() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
+        let state = DayDragState { zone: DayDragZone::Move, original_start: dt(date, 12, 0), original_end: dt(date, 13, 0) };
+
+        let result = compute_day_drag_times(&state, 22.0, 1.0, 15);
+
+        assert_eq!(result.start, dt(date, 12, 15));
+        assert_eq!(result.end, dt(date, 13, 15), "duration must stay exactly 1h");
+    }
+
+    #[test]
+    fn compute_drag_move_clamps_at_midnight() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
+        let state = DayDragState { zone: DayDragZone::Move, original_start: dt(date, 0, 5), original_end: dt(date, 1, 5) };
+
+        let result = compute_day_drag_times(&state, -1000.0, 1.0, 15);
+
+        assert_eq!(result.start, dt(date, 0, 0), "can't move before the start of the day");
+        assert_eq!(result.end, dt(date, 1, 0), "duration preserved even when clamped");
+    }
+
+    #[test]
+    fn compute_drag_move_clamps_at_day_end() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
+        let state = DayDragState { zone: DayDragZone::Move, original_start: dt(date, 22, 0), original_end: dt(date, 23, 0) };
+
+        let result = compute_day_drag_times(&state, 1000.0, 1.0, 15);
+
+        assert_eq!(result.start, dt(date, 23, 0), "can't move past the end of the day");
+        assert_eq!(result.end, dt(date, 0, 0) + Duration::days(1), "clamped end lands exactly at midnight");
+    }
+
+    #[test]
+    fn compute_drag_resize_top_moves_start_only() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
+        let state = DayDragState { zone: DayDragZone::ResizeTop, original_start: dt(date, 12, 0), original_end: dt(date, 13, 0) };
+
+        let result = compute_day_drag_times(&state, -22.0, 1.0, 15);
+
+        assert_eq!(result.start, dt(date, 11, 45));
+        assert_eq!(result.end, dt(date, 13, 0), "end must not move");
+    }
+
+    #[test]
+    fn compute_drag_resize_top_clamps_at_min_duration() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
+        // A short 20-minute event: dragging the start far down can't compress it past 15m.
+        let state = DayDragState { zone: DayDragZone::ResizeTop, original_start: dt(date, 12, 0), original_end: dt(date, 12, 20) };
+
+        let result = compute_day_drag_times(&state, 1000.0, 1.0, 15);
+
+        assert_eq!(result.start, dt(date, 12, 5), "clamped to end minus the 15-minute floor");
+        assert_eq!(result.end, dt(date, 12, 20));
+    }
+
+    #[test]
+    fn compute_drag_resize_bottom_clamps_at_min_duration() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
+        let state = DayDragState { zone: DayDragZone::ResizeBottom, original_start: dt(date, 12, 0), original_end: dt(date, 12, 20) };
+
+        let result = compute_day_drag_times(&state, -1000.0, 1.0, 15);
+
+        assert_eq!(result.start, dt(date, 12, 0));
+        assert_eq!(result.end, dt(date, 12, 15), "clamped to start plus the 15-minute floor");
     }
 }

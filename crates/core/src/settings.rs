@@ -148,9 +148,10 @@ pub struct AppSettings {
     /// matching Google Calendar's own default.
     pub auto_add_google_meet: bool,
     /// "Show weekends" (§12's View options group) — whether Saturday/Sunday columns
-    /// render in Month/Week grids. The month grid is Sunday-first and always renders
-    /// all seven columns today, so this is stored ahead of the toggle actually doing
-    /// anything, same as `default_event_duration_minutes` above.
+    /// render. The 5-day view consults this (`five_day_window` in `crates/app`:
+    /// on, a rolling calendar-day window that may include a weekend; off, a rolling
+    /// business-day-only window). The month grid is Sunday-first and always renders
+    /// all seven columns today, so Month/Week don't consult this yet.
     pub show_weekends: bool,
     /// "Show declined events" (§12) — dims rather than hides events the signed-in
     /// account has declined, per `events.self_response_status` (§8). No view reads
@@ -233,6 +234,13 @@ pub struct AppSettings {
     /// anchor. `None` means it hasn't been moved yet and opens at the built-in
     /// default offset.
     pub notification_dialog_position: Option<(i32, i32)>,
+    /// Sidebar width, as a fraction of the window's width at the time it was last
+    /// dragged (sidebar_px / window_px) rather than a raw pixel count — so the panel
+    /// keeps looking proportionally the same after the window moves to a monitor with
+    /// different scaling/DPI or a different size. `None` means "not yet customized,
+    /// use the built-in default" (the old fixed 240px sidebar against the 1100px
+    /// default window width).
+    pub sidebar_width_fraction: Option<f64>,
 }
 
 impl Default for AppSettings {
@@ -278,6 +286,7 @@ impl Default for AppSettings {
             custom_notification_dialog_enabled: true,
             notification_sound_path: None,
             notification_dialog_position: None,
+            sidebar_width_fraction: None,
         }
     }
 }
@@ -361,6 +370,7 @@ mod tests {
         settings.custom_notification_dialog_enabled = false;
         settings.notification_sound_path = Some("/home/user/sounds/chime.ogg".into());
         settings.notification_dialog_position = Some((64, 32));
+        settings.sidebar_width_fraction = Some(0.3);
         save_settings(&storage, &settings).expect("save");
 
         let loaded = load_settings(&storage).expect("load");
