@@ -237,6 +237,35 @@ impl Component for App {
                         connect_clicked => AppMsg::ToggleSidebar,
                     },
 
+                    pack_start = &gtk4::Button {
+                        set_label: "Create",
+                        add_css_class: "pill",
+                        add_css_class: "suggested-action",
+                        connect_clicked => AppMsg::CreateEvent,
+                    },
+
+                    pack_start = &gtk4::Button {
+                        set_label: "Today",
+                        add_css_class: "pill",
+                        connect_clicked => AppMsg::Today,
+                    },
+
+                    pack_start = &gtk4::Box {
+                        add_css_class: "linked",
+                        set_orientation: gtk4::Orientation::Horizontal,
+
+                        gtk4::Button {
+                            set_icon_name: "go-previous-symbolic",
+                            set_tooltip_text: Some("Previous"),
+                            connect_clicked => AppMsg::PrevPeriod,
+                        },
+                        gtk4::Button {
+                            set_icon_name: "go-next-symbolic",
+                            set_tooltip_text: Some("Next"),
+                            connect_clicked => AppMsg::NextPeriod,
+                        },
+                    },
+
                     #[name = "window_title"]
                     #[wrap(Some)]
                     set_title_widget = &adw::WindowTitle {
@@ -372,40 +401,6 @@ impl Component for App {
                         set_spacing: 12,
                         set_margin_all: 12,
 
-                        gtk4::Box {
-                            set_orientation: gtk4::Orientation::Horizontal,
-                            set_spacing: 6,
-
-                            gtk4::Button {
-                                set_label: "Create",
-                                add_css_class: "pill",
-                                add_css_class: "suggested-action",
-                                connect_clicked => AppMsg::CreateEvent,
-                            },
-
-                            gtk4::Button {
-                                set_label: "Today",
-                                add_css_class: "pill",
-                                connect_clicked => AppMsg::Today,
-                            },
-
-                            gtk4::Box {
-                                add_css_class: "linked",
-                                set_orientation: gtk4::Orientation::Horizontal,
-
-                                gtk4::Button {
-                                    set_icon_name: "go-previous-symbolic",
-                                    set_tooltip_text: Some("Previous"),
-                                    connect_clicked => AppMsg::PrevPeriod,
-                                },
-                                gtk4::Button {
-                                    set_icon_name: "go-next-symbolic",
-                                    set_tooltip_text: Some("Next"),
-                                    connect_clicked => AppMsg::NextPeriod,
-                                },
-                            },
-                        },
-
                         #[name = "month_view_container"]
                         gtk4::ScrolledWindow {
                             add_css_class: "calendar-card",
@@ -525,7 +520,16 @@ impl Component for App {
 
         populate_month_grid(&widgets.month_grid, today, today, &events, &ctx);
         populate_day_header(&widgets.day_header_box, &widgets.day_all_day_box, &[today], today, &events, &ctx);
-        populate_day_view(&widgets.day_overlay, &[today], today, &events, &ctx, settings.day_time_scale_minutes);
+        populate_day_view(
+            &widgets.day_overlay,
+            &[today],
+            today,
+            &events,
+            &ctx,
+            settings.day_time_scale_minutes,
+            settings.day_drag_snap_ctrl_minutes,
+            settings.day_drag_snap_ctrl_shift_minutes,
+        );
         {
             // The sidebar's mini calendar isn't inside a popover of its own, so
             // there's nothing to accidentally close early here — jumping a month and
@@ -855,7 +859,16 @@ impl App {
             ViewMode::Day | ViewMode::Month => vec![self.current_date],
         };
         populate_day_header(&widgets.day_header_box, &widgets.day_all_day_box, &day_view_dates, today, &events, &ctx);
-        populate_day_view(&widgets.day_overlay, &day_view_dates, today, &events, &ctx, settings.day_time_scale_minutes);
+        populate_day_view(
+            &widgets.day_overlay,
+            &day_view_dates,
+            today,
+            &events,
+            &ctx,
+            settings.day_time_scale_minutes,
+            settings.day_drag_snap_ctrl_minutes,
+            settings.day_drag_snap_ctrl_shift_minutes,
+        );
         {
             let jump = jump_to_date_callback(sender);
             populate_mini_calendar(
@@ -1833,20 +1846,56 @@ fn event_row(event: &DisplayEvent, time_format: TimeFormat) -> gtk4::Box {
     row_box
 }
 
-/// Wires an on-grid event row (built by `event_row`) so clicking it pops up
+/// Max gap `wire_event_click`/`install_day_event_drag` wait after a first click before
+/// giving up on it turning into a double-click and actually popping `show_event_popover`
+/// open — both defer that popover by this long (`gtk4::glib::timeout_add_local_once`,
+/// same debounce idiom `install_sidebar_resize_persistence` uses for its own
+/// cancel-and-reschedule timer) so a genuine double-click can cancel the pending
+/// popover and call `open_event_editor` instead, with the popover never having been
+/// shown at all. 400ms matches the default `gtk-double-click-time` most GTK apps ship
+/// with.
+const EVENT_DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Wires an on-grid event row (built by `event_row`) so a single click pops up
 /// `show_event_popover` anchored to it — the "nice summary with other controls" the
 /// month grid didn't have before, mirroring how the Google Calendar PWA opens an
-/// event's detail card from its month-view chip.
+/// event's detail card from its month-view chip — while a double-click skips the
+/// popover and jumps straight to `open_event_editor`, matching how double-clicking an
+/// event opens it for editing in Google Calendar/most desktop calendar apps.
 fn wire_event_click(row: &gtk4::Box, event: &DisplayEvent, ctx: &EventCtx) {
     let gesture = gtk4::GestureClick::new();
     let anchor = row.clone();
     let event = event.clone();
     let ctx = ctx.clone();
-    // `pressed`, not `released`: popping up the popover from the same click's
-    // release can race with that click's implicit ungrab and dismiss it instantly.
-    gesture.connect_pressed(move |gesture, _n_press, _x, _y| {
+    // The popover from a first press is deferred by `EVENT_DOUBLE_CLICK_WINDOW` rather
+    // than shown immediately: GTK's `GestureClick` fires `pressed` once per physical
+    // press (`n_press == 1` for the first, `n_press == 2` for the second of a
+    // double-click), so showing the popover synchronously on every press would make it
+    // visibly flash open before the edit dialog replaced it. Deferring lets the
+    // `n_press >= 2` branch cancel that pending popover outright, so a double-click
+    // never shows it at all.
+    let pending_popover: Rc<Cell<Option<gtk4::glib::SourceId>>> = Rc::new(Cell::new(None));
+    gesture.connect_pressed(move |gesture, n_press, _x, _y| {
         gesture.set_state(gtk4::EventSequenceState::Claimed);
-        show_event_popover(&anchor, &event, &ctx);
+        if n_press >= 2 {
+            if let Some(id) = pending_popover.take() {
+                id.remove();
+            }
+            open_event_editor(event.id, &ctx);
+            return;
+        }
+        if let Some(id) = pending_popover.take() {
+            id.remove();
+        }
+        let anchor = anchor.clone();
+        let event = event.clone();
+        let ctx = ctx.clone();
+        let pending_popover_for_timer = pending_popover.clone();
+        let id = gtk4::glib::timeout_add_local_once(EVENT_DOUBLE_CLICK_WINDOW, move || {
+            pending_popover_for_timer.set(None);
+            show_event_popover(&anchor, &event, &ctx);
+        });
+        pending_popover.set(Some(id));
     });
     row.add_controller(gesture);
 }
@@ -2221,6 +2270,8 @@ fn populate_day_view(
     events: &[DisplayEvent],
     ctx: &EventCtx,
     scale_minutes: i64,
+    ctrl_snap_minutes: i64,
+    ctrl_shift_snap_minutes: i64,
 ) {
     // The grid itself is the Overlay's persistent main child (declared in the `view!`
     // macro), so only its own children get cleared/rebuilt here — `Overlay`'s other
@@ -2247,11 +2298,18 @@ fn populate_day_view(
         let date_key = date.format("%Y-%m-%d").to_string();
         let column = DayColumnGeometry { width_px: day_column_width, x_offset_px: day_x_offset };
         for layout in layout_day_events(events, &date_key) {
-            if let Some(block) =
-                day_event_block(layout.event, layout.lane, layout.columns, column, pixels_per_minute, scale_minutes, ctx)
-            {
-                overlay.add_overlay(&block);
-            }
+            day_event_block(
+                overlay,
+                layout.event,
+                layout.lane,
+                layout.columns,
+                column,
+                pixels_per_minute,
+                scale_minutes,
+                ctrl_snap_minutes,
+                ctrl_shift_snap_minutes,
+                ctx,
+            );
         }
 
         if date == today {
@@ -2377,6 +2435,32 @@ struct DayColumnGeometry {
     x_offset_px: i32,
 }
 
+/// Threshold `day_event_block` collapses its time bubble to start-only at: below this
+/// many characters' worth of leftover subject width, the full "start–end" bubble is
+/// judged to be crowding the subject out rather than sharing the card with it.
+const MIN_SUBJECT_VISIBLE_CHARS: f64 = 20.0;
+
+/// The pixel width `day_event_block`'s `text_column` would have left for `subject` once
+/// `card`'s fixed chrome (its own `Box` spacing, `text_column`'s right margin, and
+/// `time_bubble`'s own natural width plus its left margin) is subtracted from
+/// `card_width` — the same arithmetic `card`'s `gtk4::Box` layout performs internally,
+/// just computed ahead of time so the decision of *which* bubble text to build can be
+/// made before either widget exists. `char_width_px` is `subject`'s own font's
+/// Pango-measured `approximate_char_width`, i.e. "one character" in whatever font size
+/// `.day-event-subject`'s CSS actually resolves to, not a hardcoded guess.
+fn subject_has_room(card_width: i32, time_bubble_natural_width: i32, char_width_px: f64) -> bool {
+    // Mirrors `card`'s own `gtk4::Box::new(Horizontal, 4)` spacing, `time_bubble`'s
+    // `set_margin_start(4)`, and `text_column`'s `set_margin_end(6)` — kept as named
+    // constants here rather than imported from `day_event_block` since GTK doesn't
+    // expose a "how much space would this box give child X" query to compute it from
+    // the widgets themselves ahead of layout.
+    const CARD_SPACING_PX: i32 = 4;
+    const TEXT_COLUMN_MARGIN_END_PX: i32 = 6;
+    const TIME_BUBBLE_MARGIN_START_PX: i32 = 4;
+    let available = card_width - CARD_SPACING_PX - TEXT_COLUMN_MARGIN_END_PX - TIME_BUBBLE_MARGIN_START_PX - time_bubble_natural_width;
+    available as f64 >= char_width_px * MIN_SUBJECT_VISIBLE_CHARS
+}
+
 /// One positioned event block for the Day/5-day view's hour grid: top offset and
 /// height come from the event's start time and duration (in the viewer's local time —
 /// Google Calendar events are stored/queried in UTC/RFC 3339, per `DisplayEvent`),
@@ -2386,8 +2470,8 @@ struct DayColumnGeometry {
 /// each other; `column.x_offset_px` positions the whole block in the right day column
 /// to begin with (see `DayColumnGeometry`).
 ///
-/// Internally a horizontal split: a start–end time bubble pinned to the right at its
-/// own natural size, and a subject/body text column on the left with `hexpand: true`
+/// Internally a horizontal split: a start–end time bubble pinned to the left at its
+/// own natural size, and a subject/body text column to its right with `hexpand: true`
 /// that gets whatever width is left over — ordinary `GtkBox` allocation, not manual
 /// math, so the text column shrinks to make room for the bubble instead of either one
 /// fighting the other for space.
@@ -2421,31 +2505,41 @@ struct DayColumnGeometry {
 ///   `xalign(0.0)` + `wrap(true)` instead, which suits their genuinely-constrained
 ///   ancestor chain but would not fix this Overlay-rooted one.
 ///
-/// One related, *not* fixed here: `time_bubble` below has no `max_width_chars`/
-/// `ellipsize` of its own, so at a high overlap count (`column_width` shrinks toward
-/// `MAX_DAY_EVENT_COLUMNS`) its natural width can exceed the lane's `column_width`,
-/// letting `card`'s own natural size (and thus its Overlay-clamped final size) bleed
-/// past that lane into its neighbor's. Same root cause family, different symptom, and a
-/// real design tradeoff to fix (truncate the time text, or rework how `card`'s width is
-/// pinned) rather than a one-line change alongside this one.
+/// `time_bubble` still has no `max_width_chars`/`ellipsize` of its own, so at a high
+/// overlap count its natural width could in principle still exceed the lane's
+/// `column_width` even after collapsing to the start-only text below — narrower, but
+/// not unboundedly so. Collapsing to start-only (`subject_has_room`) covers the common
+/// case; a full fix would still need truncating the time text itself or reworking how
+/// `card`'s width is pinned.
 ///
 /// Wired via `install_day_event_drag`, not `wire_event_click`: a plain click (no
 /// pointer movement) still opens the same `show_event_popover` detail card a
 /// month-view chip does, but a real drag on the body/top edge/bottom edge instead
-/// moves/resizes the event. Returns `None` if `start`/`end` don't parse as RFC 3339
-/// (shouldn't happen for a non-all-day `DisplayEvent`, but `populate_day_view` iterates
-/// a whole day's events and one bad row shouldn't blank the rest).
+/// moves/resizes the event. Adds nothing (and returns early) if `start`/`end` don't
+/// parse as RFC 3339 (shouldn't happen for a non-all-day `DisplayEvent`, but
+/// `populate_day_view` iterates a whole day's events and one bad row shouldn't blank
+/// the rest).
+///
+/// Builds *two* overlapping widgets, not one — `hit_box` (invisible, owns the drag
+/// gesture) and `card` (visible, purely decorative for input) — rather than one card
+/// that's both clicked/dragged and moved: see `install_day_event_drag`'s doc comment
+/// for why the widget a `GestureDrag` reads its motion offsets from can never also be
+/// the widget that drag repositions. Both are added directly to `overlay` here (rather
+/// than returned for the caller to add), since there are now two.
 fn day_event_block(
+    overlay: &gtk4::Overlay,
     event: &DisplayEvent,
     lane: usize,
     columns: usize,
     column: DayColumnGeometry,
     pixels_per_minute: f64,
     scale_minutes: i64,
+    ctrl_snap_minutes: i64,
+    ctrl_shift_snap_minutes: i64,
     ctx: &EventCtx,
-) -> Option<gtk4::Widget> {
-    let start = DateTime::parse_from_rfc3339(&event.start).ok()?.with_timezone(&Local);
-    let end = DateTime::parse_from_rfc3339(&event.end).ok()?.with_timezone(&Local);
+) {
+    let Some(start) = DateTime::parse_from_rfc3339(&event.start).ok().map(|d| d.with_timezone(&Local)) else { return };
+    let Some(end) = DateTime::parse_from_rfc3339(&event.end).ok().map(|d| d.with_timezone(&Local)) else { return };
 
     let start_minutes = start.hour() as f64 * 60.0 + start.minute() as f64;
     let duration_minutes = (end - start).num_minutes().max(15) as f64;
@@ -2468,10 +2562,13 @@ fn day_event_block(
     card.set_hexpand(false);
     card.set_overflow(gtk4::Overflow::Hidden);
     let card_width = (column_width - COLUMN_GAP_PX).max(20);
+    let card_margin_start = column.x_offset_px + 4 + lane as i32 * column_width;
     card.set_margin_top(top);
-    card.set_margin_start(column.x_offset_px + 4 + lane as i32 * column_width);
+    card.set_margin_start(card_margin_start);
     card.set_size_request(card_width, height.max(18));
-    card.set_cursor_from_name(Some("pointer"));
+    // Excluded from input picking entirely: `hit_box` (below) owns the drag gesture
+    // instead, so pointer events pass straight through `card` to it.
+    card.set_can_target(false);
 
     let text_column = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     text_column.set_hexpand(true);
@@ -2480,7 +2577,9 @@ fn day_event_block(
     // below ship with the wrong `halign` in the first place (see their doc comment).
     text_column.set_halign(gtk4::Align::Fill);
     text_column.set_valign(gtk4::Align::Start);
-    text_column.set_margin_start(6);
+    // On the right, not the left — `time_bubble` (appended before this, below) now sits
+    // to this column's left, so its edge-breathing-room margin moved with it.
+    text_column.set_margin_end(6);
     text_column.set_margin_top(3);
     text_column.set_margin_bottom(3);
 
@@ -2506,22 +2605,80 @@ fn day_event_block(
         body.set_hexpand(true);
         text_column.append(&body);
     }
-    card.append(&text_column);
 
-    // No `max_width_chars`/`ellipsize` here — known follow-up in this function's doc
-    // comment (bleeds into the neighboring lane at a high overlap count), not fixed yet.
-    let time_range = format!("{}–{}", format_clock(start.time(), ctx.time_format), format_clock(end.time(), ctx.time_format));
-    let time_bubble = gtk4::Label::new(Some(&time_range));
+    let time_bubble = gtk4::Label::new(None);
     time_bubble.add_css_class("day-event-time-bubble");
-    time_bubble.set_halign(gtk4::Align::End);
+    // Left-aligned, and appended to `card` before `text_column` below — the bubble sits
+    // at the card's left edge, with the subject/body text column filling the rest of
+    // the width to its right (mirrored from the original right-aligned layout).
+    time_bubble.set_halign(gtk4::Align::Start);
     time_bubble.set_valign(gtk4::Align::Start);
     time_bubble.set_margin_top(3);
-    time_bubble.set_margin_end(4);
+    time_bubble.set_margin_start(4);
+
+    // Built and measured with the full range first — `subject_has_room` needs the
+    // bubble's real, CSS-styled natural width (pill padding included) to know whether
+    // the subject line would be left with room for `MIN_SUBJECT_VISIBLE_CHARS` or more;
+    // "chars worth" is Pango's own `approximate_char_width` metric (what `GtkLabel`'s
+    // `max-width-chars`/`width-chars` are themselves built on) for `subject`'s actual
+    // font, not a hand-guessed pixels-per-char constant. Collapsing to start-only here,
+    // before either widget is added to `card`, means the card is sized/painted right on
+    // its first frame instead of jumping after an initial full-range layout.
+    let full_range = format!("{}–{}", format_clock(start.time(), ctx.time_format), format_clock(end.time(), ctx.time_format));
+    time_bubble.set_label(&full_range);
+    let time_bubble_width = time_bubble.measure(gtk4::Orientation::Horizontal, -1).1;
+    let char_width_px = subject.pango_context().metrics(None, None).approximate_char_width() as f64 / gtk4::pango::SCALE as f64;
+    let start_only = !subject_has_room(card_width, time_bubble_width, char_width_px);
+    if start_only {
+        time_bubble.set_label(&format_clock(start.time(), ctx.time_format));
+    }
     card.append(&time_bubble);
+    card.append(&text_column);
 
-    install_day_event_drag(&card, &time_bubble, event, card_width, pixels_per_minute, scale_minutes, ctx);
+    // Invisible, and never moved again once created — see `install_day_event_drag`'s
+    // doc comment for why this stability matters. Same initial geometry as `card`, so
+    // the zone classification/hover cursor it drives lines up with what's on screen.
+    let hit_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    hit_box.set_valign(gtk4::Align::Start);
+    hit_box.set_halign(gtk4::Align::Start);
+    hit_box.set_margin_top(top);
+    hit_box.set_margin_start(card_margin_start);
+    hit_box.set_size_request(card_width, height.max(18));
+    hit_box.set_cursor_from_name(Some("pointer"));
 
-    Some(card.upcast())
+    // Hidden until a drag actually starts (`install_day_event_drag`'s `connect_drag_begin`
+    // shows it, `connect_drag_end` hides it again) — its text is fixed at build time
+    // (today's configured snap intervals don't change mid-drag), so only its visibility
+    // and vertical position (tracking the card's current top, to stay just above it as
+    // it moves) need to change during the gesture.
+    let drag_hint = gtk4::Label::new(Some(&format!(
+        "Ctrl: {ctrl_snap_minutes}m snap   ·   Ctrl+Shift: {ctrl_shift_snap_minutes}m snap"
+    )));
+    drag_hint.add_css_class("day-drag-hint");
+    drag_hint.set_halign(gtk4::Align::Start);
+    drag_hint.set_valign(gtk4::Align::Start);
+    drag_hint.set_margin_start(card_margin_start);
+    drag_hint.set_margin_top((top - DAY_DRAG_HINT_OFFSET_PX).max(0));
+    drag_hint.set_visible(false);
+
+    install_day_event_drag(
+        &hit_box,
+        &card,
+        &time_bubble,
+        &drag_hint,
+        event,
+        card_width,
+        pixels_per_minute,
+        scale_minutes,
+        ctrl_snap_minutes,
+        ctrl_shift_snap_minutes,
+        start_only,
+        ctx,
+    );
+
+    overlay.add_overlay(&hit_box);
+    overlay.add_overlay(&card);
+    overlay.add_overlay(&drag_hint);
 }
 
 /// Which part of a Day-view event card a drag grabbed, decided once in
@@ -2563,6 +2720,13 @@ struct DayDragResult {
 /// `day_event_block`'s shortest-card floor (`height.max(18)`: 18 / 3 = 6px).
 const DAY_EVENT_EDGE_GRAB_PX: i32 = 10;
 
+/// Vertical gap `install_day_event_drag` keeps the drag-modifier hint (`.day-drag-hint`)
+/// above the card's current top edge while dragging — a fixed pixel offset rather than a
+/// measured one, since the hint's exact height isn't worth measuring for a transient,
+/// cosmetic label (contrast `subject_has_room`, which measures `time_bubble` because its
+/// width feeds a real layout decision).
+const DAY_DRAG_HINT_OFFSET_PX: i32 = 22;
+
 /// The 15-minute floor a drag (move or either resize) can never compress an event
 /// past — the same floor `layout_day_events`/`day_event_block` already clamp
 /// degenerate-duration events to (`.max(15)`), so a dragged card can't end up shorter
@@ -2594,6 +2758,31 @@ fn classify_day_drag_zone(y: f64, card_height: i32) -> DayDragZone {
     }
 }
 
+/// Resolves which snap granularity a Day view drag should use *right now*, from the
+/// gesture's current modifier state: Ctrl+Shift held snaps to `ctrl_shift_minutes`
+/// (`AppSettings::day_drag_snap_ctrl_shift_minutes`, 1 minute by default), plain Ctrl to
+/// `ctrl_minutes` (`day_drag_snap_ctrl_minutes`, 5 by default), and neither to
+/// `scale_minutes` (the Day view's own time-scale gridlines). Checking the Ctrl+Shift
+/// combo before plain Ctrl matters — `state.contains(CONTROL_MASK)` alone is also `true`
+/// when Shift is additionally held, so the more specific combo has to be tested first to
+/// resolve to the finer tier. Shared by `install_day_event_drag`'s `connect_drag_update`
+/// (live feedback) and `connect_drag_end` (commit) so a drag's on-screen granularity and
+/// its persisted result always agree.
+fn day_drag_snap_scale(
+    state: gtk4::gdk::ModifierType,
+    scale_minutes: i64,
+    ctrl_minutes: i64,
+    ctrl_shift_minutes: i64,
+) -> Option<i64> {
+    if state.contains(gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::SHIFT_MASK) {
+        Some(ctrl_shift_minutes)
+    } else if state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
+        Some(ctrl_minutes)
+    } else {
+        Some(scale_minutes)
+    }
+}
+
 /// Rounds `minutes` (since midnight, possibly fractional/negative) to the nearest
 /// multiple of `scale_minutes` — the same increment `populate_day_hour_grid` draws
 /// gridlines at, so a snapped drag always lands exactly on a visible line regardless of
@@ -2602,14 +2791,35 @@ fn snap_minutes_since_midnight(minutes: f64, scale_minutes: i64) -> i64 {
     (minutes / scale_minutes as f64).round() as i64 * scale_minutes
 }
 
+/// Resolves a raw (fractional, possibly off-grid) minutes-since-midnight value into a
+/// whole-minute one: `Some(scale)` snaps to the nearest multiple of `scale` (a visible
+/// gridline), `None` just rounds to the nearest whole minute — smooth, continuous
+/// tracking with no visible quantization at any sane `pixels_per_minute`, since
+/// sub-minute precision isn't distinguishable on screen. Used to keep
+/// `compute_day_drag_times`'s live-feedback and commit paths sharing identical
+/// clamping logic while differing only in this rounding granularity.
+fn resolve_minutes(minutes: f64, scale_minutes: Option<i64>) -> i64 {
+    match scale_minutes {
+        Some(scale) => snap_minutes_since_midnight(minutes, scale),
+        None => minutes.round() as i64,
+    }
+}
+
 /// Computes this drag's current proposed `(start, end)` from `state`'s pre-drag values
 /// plus the gesture's `offset_y` (px, positive = downward — same convention
-/// `card.set_margin_top` uses), snapping the resulting *absolute* clock time (not just
-/// the raw pixel delta) to the nearest gridline via `snap_minutes_since_midnight`, and
-/// clamping to the event's own calendar day and to `DAY_EVENT_MIN_DURATION_MINUTES`.
-/// Shared by the live-feedback path (`connect_drag_update`) and the commit path
-/// (`connect_drag_end`) so both apply identical math to identical inputs.
-fn compute_day_drag_times(state: &DayDragState, offset_y: f64, pixels_per_minute: f64, scale_minutes: i64) -> DayDragResult {
+/// `card.set_margin_top` uses), clamped to the event's own calendar day and to
+/// `DAY_EVENT_MIN_DURATION_MINUTES`. `scale_minutes` (via `resolve_minutes`) controls
+/// whether the resulting *absolute* clock time snaps to the nearest gridline
+/// (`Some`, used once on commit) or just the nearest whole minute (`None`, used on
+/// every live-feedback frame so the drag tracks the pointer smoothly instead of
+/// visibly stepping between gridlines). Shared by both paths so they apply identical
+/// math to identical inputs, differing only in that one parameter.
+fn compute_day_drag_times(
+    state: &DayDragState,
+    offset_y: f64,
+    pixels_per_minute: f64,
+    scale_minutes: Option<i64>,
+) -> DayDragResult {
     let raw_delta_minutes = offset_y / pixels_per_minute;
 
     let midnight = NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is always valid");
@@ -2621,22 +2831,22 @@ fn compute_day_drag_times(state: &DayDragState, offset_y: f64, pixels_per_minute
     let (start, end) = match state.zone {
         DayDragZone::Move => {
             let original_start_min = (state.original_start - day_start).num_minutes() as f64;
-            let snapped_min = snap_minutes_since_midnight(original_start_min + raw_delta_minutes, scale_minutes);
-            let start = (day_start + Duration::minutes(snapped_min)).max(day_start).min(day_end - duration);
+            let resolved_min = resolve_minutes(original_start_min + raw_delta_minutes, scale_minutes);
+            let start = (day_start + Duration::minutes(resolved_min)).max(day_start).min(day_end - duration);
             (start, start + duration)
         }
         DayDragZone::ResizeTop => {
             let end = state.original_end;
             let original_start_min = (state.original_start - day_start).num_minutes() as f64;
-            let snapped_min = snap_minutes_since_midnight(original_start_min + raw_delta_minutes, scale_minutes);
-            let start = (day_start + Duration::minutes(snapped_min)).max(day_start).min(end - min_duration);
+            let resolved_min = resolve_minutes(original_start_min + raw_delta_minutes, scale_minutes);
+            let start = (day_start + Duration::minutes(resolved_min)).max(day_start).min(end - min_duration);
             (start, end)
         }
         DayDragZone::ResizeBottom => {
             let start = state.original_start;
             let original_end_min = (state.original_end - day_start).num_minutes() as f64;
-            let snapped_min = snap_minutes_since_midnight(original_end_min + raw_delta_minutes, scale_minutes);
-            let end = (day_start + Duration::minutes(snapped_min)).max(start + min_duration).min(day_end);
+            let resolved_min = resolve_minutes(original_end_min + raw_delta_minutes, scale_minutes);
+            let end = (day_start + Duration::minutes(resolved_min)).max(start + min_duration).min(day_end);
             (start, end)
         }
     };
@@ -2646,28 +2856,41 @@ fn compute_day_drag_times(state: &DayDragState, offset_y: f64, pixels_per_minute
 
 /// Applies `result` to `card`'s geometry and `time_bubble`'s text — exactly the two
 /// properties `day_event_block` derives from an event's start/end at build time
-/// (`set_margin_top` / `set_size_request`'s height, and the "{start}–{end}" label),
-/// mutated in place so `connect_drag_update` never sends an `AppMsg` per pointer-move
+/// (`set_margin_top` / `set_size_request`'s height, and the time-bubble label), mutated
+/// in place so `connect_drag_update` never sends an `AppMsg` per pointer-move
 /// (`install_day_zoom_controller`'s "one message per meaningful action" precedent).
+/// Also keeps `drag_hint` (the Ctrl/Ctrl+Shift snap-interval reminder,
+/// `install_day_event_drag`'s doc comment) tracking just above `card`'s new top edge —
+/// only its position changes here, since its text is fixed at build time.
 /// `card_width` is fixed for the whole drag (a vertical drag never changes a card's
-/// per-lane column width), so only height/top change.
+/// per-lane column width), so only height/top change — and so is `start_only`
+/// (`day_event_block`'s own `subject_has_room` verdict for this card): the label is
+/// kept to whichever form the card started the drag in rather than re-measured on every
+/// pointer-move, so it doesn't flip formats mid-drag.
 fn apply_day_drag_geometry(
     card: &gtk4::Box,
     time_bubble: &gtk4::Label,
+    drag_hint: &gtk4::Label,
     card_width: i32,
     result: &DayDragResult,
     pixels_per_minute: f64,
     time_format: TimeFormat,
+    start_only: bool,
 ) {
     let top = ((result.start - result.day_start).num_minutes() as f64 * pixels_per_minute).round() as i32;
     let height = ((result.end - result.start).num_minutes() as f64 * pixels_per_minute).round() as i32;
     card.set_margin_top(top);
     card.set_size_request(card_width, height.max(18));
-    time_bubble.set_label(&format!(
-        "{}–{}",
-        format_clock(result.start.time(), time_format),
-        format_clock(result.end.time(), time_format)
-    ));
+    drag_hint.set_margin_top((top - DAY_DRAG_HINT_OFFSET_PX).max(0));
+    time_bubble.set_label(&if start_only {
+        format_clock(result.start.time(), time_format)
+    } else {
+        format!(
+            "{}–{}",
+            format_clock(result.start.time(), time_format),
+            format_clock(result.end.time(), time_format)
+        )
+    });
 }
 
 /// Persists a completed move/resize drag's final start/end for event `event_id`,
@@ -2724,34 +2947,70 @@ fn commit_day_drag(event_id: i64, result: &DayDragResult, ctx: &EventCtx) {
 /// only — the all-day strip and Month view keep plain `wire_event_click`, out of this
 /// feature's scope) with a single drag-aware `GestureDrag`: `connect_drag_begin`
 /// classifies the press into a `DayDragZone` (`classify_day_drag_zone`) and snapshots
-/// the event's pre-drag start/end; `connect_drag_update` live-mutates the card's own
-/// geometry/time-bubble label on every pointer move (`apply_day_drag_geometry`)
-/// without ever touching `AppMsg`; `connect_drag_end` either falls back to a plain
-/// click (`show_event_popover`, if total movement stayed under
-/// `DAY_EVENT_CLICK_MOVE_THRESHOLD_PX`) or commits the final snapped start/end
-/// (`commit_day_drag`). A single `GestureDrag` (rather than layering a second
-/// controller alongside `wire_event_click`'s `GestureClick`) avoids a race between the
-/// two: `GestureClick::connect_pressed` fires — and would open the popover — before any
+/// the event's pre-drag start/end; `connect_drag_update` live-mutates `card`'s
+/// geometry/time-bubble label on every pointer move (`apply_day_drag_geometry`, snapped
+/// per `day_drag_snap_scale` — the current time-scale gridline by default, or one of the
+/// two configurable overrides while Ctrl/Ctrl+Shift is held, checked live via
+/// `current_event_state()` — same convention `install_day_zoom_controller` uses for its
+/// own Ctrl+scroll check) without ever touching `AppMsg`; `connect_drag_end`, if total
+/// movement stayed under
+/// `DAY_EVENT_CLICK_MOVE_THRESHOLD_PX`, treats it as a plain click — deferring
+/// `show_event_popover` by `EVENT_DOUBLE_CLICK_WINDOW` exactly like `wire_event_click`
+/// does, so a second such click arriving before that timer fires cancels the pending
+/// popover and calls `open_event_editor` instead, rather than committing a move/resize
+/// (`commit_day_drag`, snapped the same way — matching whichever granularity was in
+/// effect at release).
+///
+/// The `GestureDrag`/hover `EventControllerMotion` attach to `hit_box`, *not* `card` —
+/// deliberately two different widgets. GTK computes a gesture's `offset_x`/`offset_y`
+/// by translating each new pointer event into its target widget's *local* coordinate
+/// space using that widget's *current* transform, while the drag's start reference was
+/// captured once using the *original* transform. If the gesture's target widget were
+/// the same one `connect_drag_update` repositions (as an earlier version of this
+/// function did), that mutation would keep shifting the very frame the next offset is
+/// measured in — a closed feedback loop that made the card lag and flicker between
+/// positions instead of tracking the pointer. `hit_box` is built once in
+/// `day_event_block` with the same geometry `card` starts at and is never itself
+/// moved, so its coordinate frame — and thus every offset GTK reports through it —
+/// stays exactly correct for the gesture's whole lifetime; `card` (with
+/// `set_can_target(false)`) never owns a controller and is purely what gets moved.
+///
+/// A single `GestureDrag` (rather than layering a second controller alongside
+/// `wire_event_click`'s `GestureClick`) avoids a race between the two:
+/// `GestureClick::connect_pressed` fires — and would open the popover — before any
 /// drag motion could be detected, since GTK doesn't itself arbitrate between
 /// independently-added, ungrouped gesture controllers on the same widget.
 ///
 /// `card_width`/`pixels_per_minute`/`scale_minutes` are `day_event_block`'s own values
 /// for this card, threaded straight through rather than re-derived, so the drag always
-/// uses the exact geometry/scale the card was last drawn at.
+/// uses the exact geometry/scale the card was last drawn at. `start_only` is that same
+/// call's `subject_has_room` verdict, threaded through to `apply_day_drag_geometry` so
+/// the live drag preview's time-bubble format matches whatever `time_bubble` was already
+/// built with instead of reverting to the full range on the first pointer-move.
 fn install_day_event_drag(
+    hit_box: &gtk4::Box,
     card: &gtk4::Box,
     time_bubble: &gtk4::Label,
+    drag_hint: &gtk4::Label,
     event: &DisplayEvent,
     card_width: i32,
     pixels_per_minute: f64,
     scale_minutes: i64,
+    ctrl_snap_minutes: i64,
+    ctrl_shift_snap_minutes: i64,
+    start_only: bool,
     ctx: &EventCtx,
 ) {
     let gesture = gtk4::GestureDrag::new();
     let drag_state: Rc<RefCell<Option<DayDragState>>> = Rc::new(RefCell::new(None));
+    // The popover for a plain-click release is deferred by `EVENT_DOUBLE_CLICK_WINDOW`
+    // rather than shown immediately — see `wire_event_click`'s doc comment for why —
+    // so a following double-click can cancel it via this handle before it ever shows.
+    let pending_popover: Rc<Cell<Option<gtk4::glib::SourceId>>> = Rc::new(Cell::new(None));
 
     {
-        let card = card.clone();
+        let hit_box = hit_box.clone();
+        let drag_hint = drag_hint.clone();
         let event = event.clone();
         let drag_state = drag_state.clone();
         gesture.connect_drag_begin(move |gesture, _start_x, start_y| {
@@ -2759,11 +3018,12 @@ fn install_day_event_drag(
             let start = DateTime::parse_from_rfc3339(&event.start).ok().map(|d| d.with_timezone(&Local));
             let end = DateTime::parse_from_rfc3339(&event.end).ok().map(|d| d.with_timezone(&Local));
             let (Some(original_start), Some(original_end)) = (start, end) else { return };
-            let zone = classify_day_drag_zone(start_y, card.height());
-            card.set_cursor_from_name(Some(match zone {
+            let zone = classify_day_drag_zone(start_y, hit_box.height());
+            hit_box.set_cursor_from_name(Some(match zone {
                 DayDragZone::Move => "grabbing",
                 DayDragZone::ResizeTop | DayDragZone::ResizeBottom => "ns-resize",
             }));
+            drag_hint.set_visible(true);
             *drag_state.borrow_mut() = Some(DayDragState { zone, original_start, original_end });
         });
     }
@@ -2771,62 +3031,92 @@ fn install_day_event_drag(
     {
         let card = card.clone();
         let time_bubble = time_bubble.clone();
+        let drag_hint = drag_hint.clone();
         let drag_state = drag_state.clone();
         let time_format = ctx.time_format;
-        gesture.connect_drag_update(move |_gesture, _offset_x, offset_y| {
+        gesture.connect_drag_update(move |gesture, _offset_x, offset_y| {
             let state_guard = drag_state.borrow();
             let Some(state) = state_guard.as_ref() else { return };
-            let result = compute_day_drag_times(state, offset_y, pixels_per_minute, scale_minutes);
-            apply_day_drag_geometry(&card, &time_bubble, card_width, &result, pixels_per_minute, time_format);
+            // Checked live (not latched at drag-begin), so toggling Ctrl/Shift mid-drag
+            // flips the snap granularity immediately — same convention
+            // `install_day_zoom_controller` already uses for its own Ctrl+scroll check.
+            let scale =
+                day_drag_snap_scale(gesture.current_event_state(), scale_minutes, ctrl_snap_minutes, ctrl_shift_snap_minutes);
+            let result = compute_day_drag_times(state, offset_y, pixels_per_minute, scale);
+            apply_day_drag_geometry(&card, &time_bubble, &drag_hint, card_width, &result, pixels_per_minute, time_format, start_only);
         });
     }
 
     {
+        let hit_box = hit_box.clone();
         let card = card.clone();
+        let drag_hint = drag_hint.clone();
         let event = event.clone();
         let ctx = ctx.clone();
         let drag_state = drag_state.clone();
-        gesture.connect_drag_end(move |_gesture, offset_x, offset_y| {
-            card.set_cursor_from_name(Some("pointer"));
+        let pending_popover = pending_popover.clone();
+        gesture.connect_drag_end(move |gesture, offset_x, offset_y| {
+            hit_box.set_cursor_from_name(Some("pointer"));
+            drag_hint.set_visible(false);
             let Some(state) = drag_state.borrow_mut().take() else { return };
             let moved = (offset_x * offset_x + offset_y * offset_y).sqrt();
             if moved < DAY_EVENT_CLICK_MOVE_THRESHOLD_PX {
-                show_event_popover(&card, &event, &ctx);
+                if let Some(id) = pending_popover.take() {
+                    // A popover from the previous click is still pending: this is its
+                    // double-click, so cancel that popover and edit instead.
+                    id.remove();
+                    open_event_editor(event.id, &ctx);
+                    return;
+                }
+                let card = card.clone();
+                let event = event.clone();
+                let ctx = ctx.clone();
+                let pending_popover_for_timer = pending_popover.clone();
+                let id = gtk4::glib::timeout_add_local_once(EVENT_DOUBLE_CLICK_WINDOW, move || {
+                    pending_popover_for_timer.set(None);
+                    show_event_popover(&card, &event, &ctx);
+                });
+                pending_popover.set(Some(id));
                 return;
             }
-            let result = compute_day_drag_times(&state, offset_y, pixels_per_minute, scale_minutes);
+            // Commit whichever granularity was in effect at release (mirrors
+            // `connect_drag_update`'s own live check, so the persisted value always
+            // matches what was last shown on screen).
+            let scale =
+                day_drag_snap_scale(gesture.current_event_state(), scale_minutes, ctrl_snap_minutes, ctrl_shift_snap_minutes);
+            let result = compute_day_drag_times(&state, offset_y, pixels_per_minute, scale);
             commit_day_drag(event.id, &result, &ctx);
         });
     }
 
-    card.add_controller(gesture);
+    hit_box.add_controller(gesture);
 
     // Hover-only cursor affordance (no drag in progress): "grab" over the body,
     // "ns-resize" over either edge zone, falling back to "pointer" off the card —
-    // purely cosmetic, mirrors `card.set_cursor_from_name(Some("pointer"))`'s existing
-    // role at this card's build time. Skipped while `drag_state` is `Some` so it
-    // doesn't fight the "grabbing"/"ns-resize" cursor `connect_drag_begin` already set
-    // for the active gesture.
+    // purely cosmetic, mirrors `hit_box.set_cursor_from_name(Some("pointer"))`'s
+    // existing role at `hit_box`'s build time. Skipped while `drag_state` is `Some` so
+    // it doesn't fight the "grabbing"/"ns-resize" cursor `connect_drag_begin` already
+    // set for the active gesture.
     let motion = gtk4::EventControllerMotion::new();
     {
-        let card = card.clone();
+        let hit_box = hit_box.clone();
         let drag_state = drag_state.clone();
         motion.connect_motion(move |_, _x, y| {
             if drag_state.borrow().is_some() {
                 return;
             }
-            let zone = classify_day_drag_zone(y, card.height());
-            card.set_cursor_from_name(Some(match zone {
+            let zone = classify_day_drag_zone(y, hit_box.height());
+            hit_box.set_cursor_from_name(Some(match zone {
                 DayDragZone::Move => "grab",
                 DayDragZone::ResizeTop | DayDragZone::ResizeBottom => "ns-resize",
             }));
         });
     }
     {
-        let card = card.clone();
-        motion.connect_leave(move |_| card.set_cursor_from_name(Some("pointer")));
+        let hit_box = hit_box.clone();
+        motion.connect_leave(move |_| hit_box.set_cursor_from_name(Some("pointer")));
     }
-    card.add_controller(motion);
+    hit_box.add_controller(motion);
 }
 
 /// Scrolls the Day view so "now" isn't right at the very top edge — a few hours of
@@ -2841,6 +3131,22 @@ fn scroll_day_view_to_now(scroller: &gtk4::ScrolledWindow, scale_minutes: i64) {
     let now_px = (now.hour() as f64 * 60.0 + now.minute() as f64) * pixels_per_minute;
     let target = (now_px - 3.0 * 60.0 * pixels_per_minute).max(0.0);
     scroller.vadjustment().set_value(target);
+}
+
+/// Looks up `event_id`'s full `EventDetail` and the current calendar list, then opens
+/// `show_edit_event_dialog` pre-filled with it — the "jump straight to editing" action
+/// shared by the event popover's Edit button and a double-click on an event
+/// (`wire_event_click`/`install_day_event_drag`), so both paths resolve the event the
+/// same way instead of duplicating the lookup.
+fn open_event_editor(event_id: i64, ctx: &EventCtx) {
+    match event_detail(&ctx.storage, event_id) {
+        Ok(Some(detail)) => {
+            let calendars = calendars_by_account(&ctx.storage).unwrap_or_default();
+            show_edit_event_dialog(detail, calendars, ctx.clone());
+        }
+        Ok(None) => tracing::warn!(event_id, "event no longer exists; cannot edit"),
+        Err(err) => tracing::warn!(%err, event_id, "failed to load event for editing"),
+    }
 }
 
 /// Builds and pops up the event-detail card: a colored dot + title, the formatted
@@ -2876,14 +3182,7 @@ fn show_event_popover(anchor: &gtk4::Box, event: &DisplayEvent, ctx: &EventCtx) 
         let popover = popover.clone();
         edit_btn.connect_clicked(move |_| {
             popover.popdown();
-            match event_detail(&ctx.storage, event_id) {
-                Ok(Some(detail)) => {
-                    let calendars = calendars_by_account(&ctx.storage).unwrap_or_default();
-                    show_edit_event_dialog(detail, calendars, ctx.clone());
-                }
-                Ok(None) => tracing::warn!(event_id, "event no longer exists; cannot edit"),
-                Err(err) => tracing::warn!(%err, event_id, "failed to load event for editing"),
-            }
+            open_event_editor(event_id, &ctx);
         });
     }
     controls.append(&edit_btn);
@@ -4491,18 +4790,24 @@ fn apply_event_color_button_style(color_dot: &gtk4::Box, color: Option<&str>) {
 /// the single `minutes` value `EventReminder` (and Google's API) actually stores.
 const REMINDER_UNITS: [(&str, i64); 4] = [("minutes", 1), ("hours", 60), ("days", 24 * 60), ("weeks", 7 * 24 * 60)];
 
+/// The unit choices for the Preferences "Default snooze duration" setting and the
+/// floating dialog's Snooze button label — deliberately narrower than
+/// `REMINDER_UNITS` (no "weeks"; a snooze that long isn't a realistic use case), and
+/// abbreviated since both consumers show it inline next to a number.
+pub(crate) const SNOOZE_UNITS: [(&str, i64); 3] = [("mins", 1), ("hrs", 60), ("days", 24 * 60)];
+
 /// Google Calendar caps an event at 5 reminder overrides; the edit dialog's "Add
 /// notification" button disables itself at the same limit rather than accepting rows
 /// a real sync could never push.
 const MAX_REMINDERS: usize = 5;
 
-/// Splits a total lead time in minutes into a `(quantity, unit index into
-/// REMINDER_UNITS)` pair for display — the largest unit that divides evenly, so e.g.
-/// 10080 shows as "1 week" rather than "10080 minutes". `0` always displays as "0
-/// minutes" (there's no such thing as "0 weeks" as a distinct concept), which the
-/// `total_minutes != 0` guard on every non-minutes branch ensures.
-fn minutes_to_quantity_unit(total_minutes: i64) -> (i64, u32) {
-    for (index, &(_, multiplier)) in REMINDER_UNITS.iter().enumerate().rev() {
+/// Splits a total lead time in minutes into a `(quantity, unit index into `units`)`
+/// pair for display — the largest unit that divides evenly, so e.g. 10080 against
+/// `REMINDER_UNITS` shows as "1 week" rather than "10080 minutes". `0` always displays
+/// as index `0` (there's no such thing as "0 weeks" as a distinct concept), which the
+/// `total_minutes != 0` guard on every non-base-unit iteration ensures.
+pub(crate) fn minutes_to_quantity_unit(total_minutes: i64, units: &[(&str, i64)]) -> (i64, u32) {
+    for (index, &(_, multiplier)) in units.iter().enumerate().rev() {
         if total_minutes != 0 && total_minutes % multiplier == 0 {
             return (total_minutes / multiplier, index as u32);
         }
@@ -4536,7 +4841,7 @@ fn add_reminder_row(
     dirty: &Rc<Cell<bool>>,
     reminder: &EventReminder,
 ) {
-    let (quantity, unit_index) = minutes_to_quantity_unit(reminder.minutes);
+    let (quantity, unit_index) = minutes_to_quantity_unit(reminder.minutes, &REMINDER_UNITS);
 
     let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
     row.add_css_class("reminder-row");
@@ -5521,6 +5826,20 @@ const DISPLAY_TIMEZONE_CHOICES: &[&str] = &[
     "Pacific/Auckland",
 ];
 
+/// The full IANA tz database (~600 zones), sorted, backing the searchable time zone
+/// pickers — `DISPLAY_TIMEZONE_CHOICES` above is no longer the picker's model, just
+/// the seed order `add_zone_row`'s "next unused zone" logic prefers so a freshly
+/// added row still defaults to a familiar city. Computed once and cached since it's
+/// invariant for the process lifetime.
+fn timezone_choices() -> &'static [String] {
+    static CHOICES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    CHOICES.get_or_init(|| {
+        let mut zones: Vec<String> = chrono_tz::TZ_VARIANTS.iter().map(|tz| tz.name().to_string()).collect();
+        zones.sort();
+        zones
+    })
+}
+
 /// The system time zone's IANA name, for the Preferences window's read-only "System
 /// time zone" row (DESIGN_SPEC.md §12 — the grid and new events always use this one;
 /// there's no in-app override for it, only the secondary *display* zone alongside it).
@@ -5564,6 +5883,19 @@ fn world_clock_zone_label(zone: &str) -> String {
     zone.rsplit('/').next().unwrap_or(zone).replace('_', " ")
 }
 
+/// Maps a zone's local hour (0-23) to a symbolic icon name suggesting time of day.
+/// Bucket boundaries are approximate (no sunrise/sunset calculation) — just a
+/// glanceable cue, not astronomically accurate. All four names are confirmed present
+/// in the Adwaita icon theme installed on this machine.
+fn world_clock_time_of_day_icon(hour: u32) -> &'static str {
+    match hour {
+        5..=8 => "daytime-sunrise-symbolic",  // morning
+        9..=16 => "weather-clear-symbolic",   // noon / daytime
+        17..=19 => "daytime-sunset-symbolic", // evening
+        _ => "weather-clear-night-symbolic",  // twilight / night
+    }
+}
+
 /// Rebuilds the sidebar's World Clock module (DESIGN_SPEC.md §10/§12) — one row per
 /// zone in `settings.world_clock_zones`, in order, each showing that zone's current
 /// local time, directly underneath the mini-month date navigator. Hides the whole
@@ -5591,10 +5923,16 @@ fn populate_world_clock(container: &gtk4::Box, settings: &AppSettings) {
         name_label.set_hexpand(true);
         row.append(&name_label);
 
-        let time_text = zone
-            .parse::<Tz>()
-            .map(|tz| now.with_timezone(&tz).format("%-I:%M %p").to_string())
-            .unwrap_or_else(|_| "--:--".to_string());
+        let local_time = zone.parse::<Tz>().map(|tz| now.with_timezone(&tz)).ok();
+
+        let icon = gtk4::Image::from_icon_name(
+            local_time.map(|dt| world_clock_time_of_day_icon(dt.hour())).unwrap_or("weather-clear-symbolic"),
+        );
+        icon.add_css_class("dim-label");
+        icon.set_pixel_size(16);
+        row.append(&icon);
+
+        let time_text = local_time.map(|dt| dt.format("%-I:%M %p").to_string()).unwrap_or_else(|| "--:--".to_string());
         let time_label = gtk4::Label::new(Some(&time_text));
         time_label.add_css_class("dim-label");
         row.append(&time_label);
@@ -5617,6 +5955,40 @@ fn start_world_clock_ticker(world_clock_box: &gtk4::Box, storage: Storage) {
         populate_world_clock(&world_clock_box, &settings);
         gtk4::glib::ControlFlow::Continue
     });
+}
+
+/// Lights the insertion-line CSS class for `(row, is_before)` on a World Clock zone
+/// row, first clearing whatever row/edge `hover_indicator` previously pointed at (if
+/// different) so at most one line is ever showing — see `hover_indicator`'s doc
+/// comment in `rebuild_world_clock_zone_rows` for why that guard is needed.
+fn set_world_clock_drop_indicator(
+    hover_indicator: &Rc<RefCell<Option<(adw::ComboRow, bool)>>>,
+    row: &adw::ComboRow,
+    is_before: bool,
+) {
+    let mut current = hover_indicator.borrow_mut();
+    if let Some((prev_row, prev_before)) = current.as_ref() {
+        if *prev_row == *row && *prev_before == is_before {
+            return;
+        }
+    }
+    if let Some((prev_row, prev_before)) = current.take() {
+        prev_row.remove_css_class(if prev_before { "world-clock-drop-before" } else { "world-clock-drop-after" });
+    }
+    row.add_css_class(if is_before { "world-clock-drop-before" } else { "world-clock-drop-after" });
+    *current = Some((row.clone(), is_before));
+}
+
+/// Clears the insertion-line CSS class, but only if `hover_indicator` still points at
+/// `row` — guards against a stale `leave` clearing a line that's since moved to a
+/// different row (see `set_world_clock_drop_indicator`).
+fn clear_world_clock_drop_indicator(hover_indicator: &Rc<RefCell<Option<(adw::ComboRow, bool)>>>, row: &adw::ComboRow) {
+    let mut current = hover_indicator.borrow_mut();
+    if current.as_ref().map(|(prev_row, _)| prev_row == row).unwrap_or(false) {
+        if let Some((prev_row, prev_before)) = current.take() {
+            prev_row.remove_css_class(if prev_before { "world-clock-drop-before" } else { "world-clock-drop-after" });
+        }
+    }
 }
 
 /// Tears down and rebuilds the World Clock group's per-zone `adw::ComboRow`s (and the
@@ -5644,26 +6016,41 @@ fn rebuild_world_clock_zone_rows(
         group.remove(add_zone_row);
     }
 
+    // Tracks whichever single row/edge is currently showing the insertion line, so
+    // crossing from one row's bottom half into the next row's top half explicitly
+    // clears the old line before showing the new one — each row's `connect_motion`
+    // and `connect_leave` fire independently, and GTK doesn't guarantee the outgoing
+    // row's `leave` arrives before the incoming row's `motion`, so without this two
+    // lines can be lit at once for a moment as the pointer crosses the boundary.
+    let hover_indicator: Rc<RefCell<Option<(adw::ComboRow, bool)>>> = Rc::new(RefCell::new(None));
+
     let zone_count = settings.borrow().world_clock_zones.len();
     for index in 0..zone_count {
         let current_zone = settings.borrow().world_clock_zones[index].clone();
+        let choices: Vec<&str> = timezone_choices().iter().map(String::as_str).collect();
+        let search_expr =
+            gtk4::PropertyExpression::new(gtk4::StringObject::static_type(), None::<&gtk4::Expression>, "string");
         let row = adw::ComboRow::builder()
             .title(format!("Time zone {}", index + 1))
-            .model(&gtk4::StringList::new(DISPLAY_TIMEZONE_CHOICES))
+            .model(&gtk4::StringList::new(&choices))
+            .enable_search(true)
+            .expression(&search_expr)
+            .search_match_mode(gtk4::StringFilterMatchMode::Substring)
             .selected(
-                DISPLAY_TIMEZONE_CHOICES
+                timezone_choices()
                     .iter()
                     .position(|z| *z == current_zone)
                     .map(|i| i as u32)
                     .unwrap_or(0),
             )
             .build();
+        row.add_css_class("world-clock-row");
         {
             let settings = settings.clone();
             let storage = storage.clone();
             let world_clock_box = world_clock_box.clone();
             row.connect_selected_notify(move |combo| {
-                let zone = DISPLAY_TIMEZONE_CHOICES[combo.selected() as usize].to_string();
+                let zone = timezone_choices()[combo.selected() as usize].clone();
                 settings.borrow_mut().world_clock_zones[index] = zone;
                 if let Err(err) = save_settings(&storage, &settings.borrow()) {
                     tracing::warn!(%err, "failed to save preferences");
@@ -5672,51 +6059,99 @@ fn rebuild_world_clock_zone_rows(
             });
         }
 
-        let up_button = gtk4::Button::from_icon_name("go-up-symbolic");
-        up_button.add_css_class("flat");
-        up_button.set_valign(gtk4::Align::Center);
-        up_button.set_tooltip_text(Some("Move up"));
-        up_button.set_sensitive(index > 0);
-        {
-            let group = group.clone();
-            let rows = rows.clone();
-            let settings = settings.clone();
-            let storage = storage.clone();
-            let world_clock_box = world_clock_box.clone();
-            let add_zone_row = add_zone_row.clone();
-            up_button.connect_clicked(move |_| {
-                settings.borrow_mut().world_clock_zones.swap(index, index - 1);
-                if let Err(err) = save_settings(&storage, &settings.borrow()) {
-                    tracing::warn!(%err, "failed to save preferences");
-                }
-                rebuild_world_clock_zone_rows(&group, &rows, &settings, &storage, &world_clock_box, &add_zone_row);
-                populate_world_clock(&world_clock_box, &settings.borrow());
-            });
-        }
-        row.add_suffix(&up_button);
+        let drag_handle = gtk4::Image::from_icon_name("list-drag-handle-symbolic");
+        drag_handle.add_css_class("dim-label");
+        drag_handle.set_cursor_from_name(Some("grab"));
 
-        let down_button = gtk4::Button::from_icon_name("go-down-symbolic");
-        down_button.add_css_class("flat");
-        down_button.set_valign(gtk4::Align::Center);
-        down_button.set_tooltip_text(Some("Move down"));
-        down_button.set_sensitive(index + 1 < zone_count);
+        let drag_source = gtk4::DragSource::new();
+        drag_source.set_actions(gtk4::gdk::DragAction::MOVE);
+        drag_source.connect_prepare(move |_, _, _| {
+            Some(gtk4::gdk::ContentProvider::for_value(&(index as i32).to_value()))
+        });
         {
+            // Carries the actual row along under the cursor (rather than a generic
+            // drag icon) and dims the source row while it's lifted, so the drag reads
+            // as picking the row up rather than an instant teleport on drop.
+            let row = row.clone();
+            drag_source.connect_drag_begin(move |source, _drag| {
+                row.add_css_class("world-clock-row-dragging");
+                let paintable = gtk4::WidgetPaintable::new(Some(&row));
+                source.set_icon(Some(&paintable), row.width() / 2, row.height() / 2);
+            });
+        }
+        {
+            let row = row.clone();
+            drag_source.connect_drag_end(move |_, _, _| {
+                row.remove_css_class("world-clock-row-dragging");
+            });
+        }
+        {
+            let row = row.clone();
+            drag_source.connect_drag_cancel(move |_, _, _| {
+                row.remove_css_class("world-clock-row-dragging");
+                false
+            });
+        }
+        drag_handle.add_controller(drag_source);
+        row.add_prefix(&drag_handle);
+
+        let drop_target = gtk4::DropTarget::new(i32::static_type(), gtk4::gdk::DragAction::MOVE);
+        {
+            // Highlights whichever half of the row the pointer is over, so the user
+            // sees exactly where the dragged zone will land before releasing. Routed
+            // through `hover_indicator` so only ever one row/edge is lit at a time.
+            let row = row.clone();
+            let hover_indicator = hover_indicator.clone();
+            drop_target.connect_motion(move |_, _, y| {
+                let is_before = y < row.height() as f64 / 2.0;
+                set_world_clock_drop_indicator(&hover_indicator, &row, is_before);
+                gtk4::gdk::DragAction::MOVE
+            });
+        }
+        {
+            let row = row.clone();
+            let hover_indicator = hover_indicator.clone();
+            drop_target.connect_leave(move |_| {
+                clear_world_clock_drop_indicator(&hover_indicator, &row);
+            });
+        }
+        {
+            let row = row.clone();
+            let hover_indicator = hover_indicator.clone();
             let group = group.clone();
             let rows = rows.clone();
             let settings = settings.clone();
             let storage = storage.clone();
             let world_clock_box = world_clock_box.clone();
             let add_zone_row = add_zone_row.clone();
-            down_button.connect_clicked(move |_| {
-                settings.borrow_mut().world_clock_zones.swap(index, index + 1);
+            drop_target.connect_drop(move |_, value, _, y| {
+                clear_world_clock_drop_indicator(&hover_indicator, &row);
+                let Ok(source_index) = value.get::<i32>() else { return false };
+                let source_index = source_index as usize;
+                // Land before or after this row depending on which half was hovered,
+                // shifted left by one if the dragged zone started earlier in the list
+                // (removing it first shifts everything after it back by one).
+                let drop_after = y >= row.height() as f64 / 2.0;
+                let mut insert_at = if drop_after { index + 1 } else { index };
+                if source_index < insert_at {
+                    insert_at -= 1;
+                }
+                if insert_at == source_index {
+                    return true;
+                }
+                let mut s = settings.borrow_mut();
+                let zone = s.world_clock_zones.remove(source_index);
+                s.world_clock_zones.insert(insert_at, zone);
+                drop(s);
                 if let Err(err) = save_settings(&storage, &settings.borrow()) {
                     tracing::warn!(%err, "failed to save preferences");
                 }
                 rebuild_world_clock_zone_rows(&group, &rows, &settings, &storage, &world_clock_box, &add_zone_row);
                 populate_world_clock(&world_clock_box, &settings.borrow());
+                true
             });
         }
-        row.add_suffix(&down_button);
+        row.add_controller(drop_target);
 
         let remove_button = gtk4::Button::from_icon_name("user-trash-symbolic");
         remove_button.add_css_class("flat");
@@ -5741,6 +6176,15 @@ fn rebuild_world_clock_zone_rows(
         row.add_suffix(&remove_button);
 
         group.add(&row);
+        // Rebuilds happen wholesale (see doc comment above) rather than moving the
+        // widgets that survive a reorder, so every row is freshly created here —
+        // fade each one in from the next frame tick rather than popping straight to
+        // full opacity, so a drop reads as a settle rather than a flash.
+        row.add_css_class("world-clock-row-enter");
+        row.add_tick_callback(|widget, _clock| {
+            widget.remove_css_class("world-clock-row-enter");
+            gtk4::glib::ControlFlow::Break
+        });
         rows.borrow_mut().push(row.upcast::<gtk4::Widget>());
     }
 
@@ -5834,8 +6278,8 @@ fn apply_settings_nav_filter(query: &str, rows: &[SettingsSearchRow]) {
 
 /// Wires a `SearchEntry` sitting above the nav sidebar to filter its rows as-you-type
 /// (`apply_settings_nav_filter`). Escape-to-clear for this field is handled separately,
-/// right where it's wired up in `show_preferences_window`, since it also needs to fall
-/// through to closing the whole dialog once the field's already empty.
+/// by `install_escape_to_close_dialog`, since it also needs to fall through to closing
+/// the whole dialog once the field's already empty.
 fn wire_settings_nav_search(search_entry: &gtk4::SearchEntry, search_rows: &SettingsSearchRows) {
     let search_rows = search_rows.clone();
     search_entry.connect_search_changed(move |entry| {
@@ -5971,6 +6415,41 @@ fn install_settings_close_guard(window: &adw::Dialog) {
             }
         });
     });
+}
+
+/// Binds Escape for a dialog that owns a search field, so it always does *something*
+/// useful regardless of what currently has focus — unlike the event editor's plain
+/// `install_escape_to_close`, this one is two-stage: a first press clears `search_entry`
+/// (re-applying its filter immediately, same as `wire_settings_nav_search` does on
+/// every keystroke) if it has text, and only once it's already empty does a press
+/// close the dialog via `Dialog::close`, still routed through whatever `close-attempt`
+/// guard (e.g. `install_settings_close_guard`) is installed on `window`. `Global` scope
+/// (mirroring `install_escape_to_close`) is what makes the close-when-empty branch
+/// reachable at all when focus is on some other control entirely, not the search field
+/// — this is the single source of Escape behavior for the dialog, deliberately not
+/// paired with the search entry's own `stop-search` signal, so there's exactly one
+/// place deciding what Escape does instead of two handlers racing on the same key.
+fn install_escape_to_close_dialog(window: &adw::Dialog, search_entry: &gtk4::SearchEntry, search_rows: &SettingsSearchRows) {
+    let controller = gtk4::ShortcutController::new();
+    controller.set_scope(gtk4::ShortcutScope::Global);
+
+    let window_for_close = window.clone();
+    let search_entry = search_entry.clone();
+    let search_rows = search_rows.clone();
+    controller.add_shortcut(gtk4::Shortcut::new(
+        gtk4::ShortcutTrigger::parse_string("Escape"),
+        Some(gtk4::CallbackAction::new(move |_widget, _args| {
+            if search_entry.text().is_empty() {
+                window_for_close.close();
+            } else {
+                search_entry.set_text("");
+                apply_settings_nav_filter("", &search_rows.borrow());
+            }
+            gtk4::glib::Propagation::Stop
+        })),
+    ));
+
+    window.add_controller(controller);
 }
 
 fn show_preferences_window(ctx: SettingsCtx) {
@@ -6159,17 +6638,22 @@ fn show_preferences_window(ctx: SettingsCtx) {
     let system_tz = system_timezone_name();
     let system_choice_label = format!("System default ({system_tz})");
     let primary_choice_labels: Vec<&str> =
-        std::iter::once(system_choice_label.as_str()).chain(DISPLAY_TIMEZONE_CHOICES.iter().copied()).collect();
+        std::iter::once(system_choice_label.as_str()).chain(timezone_choices().iter().map(String::as_str)).collect();
+    let primary_search_expr =
+        gtk4::PropertyExpression::new(gtk4::StringObject::static_type(), None::<&gtk4::Expression>, "string");
     let primary_combo = adw::ComboRow::builder()
         .title("Primary time zone")
         .subtitle("Used for the calendar grid and new events")
         .model(&gtk4::StringList::new(&primary_choice_labels))
+        .enable_search(true)
+        .expression(&primary_search_expr)
+        .search_match_mode(gtk4::StringFilterMatchMode::Substring)
         .selected(
             settings
                 .borrow()
                 .primary_timezone
                 .as_deref()
-                .and_then(|tz| DISPLAY_TIMEZONE_CHOICES.iter().position(|z| *z == tz))
+                .and_then(|tz| timezone_choices().iter().position(|z| z == tz))
                 .map(|i| (i + 1) as u32)
                 .unwrap_or(0),
         )
@@ -6182,18 +6666,23 @@ fn show_preferences_window(ctx: SettingsCtx) {
         .build();
 
     let secondary_choice_labels: Vec<&str> =
-        std::iter::once("Select a time zone").chain(DISPLAY_TIMEZONE_CHOICES.iter().copied()).collect();
+        std::iter::once("Select a time zone").chain(timezone_choices().iter().map(String::as_str)).collect();
+    let secondary_search_expr =
+        gtk4::PropertyExpression::new(gtk4::StringObject::static_type(), None::<&gtk4::Expression>, "string");
     let secondary_combo = adw::ComboRow::builder()
         .title("Secondary time zone")
         .subtitle("Adds a second time gutter to Week/Day views — coming soon")
         .model(&gtk4::StringList::new(&secondary_choice_labels))
+        .enable_search(true)
+        .expression(&secondary_search_expr)
+        .search_match_mode(gtk4::StringFilterMatchMode::Substring)
         .sensitive(settings.borrow().display_secondary_timezone)
         .selected(
             settings
                 .borrow()
                 .secondary_timezone
                 .as_deref()
-                .and_then(|tz| DISPLAY_TIMEZONE_CHOICES.iter().position(|z| *z == tz))
+                .and_then(|tz| timezone_choices().iter().position(|z| z == tz))
                 .map(|i| (i + 1) as u32)
                 .unwrap_or(0),
         )
@@ -6228,7 +6717,7 @@ fn show_preferences_window(ctx: SettingsCtx) {
         let storage = ctx.storage.clone();
         primary_combo.connect_selected_notify(move |row| {
             let selected = row.selected();
-            let tz = (selected > 0).then(|| DISPLAY_TIMEZONE_CHOICES[selected as usize - 1].to_string());
+            let tz = (selected > 0).then(|| timezone_choices()[selected as usize - 1].clone());
             settings.borrow_mut().primary_timezone = tz;
             if let Err(err) = save_settings(&storage, &settings.borrow()) {
                 tracing::warn!(%err, "failed to save preferences");
@@ -6274,7 +6763,7 @@ fn show_preferences_window(ctx: SettingsCtx) {
                 settings
                     .primary_timezone
                     .as_deref()
-                    .and_then(|tz| DISPLAY_TIMEZONE_CHOICES.iter().position(|z| *z == tz))
+                    .and_then(|tz| timezone_choices().iter().position(|z| z == tz))
                     .map(|i| (i + 1) as u32)
                     .unwrap_or(0),
             );
@@ -6283,7 +6772,7 @@ fn show_preferences_window(ctx: SettingsCtx) {
                 settings
                     .secondary_timezone
                     .as_deref()
-                    .and_then(|tz| DISPLAY_TIMEZONE_CHOICES.iter().position(|z| *z == tz))
+                    .and_then(|tz| timezone_choices().iter().position(|z| z == tz))
                     .map(|i| (i + 1) as u32)
                     .unwrap_or(0),
             );
@@ -6301,7 +6790,7 @@ fn show_preferences_window(ctx: SettingsCtx) {
         let storage = ctx.storage.clone();
         secondary_combo.connect_selected_notify(move |row| {
             let selected = row.selected();
-            let tz = (selected > 0).then(|| DISPLAY_TIMEZONE_CHOICES[selected as usize - 1].to_string());
+            let tz = (selected > 0).then(|| timezone_choices()[selected as usize - 1].clone());
             settings.borrow_mut().secondary_timezone = tz;
             if let Err(err) = save_settings(&storage, &settings.borrow()) {
                 tracing::warn!(%err, "failed to save preferences");
@@ -6744,28 +7233,59 @@ fn show_preferences_window(ctx: SettingsCtx) {
     sound_row.add_suffix(&reset_sound_button);
     notif_group.add(&sound_row);
 
-    let snoozed_row = adw::SpinRow::builder()
+    let snoozed_row = adw::ActionRow::builder()
         .title("Default snooze duration")
-        .subtitle("How long the floating dialog's Snooze button delays a reminder by, in minutes — its dropdown offers other durations per-alert")
+        .subtitle("How long the floating dialog's Snooze button delays a reminder by — its own dropdown offers other durations per-alert")
         .build();
-    snoozed_row.set_adjustment(Some(&gtk4::Adjustment::new(
-        settings.borrow().default_snooze_minutes as f64,
-        1.0,
-        360.0,
-        1.0,
-        5.0,
-        0.0,
-    )));
-    {
+
+    let (snooze_quantity, snooze_unit_index) = minutes_to_quantity_unit(settings.borrow().default_snooze_minutes, &SNOOZE_UNITS);
+
+    let snooze_quantity_combo = gtk4::ComboBoxText::with_entry();
+    for preset in ["5", "10", "15", "30", "60"] {
+        snooze_quantity_combo.append_text(preset);
+    }
+    if let Some(entry) = snooze_quantity_combo.child().and_downcast::<gtk4::Entry>() {
+        entry.set_text(&snooze_quantity.to_string());
+        entry.set_width_chars(3);
+    }
+    snooze_quantity_combo.set_valign(gtk4::Align::Center);
+
+    let snooze_unit_names: Vec<&str> = SNOOZE_UNITS.iter().map(|(name, _)| *name).collect();
+    let snooze_unit_dropdown = gtk4::DropDown::from_strings(&snooze_unit_names);
+    snooze_unit_dropdown.set_selected(snooze_unit_index);
+    snooze_unit_dropdown.set_valign(gtk4::Align::Center);
+
+    let save_snooze_duration = {
         let settings = settings.clone();
         let storage = ctx.storage.clone();
-        snoozed_row.connect_value_notify(move |row| {
-            settings.borrow_mut().default_snooze_minutes = row.value() as i64;
+        let snooze_quantity_combo = snooze_quantity_combo.clone();
+        let snooze_unit_dropdown = snooze_unit_dropdown.clone();
+        move || {
+            let Some(quantity) = snooze_quantity_combo
+                .active_text()
+                .and_then(|text| text.trim().parse::<i64>().ok())
+                .filter(|&q| q > 0)
+            else {
+                return;
+            };
+            let multiplier = SNOOZE_UNITS[snooze_unit_dropdown.selected() as usize].1;
+            settings.borrow_mut().default_snooze_minutes = quantity * multiplier;
             if let Err(err) = save_settings(&storage, &settings.borrow()) {
                 tracing::warn!(%err, "failed to save preferences");
             }
-        });
+        }
+    };
+    {
+        let save_snooze_duration = save_snooze_duration.clone();
+        snooze_quantity_combo.connect_changed(move |_| save_snooze_duration());
     }
+    {
+        let save_snooze_duration = save_snooze_duration.clone();
+        snooze_unit_dropdown.connect_selected_notify(move |_| save_snooze_duration());
+    }
+
+    snoozed_row.add_suffix(&snooze_quantity_combo);
+    snoozed_row.add_suffix(&snooze_unit_dropdown);
     notif_group.add(&snoozed_row);
 
     let rsvp_only_row = adw::SwitchRow::builder()
@@ -6863,6 +7383,54 @@ fn show_preferences_window(ctx: SettingsCtx) {
         });
     }
     layout_group.add(&day_time_scale_combo);
+
+    let ctrl_snap_row = adw::SpinRow::builder()
+        .title("Ctrl+drag snap interval")
+        .subtitle("Minutes — hold Ctrl while dragging an event in Day view")
+        .build();
+    ctrl_snap_row.set_adjustment(Some(&gtk4::Adjustment::new(
+        settings.borrow().day_drag_snap_ctrl_minutes as f64,
+        1.0,
+        60.0,
+        1.0,
+        5.0,
+        0.0,
+    )));
+    {
+        let settings = settings.clone();
+        let storage = ctx.storage.clone();
+        ctrl_snap_row.connect_value_notify(move |row| {
+            settings.borrow_mut().day_drag_snap_ctrl_minutes = row.value() as i64;
+            if let Err(err) = save_settings(&storage, &settings.borrow()) {
+                tracing::warn!(%err, "failed to save preferences");
+            }
+        });
+    }
+    layout_group.add(&ctrl_snap_row);
+
+    let ctrl_shift_snap_row = adw::SpinRow::builder()
+        .title("Ctrl+Shift+drag snap interval")
+        .subtitle("Minutes — hold Ctrl+Shift while dragging an event in Day view")
+        .build();
+    ctrl_shift_snap_row.set_adjustment(Some(&gtk4::Adjustment::new(
+        settings.borrow().day_drag_snap_ctrl_shift_minutes as f64,
+        1.0,
+        60.0,
+        1.0,
+        5.0,
+        0.0,
+    )));
+    {
+        let settings = settings.clone();
+        let storage = ctx.storage.clone();
+        ctrl_shift_snap_row.connect_value_notify(move |row| {
+            settings.borrow_mut().day_drag_snap_ctrl_shift_minutes = row.value() as i64;
+            if let Err(err) = save_settings(&storage, &settings.borrow()) {
+                tracing::warn!(%err, "failed to save preferences");
+            }
+        });
+    }
+    layout_group.add(&ctrl_shift_snap_row);
 
     content_box.append(&layout_group);
     add_settings_nav_item(&sidebar_list, &nav_anchors, &nav_search_rows, "View options", layout_group.upcast_ref());
@@ -7056,9 +7624,16 @@ fn show_preferences_window(ctx: SettingsCtx) {
     let create_description_row = adw::EntryRow::builder().title("Description").build();
     create_group.add(&create_description_row);
     let create_tz_labels: Vec<&str> =
-        std::iter::once(system_choice_label.as_str()).chain(DISPLAY_TIMEZONE_CHOICES.iter().copied()).collect();
-    let create_tz_combo =
-        adw::ComboRow::builder().title("Time zone").model(&gtk4::StringList::new(&create_tz_labels)).build();
+        std::iter::once(system_choice_label.as_str()).chain(timezone_choices().iter().map(String::as_str)).collect();
+    let create_tz_search_expr =
+        gtk4::PropertyExpression::new(gtk4::StringObject::static_type(), None::<&gtk4::Expression>, "string");
+    let create_tz_combo = adw::ComboRow::builder()
+        .title("Time zone")
+        .model(&gtk4::StringList::new(&create_tz_labels))
+        .enable_search(true)
+        .expression(&create_tz_search_expr)
+        .search_match_mode(gtk4::StringFilterMatchMode::Substring)
+        .build();
     create_group.add(&create_tz_combo);
     let create_button_row =
         adw::ButtonRow::builder().title("Create calendar").start_icon_name("list-add-symbolic").sensitive(false).build();
@@ -7166,26 +7741,7 @@ fn show_preferences_window(ctx: SettingsCtx) {
 
     wire_settings_scrollspy(&sidebar_list, &content_scroller, &content_box, &nav_anchors);
     wire_settings_nav_search(&sidebar_search, &nav_search_rows);
-
-    // `stop-search` (`GtkSearchEntry`'s built-in Escape binding) is only a
-    // notification — per its own docs, "applications should connect to it, to
-    // implement" the actual behavior, so nothing clears the field on its own. With
-    // text in the field, Escape clears it (immediately re-applying the filter rather
-    // than waiting on the debounced `search-changed`, per `apply_settings_nav_filter`'s
-    // doc comment); with nothing left to clear, it falls through to closing the dialog
-    // instead of doing nothing.
-    {
-        let window = window.clone();
-        let nav_search_rows = nav_search_rows.clone();
-        sidebar_search.connect_stop_search(move |entry| {
-            if entry.text().is_empty() {
-                window.close();
-            } else {
-                entry.set_text("");
-                apply_settings_nav_filter("", &nav_search_rows.borrow());
-            }
-        });
-    }
+    install_escape_to_close_dialog(&window, &sidebar_search, &nav_search_rows);
 
     window.present(Some(&ctx.window));
 }
@@ -7304,8 +7860,17 @@ fn load_static_css() {
             border-radius: 12px;
             background-color: alpha(currentColor, 0.02);
         }
-        button.view-switcher-button {
+        .notification-overlay-root {
             border: 1px solid alpha(currentColor, 0.15);
+            border-radius: 12px;
+            background-color: @window_bg_color;
+        }
+        .notification-overlay {
+            border-radius: 12px;
+        }
+        menubutton.view-switcher-button {
+            border: 1px solid white;
+            border-radius: 999px;
             background-color: alpha(currentColor, 0.05);
         }
         .description-frame {
@@ -7648,6 +8213,29 @@ fn load_static_css() {
             border-radius: 999px;
             padding: 1px 8px;
         }
+        .day-drag-hint {
+            font-size: 0.72em;
+            font-weight: 500;
+            color: white;
+            background-color: alpha(black, 0.75);
+            border-radius: 999px;
+            padding: 2px 10px;
+        }
+        .world-clock-row {
+            transition: opacity 150ms ease, box-shadow 150ms ease;
+        }
+        .world-clock-row.world-clock-row-enter {
+            opacity: 0;
+        }
+        .world-clock-row.world-clock-row-dragging {
+            opacity: 0.35;
+        }
+        .world-clock-row.world-clock-drop-before {
+            box-shadow: inset 0 2px 0 0 @accent_bg_color;
+        }
+        .world-clock-row.world-clock-drop-after {
+            box-shadow: inset 0 -2px 0 0 @accent_bg_color;
+        }
         ",
     );
     add_provider(&provider);
@@ -7913,10 +8501,24 @@ mod day_view_layout_tests {
         let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
         let state = DayDragState { zone: DayDragZone::Move, original_start: dt(date, 12, 0), original_end: dt(date, 13, 0) };
 
-        let result = compute_day_drag_times(&state, 22.0, 1.0, 15);
+        let result = compute_day_drag_times(&state, 22.0, 1.0, Some(15));
 
         assert_eq!(result.start, dt(date, 12, 15));
         assert_eq!(result.end, dt(date, 13, 15), "duration must stay exactly 1h");
+    }
+
+    #[test]
+    fn compute_drag_move_unsnapped_tracks_the_pointer_continuously() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
+        let state = DayDragState { zone: DayDragZone::Move, original_start: dt(date, 12, 0), original_end: dt(date, 13, 0) };
+
+        // `None` (live-feedback path): rounds to the nearest whole minute, not the
+        // nearest `scale_minutes` gridline — a 7-minute drag lands on 12:07, not
+        // snapped away to 12:00/12:15 the way `Some(15)` would.
+        let result = compute_day_drag_times(&state, 7.0, 1.0, None);
+
+        assert_eq!(result.start, dt(date, 12, 7));
+        assert_eq!(result.end, dt(date, 13, 7));
     }
 
     #[test]
@@ -7924,7 +8526,7 @@ mod day_view_layout_tests {
         let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
         let state = DayDragState { zone: DayDragZone::Move, original_start: dt(date, 0, 5), original_end: dt(date, 1, 5) };
 
-        let result = compute_day_drag_times(&state, -1000.0, 1.0, 15);
+        let result = compute_day_drag_times(&state, -1000.0, 1.0, Some(15));
 
         assert_eq!(result.start, dt(date, 0, 0), "can't move before the start of the day");
         assert_eq!(result.end, dt(date, 1, 0), "duration preserved even when clamped");
@@ -7935,7 +8537,7 @@ mod day_view_layout_tests {
         let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
         let state = DayDragState { zone: DayDragZone::Move, original_start: dt(date, 22, 0), original_end: dt(date, 23, 0) };
 
-        let result = compute_day_drag_times(&state, 1000.0, 1.0, 15);
+        let result = compute_day_drag_times(&state, 1000.0, 1.0, Some(15));
 
         assert_eq!(result.start, dt(date, 23, 0), "can't move past the end of the day");
         assert_eq!(result.end, dt(date, 0, 0) + Duration::days(1), "clamped end lands exactly at midnight");
@@ -7946,7 +8548,7 @@ mod day_view_layout_tests {
         let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
         let state = DayDragState { zone: DayDragZone::ResizeTop, original_start: dt(date, 12, 0), original_end: dt(date, 13, 0) };
 
-        let result = compute_day_drag_times(&state, -22.0, 1.0, 15);
+        let result = compute_day_drag_times(&state, -22.0, 1.0, Some(15));
 
         assert_eq!(result.start, dt(date, 11, 45));
         assert_eq!(result.end, dt(date, 13, 0), "end must not move");
@@ -7958,7 +8560,7 @@ mod day_view_layout_tests {
         // A short 20-minute event: dragging the start far down can't compress it past 15m.
         let state = DayDragState { zone: DayDragZone::ResizeTop, original_start: dt(date, 12, 0), original_end: dt(date, 12, 20) };
 
-        let result = compute_day_drag_times(&state, 1000.0, 1.0, 15);
+        let result = compute_day_drag_times(&state, 1000.0, 1.0, Some(15));
 
         assert_eq!(result.start, dt(date, 12, 5), "clamped to end minus the 15-minute floor");
         assert_eq!(result.end, dt(date, 12, 20));
@@ -7969,7 +8571,7 @@ mod day_view_layout_tests {
         let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
         let state = DayDragState { zone: DayDragZone::ResizeBottom, original_start: dt(date, 12, 0), original_end: dt(date, 12, 20) };
 
-        let result = compute_day_drag_times(&state, -1000.0, 1.0, 15);
+        let result = compute_day_drag_times(&state, -1000.0, 1.0, Some(15));
 
         assert_eq!(result.start, dt(date, 12, 0));
         assert_eq!(result.end, dt(date, 12, 15), "clamped to start plus the 15-minute floor");

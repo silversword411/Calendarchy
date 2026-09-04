@@ -251,28 +251,36 @@ fn build_overlay_window(storage: Storage, sender: ComponentSender<App>) -> Overl
     }
 }
 
-/// Wires the header's `GestureDrag`: `drag-begin` snapshots the margins as they stood
-/// when the drag started, `drag-update` live-recomputes them from the pointer offset
-/// (clamped to the current monitor's geometry so the dialog can't be dragged off
-/// screen), and `drag-end` persists the result via `save_settings`.
+/// Wires the header's `GestureDrag`: `drag-update` fires with `offset_x`/`offset_y`
+/// cumulative since `drag-begin`, measured in the window's own surface-local
+/// coordinates — since we're continuously repositioning that very window, reapplying
+/// the full cumulative offset to a frozen drag-start snapshot each tick would measure
+/// against a reference frame that has itself already moved, causing the dialog to lag
+/// behind the pointer. Instead we track the incremental delta since the *previous*
+/// tick and nudge the window's *current* live margin by just that much — immune to
+/// the moving-reference-frame issue, and it also naturally respects whatever
+/// `clamp_margin` (screen-edge clamping) did on the previous tick. `drag-end` persists
+/// the final position via `save_settings`.
 fn drag_controller(window: &gtk4::Window, storage: &Storage) -> gtk4::GestureDrag {
     let drag = gtk4::GestureDrag::new();
-    let start_margins = Rc::new(Cell::new((0, 0)));
+    let last_offset = Rc::new(Cell::new((0.0, 0.0)));
 
     {
-        let window = window.clone();
-        let start_margins = start_margins.clone();
+        let last_offset = last_offset.clone();
         drag.connect_drag_begin(move |_, _, _| {
-            start_margins.set((window.margin(Edge::Top), window.margin(Edge::Right)));
+            last_offset.set((0.0, 0.0));
         });
     }
     {
         let window = window.clone();
-        let start_margins = start_margins.clone();
+        let last_offset = last_offset.clone();
         drag.connect_drag_update(move |_, offset_x, offset_y| {
-            let (start_top, start_right) = start_margins.get();
-            let new_top = clamp_margin(start_top + offset_y as i32, &window, Edge::Top);
-            let new_right = clamp_margin(start_right - offset_x as i32, &window, Edge::Right);
+            let (last_x, last_y) = last_offset.get();
+            let (dx, dy) = (offset_x - last_x, offset_y - last_y);
+            last_offset.set((offset_x, offset_y));
+
+            let new_top = clamp_margin(window.margin(Edge::Top) + dy as i32, &window, Edge::Top);
+            let new_right = clamp_margin(window.margin(Edge::Right) - dx as i32, &window, Edge::Right);
             window.set_margin(Edge::Top, new_top);
             window.set_margin(Edge::Right, new_right);
         });
@@ -370,7 +378,11 @@ fn alert_card(reminder: &ActiveReminder, time_format: TimeFormat, default_snooze
     let snooze_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     snooze_box.add_css_class("linked");
 
-    let snooze_button = gtk4::Button::with_label("Snooze");
+    let (snooze_quantity, snooze_unit_index) = crate::minutes_to_quantity_unit(default_snooze_minutes, &crate::SNOOZE_UNITS);
+    let snooze_button = gtk4::Button::with_label(&format!(
+        "Snooze {snooze_quantity}{}",
+        crate::SNOOZE_UNITS[snooze_unit_index as usize].0
+    ));
     {
         let sender = sender.clone();
         let id = reminder.id;

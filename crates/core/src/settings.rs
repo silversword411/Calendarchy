@@ -183,6 +183,17 @@ pub struct AppSettings {
     /// (`crates/app/src/main.rs`'s `AppMsg::ZoomDayTimeScale`) so either control
     /// reflects the other's changes.
     pub day_time_scale_minutes: i64,
+    /// Snap granularity (minutes) for a Day view drag while Ctrl is held — one of two
+    /// configurable overrides of the plain-drag default (which snaps to
+    /// `day_time_scale_minutes`'s gridlines instead). Checked live for the whole
+    /// gesture (`crates/app/src/main.rs`'s `install_day_event_drag`), not just at
+    /// drag-start, so releasing/re-pressing Ctrl mid-drag changes the snap immediately.
+    pub day_drag_snap_ctrl_minutes: i64,
+    /// Snap granularity (minutes) for a Day view drag while Ctrl+Shift is held — the
+    /// finer of the two override tiers (checked before the plain-Ctrl one, since
+    /// Ctrl+Shift also matches a plain "is Ctrl held" test). See
+    /// `day_drag_snap_ctrl_minutes`.
+    pub day_drag_snap_ctrl_shift_minutes: i64,
     /// "Start week on" (§12) — a per-app override of the region-implied first day of
     /// week, stored as days-from-Sunday (0 = Sunday .. 6 = Saturday), matching
     /// `chrono::Weekday::num_days_from_sunday`. `None` means "follow region" (the
@@ -274,6 +285,8 @@ impl Default for AppSettings {
             dim_past_events: true,
             side_by_side_calendars_in_day_view: true,
             day_time_scale_minutes: 60,
+            day_drag_snap_ctrl_minutes: 5,
+            day_drag_snap_ctrl_shift_minutes: 1,
             start_of_week: None,
             custom_view_days: 5,
             alternate_calendar: None,
@@ -358,6 +371,8 @@ mod tests {
         settings.dim_past_events = false;
         settings.side_by_side_calendars_in_day_view = false;
         settings.day_time_scale_minutes = 15;
+        settings.day_drag_snap_ctrl_minutes = 7;
+        settings.day_drag_snap_ctrl_shift_minutes = 2;
         settings.start_of_week = Some(1);
         settings.custom_view_days = 4;
         settings.alternate_calendar = Some("chinese".into());
