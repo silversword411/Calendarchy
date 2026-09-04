@@ -583,10 +583,9 @@ impl Component for App {
                                         },
 
                                         #[name = "day_all_day_box"]
-                                        gtk4::Grid {
+                                        gtk4::Box {
+                                            set_orientation: gtk4::Orientation::Horizontal,
                                             add_css_class: "day-all-day-strip",
-                                            set_row_spacing: 2,
-                                            set_column_spacing: 2,
                                             set_visible: false,
                                         },
 
@@ -3123,7 +3122,12 @@ fn event_row(event: &DisplayEvent, time_format: TimeFormat) -> gtk4::Box {
 /// event's real range extends past the currently visible dates. Unlike
 /// `day_event_block`, this needs no absolute positioning: `populate_day_header` attaches
 /// it straight into a `Grid` cell (or cell span), which sizes it for us.
-fn all_day_event_bar(event: &DisplayEvent, clipped_start: bool, clipped_end: bool) -> gtk4::Box {
+fn all_day_event_bar(
+    event: &DisplayEvent,
+    clipped_start: bool,
+    clipped_end: bool,
+    show_content: bool,
+) -> gtk4::Box {
     let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
     bar.add_css_class("day-event-block");
     bar.add_css_class("day-all-day-event");
@@ -3135,19 +3139,21 @@ fn all_day_event_bar(event: &DisplayEvent, clipped_start: bool, clipped_end: boo
     }
     bar.set_cursor_from_name(Some("pointer"));
 
-    if clipped_start {
+    if clipped_start && show_content {
         bar.append(&gtk4::Image::from_icon_name("go-previous-symbolic"));
     }
 
-    let subject = gtk4::Label::new(Some(&event.title));
-    subject.add_css_class("day-event-subject");
-    subject.set_halign(gtk4::Align::Start);
-    subject.set_hexpand(true);
-    subject.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    bar.append(&subject);
+    if show_content {
+        let subject = gtk4::Label::new(Some(&event.title));
+        subject.add_css_class("day-event-subject");
+        subject.set_halign(gtk4::Align::Start);
+        subject.set_hexpand(true);
+        subject.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        bar.append(&subject);
 
-    if let Some(badges) = event_badge_row(event) {
-        bar.append(&badges);
+        if let Some(badges) = event_badge_row(event) {
+            bar.append(&badges);
+        }
     }
 
     if clipped_end {
@@ -3666,19 +3672,19 @@ fn build_view_switcher_popover(sender: &ComponentSender<App>, storage: &Storage)
 /// several dates this centering trick doesn't apply (each cell already evenly divides
 /// the remaining width, matching `populate_day_hour_grid`'s per-day hour cells), so the
 /// spacer is omitted. Also (re)builds the all-day strip directly underneath from any
-/// `all_day` events overlapping `dates` — a `gtk4::Grid` sharing the exact column
-/// scheme `populate_day_hour_grid` uses (a `GUTTER_WIDTH_PX` column 0, one hexpand
-/// column per date after it), so a bar's edges land exactly under the hour grid's day
-/// dividers instead of drifting the way three independently-laid-out containers could.
+/// `all_day` events overlapping `dates`. Its fixed-width gutter and homogeneous day
+/// columns match `populate_day_hour_grid`'s columns. Events are rendered as one segment
+/// per covered date so a spanning widget cannot influence the width of any column.
 /// `layout_all_day_events` computes each event's row/column span (clipped to `dates`,
 /// with multi-day events spanning every column they cover via `Grid::attach`'s
 /// `width` — a single widget rather than one per day, so the strip reads as one
 /// continuous colored bar, `all_day_event_bar`), reusing `wire_event_click` so it opens
-/// the same detail popover a month-view chip does. Hides itself via `set_visible` when
+/// the same detail popover a month-view chip does. Each covered day gets a segment so GTK
+/// cannot size a column from a multi-column child. Hides itself via `set_visible` when
 /// nothing overlaps `dates`, rather than always reserving empty space.
 fn populate_day_header(
     header: &gtk4::Box,
-    all_day: &gtk4::Grid,
+    all_day: &gtk4::Box,
     dates: &[NaiveDate],
     today: NaiveDate,
     events: &[DisplayEvent],
@@ -3730,25 +3736,34 @@ fn populate_day_header(
 
     clear_children(all_day);
 
-    // Row 0 is a "pinning" row that's never used for event bars: a `GtkGrid` only
-    // sizes a column from cells that actually touch it, so without this, a date with
-    // no all-day events of its own (and no spanning bar crossing it) would collapse to
-    // zero width instead of matching `header`/the hour grid's column for that date.
     let gutter_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     gutter_spacer.set_width_request(GUTTER_WIDTH_PX);
-    all_day.attach(&gutter_spacer, 0, 0, 1, 1);
+    all_day.append(&gutter_spacer);
+
+    let day_grid = gtk4::Grid::new();
+    day_grid.set_hexpand(true);
+    day_grid.set_column_homogeneous(true);
+    day_grid.set_row_spacing(2);
     for day_index in 0..dates.len() {
         let day_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         day_spacer.set_hexpand(true);
         day_spacer.set_size_request(-1, 0);
-        all_day.attach(&day_spacer, 1 + day_index as i32, 0, 1, 1);
+        day_grid.attach(&day_spacer, day_index as i32, 0, 1, 1);
     }
+    all_day.append(&day_grid);
 
     let layout = layout_all_day_events(events, dates);
     for item in &layout {
-        let bar = all_day_event_bar(item.event, item.clipped_start, item.clipped_end);
-        wire_event_click(&bar, item.event, ctx);
-        all_day.attach(&bar, 1 + item.start_col as i32, 1 + item.row as i32, item.span_cols as i32, 1);
+        for column in item.start_col..item.start_col + item.span_cols {
+            let bar = all_day_event_bar(
+                item.event,
+                item.clipped_start && column == item.start_col,
+                item.clipped_end && column + 1 == item.start_col + item.span_cols,
+                column == item.start_col,
+            );
+            wire_event_click(&bar, item.event, ctx);
+            day_grid.attach(&bar, column as i32, 1 + item.row as i32, 1, 1);
+        }
     }
     all_day.set_visible(!layout.is_empty());
 }
@@ -3906,7 +3921,7 @@ fn populate_day_view(
     // resize watcher both re-run this function once a real width is available, so a
     // brief undersized first frame self-corrects rather than needing special-casing
     // here.
-    let total_columns_width = (overlay.width() - GUTTER_WIDTH_PX - 8).max(60 * day_count);
+    let total_columns_width = (overlay.width() - GUTTER_WIDTH_PX).max(60 * day_count);
     let day_column_width = total_columns_width / day_count;
 
     for (day_index, &date) in dates.iter().enumerate() {
@@ -10344,7 +10359,7 @@ fn load_static_css() {
             padding: 2px;
         }
         .day-all-day-strip {
-            padding: 2px 4px 6px 0;
+            padding: 2px 0 6px 0;
         }
         .day-all-day-event {
             padding: 3px 8px;
