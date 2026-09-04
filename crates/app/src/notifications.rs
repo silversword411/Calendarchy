@@ -19,6 +19,7 @@ use calendarchy_service_calendar::query::{
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use gtk4::prelude::*;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
+use relm4::adw;
 use relm4::{ComponentSender, RelmWidgetExt};
 
 use crate::{App, AppMsg};
@@ -259,32 +260,44 @@ fn build_overlay_window(storage: Storage, sender: ComponentSender<App>) -> Overl
 /// the full cumulative offset to a frozen drag-start snapshot each tick would measure
 /// against a reference frame that has itself already moved, causing the dialog to lag
 /// behind the pointer. Instead we track the incremental delta since the *previous*
-/// tick and nudge the window's *current* live margin by just that much — immune to
-/// the moving-reference-frame issue, and it also naturally respects whatever
-/// `clamp_margin` (screen-edge clamping) did on the previous tick. `drag-end` persists
-/// the final position via `save_settings`.
+/// tick and nudge a full-precision `target` margin by just that much, only rounding
+/// when it's actually applied via `set_margin` — `offset_x`/`offset_y` routinely carry
+/// sub-1-pixel amounts (especially under a fractional display scale factor), and
+/// truncating those every tick instead of accumulating them silently eats real mouse
+/// movement, which is its own source of lag independent of the moving-reference-frame
+/// issue above. Clamping (`clamp_margin`, screen-edge bounds) is applied to `target`
+/// itself so a clamp at one edge is remembered and respected on the next tick instead
+/// of being discarded. `drag-end` persists the final position via `save_settings`.
 fn drag_controller(window: &gtk4::Window, storage: &Storage) -> gtk4::GestureDrag {
     let drag = gtk4::GestureDrag::new();
     let last_offset = Rc::new(Cell::new((0.0, 0.0)));
+    let target = Rc::new(Cell::new((0.0, 0.0)));
 
     {
+        let window = window.clone();
         let last_offset = last_offset.clone();
+        let target = target.clone();
         drag.connect_drag_begin(move |_, _, _| {
             last_offset.set((0.0, 0.0));
+            target.set((window.margin(Edge::Top) as f64, window.margin(Edge::Right) as f64));
         });
     }
     {
         let window = window.clone();
         let last_offset = last_offset.clone();
+        let target = target.clone();
         drag.connect_drag_update(move |_, offset_x, offset_y| {
             let (last_x, last_y) = last_offset.get();
             let (dx, dy) = (offset_x - last_x, offset_y - last_y);
             last_offset.set((offset_x, offset_y));
 
-            let new_top = clamp_margin(window.margin(Edge::Top) + dy as i32, &window, Edge::Top);
-            let new_right = clamp_margin(window.margin(Edge::Right) - dx as i32, &window, Edge::Right);
-            window.set_margin(Edge::Top, new_top);
-            window.set_margin(Edge::Right, new_right);
+            let (target_top, target_right) = target.get();
+            let new_top = clamp_margin(target_top + dy, &window, Edge::Top);
+            let new_right = clamp_margin(target_right - dx, &window, Edge::Right);
+            target.set((new_top, new_right));
+
+            window.set_margin(Edge::Top, new_top.round() as i32);
+            window.set_margin(Edge::Right, new_right.round() as i32);
         });
     }
     {
@@ -304,27 +317,56 @@ fn drag_controller(window: &gtk4::Window, storage: &Storage) -> gtk4::GestureDra
 
 /// Clamps a margin so the dialog can't be dragged past the opposite edge of its
 /// current monitor. Falls back to "no clamp" if the monitor can't be resolved (e.g.
-/// the window isn't mapped yet) — permissive rather than blocking the drag.
-fn clamp_margin(value: i32, window: &gtk4::Window, edge: Edge) -> i32 {
+/// the window isn't mapped yet) — permissive rather than blocking the drag. Takes and
+/// returns `f64` (rather than the `i32` `set_margin` ultimately needs) so callers can
+/// clamp a full-precision drag target without an intermediate truncation.
+fn clamp_margin(value: f64, window: &gtk4::Window, edge: Edge) -> f64 {
     let monitor_size = window
         .surface()
         .and_then(|surface| gtk4::prelude::WidgetExt::display(window).monitor_at_surface(&surface))
         .map(|monitor| monitor.geometry());
     let max = match (edge, monitor_size) {
-        (Edge::Top, Some(rect)) => (rect.height() - window.height().max(1)).max(0),
-        (Edge::Right, Some(rect)) => (rect.width() - window.width().max(1)).max(0),
-        _ => i32::MAX,
+        (Edge::Top, Some(rect)) => (rect.height() - window.height().max(1)).max(0) as f64,
+        (Edge::Right, Some(rect)) => (rect.width() - window.width().max(1)).max(0) as f64,
+        _ => f64::MAX,
     };
-    value.clamp(0, max)
+    value.clamp(0.0, max)
+}
+
+/// Re-homes the overlay to whichever monitor currently holds `main_window`, if
+/// different from where it currently sits. `gtk4-layer-shell` assigns a layer surface
+/// to whatever monitor the compositor picks at creation time (we never chose one
+/// explicitly) and it stays there for the surface's whole life unless told otherwise —
+/// in a multi-monitor setup that means the dialog doesn't follow the user to a
+/// different monitor on its own. The main app window is a plain-GTK, no-Hyprland-IPC
+/// proxy for "where the user currently is" (DESIGN_SPEC.md deliberately leaves
+/// compositor-specific control to the user's own config rather than baking it into the
+/// app). `set_monitor` remaps an already-visible surface itself, so this is safe to
+/// call every refresh; the `monitor()` comparison just avoids a needless remap when
+/// nothing's changed.
+fn reposition_to_focused_monitor(overlay_window: &gtk4::Window, main_window: &adw::Window) {
+    let Some(target) = main_window
+        .surface()
+        .and_then(|surface| WidgetExt::display(main_window).monitor_at_surface(&surface))
+    else {
+        return;
+    };
+    if overlay_window.monitor().as_ref() != Some(&target) {
+        overlay_window.set_monitor(Some(&target));
+    }
 }
 
 /// Rebuilds the floating dialog's active-card list and "Past" history section from
 /// storage — the same "clear and repopulate" convention `populate_sidebar` already
 /// uses, so add/dismiss/snooze are all just "mutate storage, rebuild" instead of
-/// patching individual rows in place. Shows the window if there's anything to show
-/// (active or history), hides it otherwise rather than leaving an empty floating box
-/// on screen.
-pub fn refresh_overlay(handle: &OverlayHandle) {
+/// patching individual rows in place. Shows the window only while there's an active
+/// reminder to act on; a non-empty "Past" section alone (dismissed reminders never
+/// expire from it on their own — only a row's own Clear button removes one) doesn't
+/// keep the dialog pinned open by itself, or it would never fully hide again after the
+/// very first dismissal.
+pub fn refresh_overlay(handle: &OverlayHandle, main_window: &adw::Window) {
+    reposition_to_focused_monitor(&handle.window, main_window);
+
     let settings = load_settings(&handle.storage).unwrap_or_default();
     let time_format = crate::resolve_time_format(&settings);
 
@@ -350,7 +392,7 @@ pub fn refresh_overlay(handle: &OverlayHandle) {
         handle.history_box.append(&history_row(entry, time_format, &handle.sender));
     }
 
-    handle.window.set_visible(!active.is_empty() || !history.is_empty());
+    handle.window.set_visible(!active.is_empty());
 }
 
 /// Preset durations offered by the Snooze split-button's dropdown — common choices

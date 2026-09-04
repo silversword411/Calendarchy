@@ -61,6 +61,22 @@ impl Default for TimeFormat {
     }
 }
 
+/// Which of the event editor's three layouts (DESIGN_SPEC.md §10's redesigned
+/// dockable editor) is currently active — persisted so the editor reopens in the
+/// same layout it was last left in, rather than always starting floating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EventEditorPanelMode {
+    Floating,
+    Bottom,
+    Right,
+}
+
+impl Default for EventEditorPanelMode {
+    fn default() -> Self {
+        EventEditorPanelMode::Floating
+    }
+}
+
 /// Every user-configurable knob the Preferences window exposes. `#[serde(default)]`
 /// on each field (via the container attribute) means a settings blob written by an
 /// older version — missing a field this version added — still deserializes instead of
@@ -194,6 +210,12 @@ pub struct AppSettings {
     /// Ctrl+Shift also matches a plain "is Ctrl held" test). See
     /// `day_drag_snap_ctrl_minutes`.
     pub day_drag_snap_ctrl_shift_minutes: i64,
+    /// Milliseconds a Day view press must be held before it engages move/resize
+    /// (`crates/app/src/main.rs`'s `install_day_event_drag`) — a release before this
+    /// elapses does nothing (or opens the event popover, for a near-stationary
+    /// click). `0` disables the hold gate entirely (drag engages immediately, the
+    /// old behavior).
+    pub day_drag_hold_ms: i64,
     /// "Start week on" (§12) — a per-app override of the region-implied first day of
     /// week, stored as days-from-Sunday (0 = Sunday .. 6 = Saturday), matching
     /// `chrono::Weekday::num_days_from_sunday`. `None` means "follow region" (the
@@ -252,6 +274,28 @@ pub struct AppSettings {
     /// use the built-in default" (the old fixed 240px sidebar against the 1100px
     /// default window width).
     pub sidebar_width_fraction: Option<f64>,
+    /// Which layout the event editor panel (DESIGN_SPEC.md §10's redesigned floating/
+    /// bottom/right dockable editor) currently renders as — restored the next time
+    /// the editor opens rather than always starting `Floating`.
+    pub event_editor_panel_mode: EventEditorPanelMode,
+    /// The floating editor panel's last-dragged position, as `(x_fraction,
+    /// y_fraction)` of its top-left margin against the main window's content-area
+    /// overlay's own width/height at the time it was last dragged — a fraction of
+    /// that widget's own size, not raw pixels or the whole window's size, for the
+    /// same "keeps looking proportionally right after a monitor/DPI/size change"
+    /// reasoning as `sidebar_width_fraction`. `None` means it hasn't been dragged
+    /// yet and opens at the built-in default offset.
+    pub event_editor_floating_position: Option<(f64, f64)>,
+    /// The bottom-docked editor panel's height, as a fraction of the dock `Paned`'s
+    /// own height at the time it was last resized (dock_px / paned_px), same
+    /// proportional-sizing rationale as `sidebar_width_fraction`. `None` means "not
+    /// yet customized, use the built-in default height".
+    pub event_editor_bottom_height_fraction: Option<f64>,
+    /// The right-docked editor panel's width, as a fraction of the dock `Paned`'s
+    /// own width at the time it was last resized (dock_px / paned_px). `None` means
+    /// "not yet customized, use the built-in default width" (matching the old fixed
+    /// 560px dialog default against a typical window width).
+    pub event_editor_right_width_fraction: Option<f64>,
 }
 
 impl Default for AppSettings {
@@ -287,6 +331,7 @@ impl Default for AppSettings {
             day_time_scale_minutes: 60,
             day_drag_snap_ctrl_minutes: 5,
             day_drag_snap_ctrl_shift_minutes: 1,
+            day_drag_hold_ms: 500,
             start_of_week: None,
             custom_view_days: 5,
             alternate_calendar: None,
@@ -300,6 +345,10 @@ impl Default for AppSettings {
             notification_sound_path: None,
             notification_dialog_position: None,
             sidebar_width_fraction: None,
+            event_editor_panel_mode: EventEditorPanelMode::Floating,
+            event_editor_floating_position: None,
+            event_editor_bottom_height_fraction: None,
+            event_editor_right_width_fraction: None,
         }
     }
 }
@@ -373,6 +422,7 @@ mod tests {
         settings.day_time_scale_minutes = 15;
         settings.day_drag_snap_ctrl_minutes = 7;
         settings.day_drag_snap_ctrl_shift_minutes = 2;
+        settings.day_drag_hold_ms = 250;
         settings.start_of_week = Some(1);
         settings.custom_view_days = 4;
         settings.alternate_calendar = Some("chinese".into());
@@ -386,6 +436,10 @@ mod tests {
         settings.notification_sound_path = Some("/home/user/sounds/chime.ogg".into());
         settings.notification_dialog_position = Some((64, 32));
         settings.sidebar_width_fraction = Some(0.3);
+        settings.event_editor_panel_mode = EventEditorPanelMode::Right;
+        settings.event_editor_floating_position = Some((0.2, 0.4));
+        settings.event_editor_bottom_height_fraction = Some(0.35);
+        settings.event_editor_right_width_fraction = Some(0.45);
         save_settings(&storage, &settings).expect("save");
 
         let loaded = load_settings(&storage).expect("load");

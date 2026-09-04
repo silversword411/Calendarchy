@@ -5,8 +5,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use calendarchy_core::{
-    load_settings, save_settings, Account, AccountId, AccountManager, AppSettings, DateFormat, InvitationAutoAdd,
-    Keyring, SecretServiceKeyring, ServiceKind, ServiceRegistry, Storage, TimeFormat,
+    load_settings, save_settings, Account, AccountId, AccountManager, AppSettings, DateFormat, EventEditorPanelMode,
+    InvitationAutoAdd, Keyring, SecretServiceKeyring, ServiceKind, ServiceRegistry, Storage, TimeFormat,
 };
 use calendarchy_service_calendar::query::{
     calendars_by_account, clear_calendar_cache, create_event, delete_event, delete_reminder_notification,
@@ -81,6 +81,10 @@ enum ViewMode {
     /// A rolling 5-day window centered on `App::current_date` (2 days before, the
     /// anchor, 2 days after — see `five_day_window`), not a fixed Mon–Fri work week.
     FiveDay,
+    /// A side-by-side view of whatever dates the sidebar's mini calendar drag-select
+    /// last produced (`App::custom_view_dates`) — entered only via
+    /// `AppMsg::SetCustomViewDates`, never from the view-switcher popover.
+    Custom,
 }
 
 /// Floor on the sidebar's drag-resized width — enforced by GTK itself via the
@@ -96,6 +100,40 @@ const SIDEBAR_MAX_WIDTH_PX: i32 = 480;
 /// is `None`) — matches the fixed width the sidebar had before it became resizable.
 const DEFAULT_SIDEBAR_WIDTH_PX: i32 = 240;
 
+/// Floor/ceiling/default for the right-docked event editor panel's drag-resized
+/// width, same enforcement shape as `SIDEBAR_MIN_WIDTH_PX`/`SIDEBAR_MAX_WIDTH_PX`
+/// above. The default matches the old fixed-width edit dialog's `default_width(560)`.
+const EDITOR_RIGHT_DOCK_MIN_WIDTH_PX: i32 = 320;
+const EDITOR_RIGHT_DOCK_MAX_WIDTH_PX: i32 = 900;
+const DEFAULT_EDITOR_RIGHT_DOCK_WIDTH_PX: i32 = 560;
+/// Floor/ceiling/default for the bottom-docked event editor panel's drag-resized
+/// height.
+const EDITOR_BOTTOM_DOCK_MIN_HEIGHT_PX: i32 = 220;
+const EDITOR_BOTTOM_DOCK_MAX_HEIGHT_PX: i32 = 700;
+const DEFAULT_EDITOR_BOTTOM_DOCK_HEIGHT_PX: i32 = 360;
+/// Default floating position (top-left margin, in px against a typical-size overlay)
+/// used before the user has ever dragged the panel.
+const DEFAULT_EDITOR_FLOATING_MARGIN_PX: (i32, i32) = (80, 80);
+/// Fixed size of the floating event editor panel — unlike the two docked modes, the
+/// user only asked to resize the panel *while snapped to an edge*, so floating keeps
+/// one constant size (close to the old fixed-width dialog's own proportions) rather
+/// than being independently resizable and persisted.
+const DEFAULT_EDITOR_FLOATING_SIZE_PX: (i32, i32) = (560, 640);
+/// While dragging, the panel's logical (floating-sized) position is considered
+/// "close enough" to the content area's bottom/right edge to preview/resolve as
+/// that dock once its distance to that edge drops under this. The same threshold
+/// governs both snapping in and un-docking — `install_panel_drag` recomputes
+/// which mode applies from scratch on every tick, purely from distance-to-edge,
+/// rather than tracking "docked" and "floating" as separate branches each with
+/// their own threshold (an earlier version of this constant did that, with a
+/// deliberately larger un-dock threshold to avoid flicker right at the boundary;
+/// that's no longer needed for a drag that *starts* docked, since it shows no
+/// live preview at all until `drag-end` resolves it — see that function's doc
+/// comment — though a drag that starts floating can still flicker its preview for
+/// an instant if held exactly on this boundary, a minor enough case not to
+/// warrant reintroducing a second threshold for it).
+const EDITOR_PANEL_SNAP_THRESHOLD_PX: f64 = 28.0;
+
 struct App {
     core: AppCore,
     /// Which main-content view is currently displayed. Switched via the header bar's
@@ -107,8 +145,15 @@ struct App {
     /// `ViewMode::Day`, this instead identifies the exact day shown (paged by
     /// `AppMsg::PrevPeriod`/`NextPeriod`, one day at a time rather than one month). In
     /// `ViewMode::FiveDay`, this is the *anchor* the 5-day window is centered on
-    /// (`five_day_window`), not a stored range — paged ±5 days/weekdays at a time.
+    /// (`five_day_window`), not a stored range — paged ±5 days/weekdays at a time. In
+    /// `ViewMode::Custom`, this tracks `custom_view_dates[0]` (kept in sync on every
+    /// selection/page) so the mini calendar and window title stay aligned with it.
     current_date: NaiveDate,
+    /// The dates shown side by side in `ViewMode::Custom` — set by a mini calendar
+    /// drag-select (`AppMsg::SetCustomViewDates`) and paged as a whole block by
+    /// `AppMsg::PrevPeriod`/`NextPeriod`. Empty until the first drag-select; meaningless
+    /// outside `ViewMode::Custom`.
+    custom_view_dates: Vec<NaiveDate>,
     /// Live text from the header bar's search popover; re-applied on every refresh
     /// so it survives month navigation instead of resetting.
     search_query: String,
@@ -119,6 +164,12 @@ struct App {
     /// first reminder fires, then a persistent singleton for the rest of the app's
     /// life. See `notifications::ensure_overlay`.
     overlay: Rc<RefCell<Option<notifications::OverlayHandle>>>,
+    /// The event editor panel currently open, if any — see `OpenEditorPanel`. Created
+    /// once here and cloned (the `Rc`, not the contents) into every `EditorDocks`
+    /// built for an `EventCtx`, so the one persistent drag gesture installed on
+    /// `editor_overlay` at `init` time always sees the same cell regardless of which
+    /// `EditorDocks` instance most recently populated it.
+    open_editor_panel: Rc<RefCell<Option<OpenEditorPanel>>>,
 }
 
 #[derive(Debug)]
@@ -148,6 +199,11 @@ enum AppMsg {
     ShowShortcuts,
     Resize,
     JumpToDate(NaiveDate),
+    /// A completed drag-select on the sidebar's mini calendar (`populate_mini_calendar`'s
+    /// `on_range_pick`) — always 2+ consecutive dates, capped at
+    /// `MINI_CALENDAR_DRAG_MAX_DAYS`. Switches to `ViewMode::Custom` showing exactly
+    /// these dates side by side.
+    SetCustomViewDates(Vec<NaiveDate>),
     EventUpdated,
     ToggleSidebar,
     CreateEvent,
@@ -186,6 +242,52 @@ enum AppCommandMsg {
     ReminderCheckFinished { newly_fired: Vec<DueReminder> },
 }
 
+/// The event editor panel currently open, if any, and just enough about it for the
+/// one persistent drag gesture (`install_panel_drag`, attached once at `init` to
+/// `editor_overlay` — deliberately never to the panel itself, see that function's
+/// doc comment) to know what to drag and where it currently is. Populated by
+/// `show_edit_event_dialog` right after the panel's initial `dock_panel` attach,
+/// and cleared by `close_panel`. `relayout` re-flows the panel's own field rows for
+/// a newly-committed mode (see `relayout_editor_body`) — called once up front for
+/// the panel's starting mode, and again by `install_panel_drag`'s `drag-end` every
+/// time a live drag actually commits to a new mode.
+#[derive(Clone)]
+struct OpenEditorPanel {
+    root: adw::ToolbarView,
+    titlebar: gtk4::Box,
+    mode: Rc<Cell<EventEditorPanelMode>>,
+    relayout: Rc<dyn Fn(EventEditorPanelMode)>,
+}
+
+/// The main window's editor-docking widgets (DESIGN_SPEC.md §10's redesigned
+/// floating/bottom/right dockable event editor) — cheap GObject-handle clones, same
+/// "everything a dialog needs, cloned once" shape as `EventCtx` itself. `overlay` is
+/// the content-area `gtk4::Overlay` the floating panel is added into/removed from at
+/// runtime (`editor_overlay` in the `view!` macro); `right_paned`/`bottom_paned` are
+/// the two dock `Paned`s whose `notify::position` drives resize persistence;
+/// `right_slot`/`bottom_slot` are the (normally hidden) `Box`es the panel's root is
+/// reparented into while docked. `main_content_box`'s shared-edge margin is zeroed
+/// while a dock is active and restored when not (`update_dock_margins`) — the
+/// sidebar sits outside both docks' `Paned`s entirely and never needs that, but
+/// `sidebar_pane`'s own current width is still read by `preview_docked_bottom` to
+/// keep the bottom dock's live drag-preview from covering it. `current_panel` is shared
+/// (an `Rc<RefCell<...>>`, cloned from a single instance stored on `App` — see
+/// `install_panel_drag`) rather than rebuilt fresh in each `EditorDocks`, since it
+/// has to be the *same* cell every time for the persistent drag gesture to see
+/// what the freshly-(re)built `EditorDocks` in `AppMsg::CreateEvent`/`App::refresh`
+/// populate into it.
+#[derive(Clone)]
+struct EditorDocks {
+    overlay: gtk4::Overlay,
+    right_paned: gtk4::Paned,
+    right_slot: gtk4::Box,
+    bottom_paned: gtk4::Paned,
+    bottom_slot: gtk4::Box,
+    sidebar_pane: gtk4::ScrolledWindow,
+    main_content_box: gtk4::Box,
+    current_panel: Rc<RefCell<Option<OpenEditorPanel>>>,
+}
+
 /// Everything an event chip's click handler and the edit dialog it opens need, bundled
 /// so it can be threaded through `populate_month_grid`/`event_row` as one clone-able
 /// value instead of three separate parameters. `window` is the app's single top-level
@@ -193,7 +295,9 @@ enum AppCommandMsg {
 /// DESIGN_SPEC.md §12's Language and region overrides, already resolved (never
 /// `DateFormat::System`/`TimeFormat::System`, see `resolve_date_format`/
 /// `resolve_time_format`) so every rendering function downstream just matches on a
-/// concrete choice instead of re-deriving the system-locale fallback itself.
+/// concrete choice instead of re-deriving the system-locale fallback itself. `docks`
+/// is what the event editor panel reparents itself into/out of across its three view
+/// modes — see `EditorDocks`.
 #[derive(Clone)]
 struct EventCtx {
     storage: Storage,
@@ -201,6 +305,7 @@ struct EventCtx {
     window: adw::Window,
     date_format: DateFormat,
     time_format: TimeFormat,
+    docks: EditorDocks,
 }
 
 /// Everything the Preferences window (DESIGN_SPEC.md §12) needs: `storage` for
@@ -316,159 +421,219 @@ impl Component for App {
                     },
                 },
 
-                #[name = "sidebar_paned"]
+                #[name = "editor_overlay"]
                 #[wrap(Some)]
-                set_content = &gtk4::Paned {
-                    set_orientation: gtk4::Orientation::Horizontal,
-                    set_wide_handle: true,
-                    set_resize_start_child: false,
-                    set_resize_end_child: true,
-                    set_shrink_start_child: false,
-                    set_shrink_end_child: true,
+                set_content = &gtk4::Overlay {
+                    set_hexpand: true,
+                    set_vexpand: true,
 
-                    #[name = "sidebar_pane"]
-                    #[wrap(Some)]
-                    set_start_child = &gtk4::ScrolledWindow {
-                        add_css_class: "card",
-                        set_overflow: gtk4::Overflow::Hidden,
-                        set_margin_start: 12,
-                        set_margin_top: 12,
-                        set_margin_bottom: 12,
-                        set_width_request: SIDEBAR_MIN_WIDTH_PX,
-                        set_hexpand: false,
-                        set_vexpand: true,
-                        set_hscrollbar_policy: gtk4::PolicyType::Never,
+                    // The sidebar sits outside the bottom-dock split entirely (its own
+                    // outermost Paned, wrapping everything to its right) so it always
+                    // spans the full window height — bottom-docking the event editor
+                    // only cuts into the main content column's height, never the
+                    // sidebar's.
+                    #[name = "sidebar_paned"]
+                    gtk4::Paned {
+                        set_orientation: gtk4::Orientation::Horizontal,
+                        set_wide_handle: true,
+                        set_resize_start_child: false,
+                        set_resize_end_child: true,
+                        set_shrink_start_child: false,
+                        set_shrink_end_child: true,
 
-                        gtk4::Box {
-                            set_orientation: gtk4::Orientation::Vertical,
-                            set_spacing: 12,
-                            set_margin_all: 12,
+                        #[name = "sidebar_pane"]
+                        #[wrap(Some)]
+                        set_start_child = &gtk4::ScrolledWindow {
+                            add_css_class: "card",
+                            set_overflow: gtk4::Overflow::Hidden,
+                            set_margin_start: 12,
+                            set_margin_top: 12,
+                            set_margin_bottom: 12,
+                            set_width_request: SIDEBAR_MIN_WIDTH_PX,
+                            set_hexpand: false,
+                            set_vexpand: true,
+                            set_hscrollbar_policy: gtk4::PolicyType::Never,
 
                             gtk4::Box {
-                                add_css_class: "mini-calendar",
                                 set_orientation: gtk4::Orientation::Vertical,
-                                set_spacing: 6,
+                                set_spacing: 12,
+                                set_margin_all: 12,
 
                                 gtk4::Box {
-                                    set_orientation: gtk4::Orientation::Horizontal,
-                                    set_spacing: 2,
+                                    add_css_class: "mini-calendar",
+                                    set_orientation: gtk4::Orientation::Vertical,
+                                    set_spacing: 6,
 
-                                    #[name = "mini_calendar_title"]
-                                    gtk4::MenuButton {
-                                        add_css_class: "flat",
-                                        add_css_class: "mini-calendar-title",
-                                        set_hexpand: true,
-                                        set_halign: gtk4::Align::Start,
-                                        set_tooltip_text: Some("Jump to month/year"),
+                                    gtk4::Box {
+                                        set_orientation: gtk4::Orientation::Horizontal,
+                                        set_spacing: 2,
+
+                                        #[name = "mini_calendar_title"]
+                                        gtk4::MenuButton {
+                                            add_css_class: "flat",
+                                            add_css_class: "mini-calendar-title",
+                                            set_hexpand: true,
+                                            set_halign: gtk4::Align::Start,
+                                            set_tooltip_text: Some("Jump to month/year"),
+                                        },
+                                        gtk4::Button {
+                                            set_icon_name: "go-previous-symbolic",
+                                            add_css_class: "flat",
+                                            set_tooltip_text: Some("Previous month"),
+                                            connect_clicked => AppMsg::PrevMonth,
+                                        },
+                                        gtk4::Button {
+                                            set_icon_name: "go-next-symbolic",
+                                            add_css_class: "flat",
+                                            set_tooltip_text: Some("Next month"),
+                                            connect_clicked => AppMsg::NextMonth,
+                                        },
                                     },
-                                    gtk4::Button {
-                                        set_icon_name: "go-previous-symbolic",
-                                        add_css_class: "flat",
-                                        set_tooltip_text: Some("Previous month"),
-                                        connect_clicked => AppMsg::PrevMonth,
-                                    },
-                                    gtk4::Button {
-                                        set_icon_name: "go-next-symbolic",
-                                        add_css_class: "flat",
-                                        set_tooltip_text: Some("Next month"),
-                                        connect_clicked => AppMsg::NextMonth,
-                                    },
-                                },
 
-                                #[name = "mini_calendar_grid"]
-                                gtk4::Grid {
-                                    add_css_class: "mini-calendar-grid",
-                                    set_row_homogeneous: true,
-                                    set_column_homogeneous: true,
-                                    set_row_spacing: 2,
-                                    set_column_spacing: 2,
-                                },
-                            },
-
-                            #[name = "world_clock_box"]
-                            gtk4::Box {
-                                add_css_class: "world-clock",
-                                set_orientation: gtk4::Orientation::Vertical,
-                                set_spacing: 4,
-                            },
-
-                            gtk4::Separator {},
-
-                            #[name = "sidebar_list"]
-                            gtk4::Box {
-                                add_css_class: "sidebar",
-                                set_orientation: gtk4::Orientation::Vertical,
-                                set_spacing: 2,
-                            },
-                        },
-                    },
-
-                    #[wrap(Some)]
-                    set_end_child = &gtk4::Box {
-                        set_orientation: gtk4::Orientation::Vertical,
-                        set_hexpand: true,
-                        set_vexpand: true,
-                        set_spacing: 12,
-                        set_margin_top: 12,
-                        set_margin_bottom: 12,
-                        set_margin_end: 12,
-
-                        #[name = "month_view_container"]
-                        gtk4::ScrolledWindow {
-                            add_css_class: "card",
-                            set_overflow: gtk4::Overflow::Hidden,
-                            set_vexpand: true,
-                            set_hexpand: true,
-                            set_visible: true,
-
-                            #[name = "month_grid"]
-                            gtk4::Grid {
-                                add_css_class: "month-grid",
-                                set_row_homogeneous: true,
-                                set_column_homogeneous: true,
-                                set_hexpand: true,
-                                set_vexpand: true,
-                            },
-                        },
-
-                        #[name = "day_view_container"]
-                        gtk4::Box {
-                            add_css_class: "card",
-                            set_orientation: gtk4::Orientation::Vertical,
-                            set_overflow: gtk4::Overflow::Hidden,
-                            set_vexpand: true,
-                            set_hexpand: true,
-                            set_visible: false,
-
-                            #[name = "day_header_box"]
-                            gtk4::Box {
-                                set_orientation: gtk4::Orientation::Horizontal,
-                                add_css_class: "day-header-row",
-                            },
-
-                            #[name = "day_all_day_box"]
-                            gtk4::Box {
-                                set_orientation: gtk4::Orientation::Vertical,
-                                add_css_class: "day-all-day-row",
-                                set_visible: false,
-                            },
-
-                            gtk4::Separator {},
-
-                            #[name = "day_scroller"]
-                            gtk4::ScrolledWindow {
-                                set_vexpand: true,
-                                set_hexpand: true,
-                                set_hscrollbar_policy: gtk4::PolicyType::Never,
-
-                                #[name = "day_overlay"]
-                                gtk4::Overlay {
-                                    #[name = "day_hour_grid"]
+                                    #[name = "mini_calendar_grid"]
                                     gtk4::Grid {
-                                        add_css_class: "day-hour-grid",
-                                        set_hexpand: true,
+                                        add_css_class: "mini-calendar-grid",
+                                        set_row_homogeneous: true,
+                                        set_column_homogeneous: true,
+                                        set_row_spacing: 2,
+                                        set_column_spacing: 2,
                                     },
                                 },
+
+                                #[name = "world_clock_box"]
+                                gtk4::Box {
+                                    add_css_class: "world-clock",
+                                    set_orientation: gtk4::Orientation::Vertical,
+                                    set_spacing: 4,
+                                },
+
+                                gtk4::Separator {},
+
+                                #[name = "sidebar_list"]
+                                gtk4::Box {
+                                    add_css_class: "sidebar",
+                                    set_orientation: gtk4::Orientation::Vertical,
+                                    set_spacing: 2,
+                                },
+                            },
+                        },
+
+                        #[name = "right_dock_paned"]
+                        #[wrap(Some)]
+                        set_end_child = &gtk4::Paned {
+                            set_orientation: gtk4::Orientation::Horizontal,
+                            set_wide_handle: true,
+                            set_resize_start_child: true,
+                            set_resize_end_child: false,
+                            set_shrink_start_child: true,
+                            set_shrink_end_child: false,
+
+                            #[name = "bottom_dock_paned"]
+                            #[wrap(Some)]
+                            set_start_child = &gtk4::Paned {
+                                set_orientation: gtk4::Orientation::Vertical,
+                                set_wide_handle: true,
+                                set_resize_start_child: true,
+                                set_resize_end_child: false,
+                                set_shrink_start_child: true,
+                                set_shrink_end_child: false,
+
+                                #[name = "main_content_box"]
+                                #[wrap(Some)]
+                                set_start_child = &gtk4::Box {
+                                    set_orientation: gtk4::Orientation::Vertical,
+                                    set_hexpand: true,
+                                    set_vexpand: true,
+                                    set_spacing: 12,
+                                    set_margin_top: 12,
+                                    set_margin_bottom: 12,
+                                    set_margin_end: 12,
+
+                                    #[name = "month_view_container"]
+                                    gtk4::ScrolledWindow {
+                                        add_css_class: "card",
+                                        set_overflow: gtk4::Overflow::Hidden,
+                                        set_vexpand: true,
+                                        set_hexpand: true,
+                                        set_visible: true,
+
+                                        #[name = "month_grid"]
+                                        gtk4::Grid {
+                                            add_css_class: "month-grid",
+                                            set_row_homogeneous: true,
+                                            set_column_homogeneous: true,
+                                            set_hexpand: true,
+                                            set_vexpand: true,
+                                        },
+                                    },
+
+                                    #[name = "day_view_container"]
+                                    gtk4::Box {
+                                        add_css_class: "card",
+                                        set_orientation: gtk4::Orientation::Vertical,
+                                        set_overflow: gtk4::Overflow::Hidden,
+                                        set_vexpand: true,
+                                        set_hexpand: true,
+                                        set_visible: false,
+
+                                        #[name = "day_header_box"]
+                                        gtk4::Box {
+                                            set_orientation: gtk4::Orientation::Horizontal,
+                                            add_css_class: "day-header-row",
+                                        },
+
+                                        #[name = "day_all_day_box"]
+                                        gtk4::Grid {
+                                            add_css_class: "day-all-day-strip",
+                                            set_row_spacing: 2,
+                                            set_column_spacing: 2,
+                                            set_visible: false,
+                                        },
+
+                                        gtk4::Separator {},
+
+                                        #[name = "day_scroller"]
+                                        gtk4::ScrolledWindow {
+                                            set_vexpand: true,
+                                            set_hexpand: true,
+                                            set_hscrollbar_policy: gtk4::PolicyType::Never,
+
+                                            #[name = "day_overlay"]
+                                            gtk4::Overlay {
+                                                #[name = "day_hour_grid"]
+                                                gtk4::Grid {
+                                                    add_css_class: "day-hour-grid",
+                                                    set_hexpand: true,
+                                                },
+                                            },
+                                        },
+                                    },
+                                },
+
+                                #[name = "bottom_dock_slot"]
+                                #[wrap(Some)]
+                                set_end_child = &gtk4::Box {
+                                    add_css_class: "card",
+                                    set_overflow: gtk4::Overflow::Hidden,
+                                    set_hexpand: true,
+                                    set_vexpand: true,
+                                    set_margin_end: 12,
+                                    set_margin_bottom: 12,
+                                    set_visible: false,
+                                },
+                            },
+
+                            #[name = "right_dock_slot"]
+                            #[wrap(Some)]
+                            set_end_child = &gtk4::Box {
+                                add_css_class: "card",
+                                set_overflow: gtk4::Overflow::Hidden,
+                                set_hexpand: true,
+                                set_vexpand: true,
+                                set_margin_top: 12,
+                                set_margin_bottom: 12,
+                                set_margin_end: 12,
+                                set_visible: false,
                             },
                         },
                     },
@@ -506,27 +671,44 @@ impl Component for App {
         // see `filter_events`'s doc comment for why this half lives app-side.
         let events = filter_events(&events, "", settings.show_declined_events);
 
-        // Built before `core` moves into `model` below — `Storage` is a cheap
-        // `Arc`-backed clone (calendarchy_core::Storage), and `root` (the app's one
-        // top-level window) is cloned here rather than re-fetched later since nothing
-        // else needs an owned handle to it.
-        let ctx = EventCtx {
-            storage: core.storage.clone(),
-            sender: sender.clone(),
-            window: root.clone(),
-            date_format: resolve_date_format(&settings),
-            time_format: resolve_time_format(&settings),
-        };
+        // `Storage` is a cheap `Arc`-backed clone (calendarchy_core::Storage) — cloned
+        // here, before `core` moves into `model` below, since `ctx` itself can only be
+        // built after `view_output!()` produces `widgets` (its `docks` field needs the
+        // editor-docking widgets that macro invocation generates).
+        let storage_for_ctx = core.storage.clone();
+        let open_editor_panel = Rc::new(RefCell::new(None));
 
         let model = App {
             core,
             current_view: ViewMode::Month,
             current_date: today,
+            custom_view_dates: Vec::new(),
             search_query: String::new(),
             sidebar_visible: true,
             overlay: Rc::new(RefCell::new(None)),
+            open_editor_panel: open_editor_panel.clone(),
         };
         let widgets = view_output!();
+
+        // `root` (the app's one top-level window) is cloned here rather than
+        // re-fetched later since nothing else needs an owned handle to it.
+        let ctx = EventCtx {
+            storage: storage_for_ctx,
+            sender: sender.clone(),
+            window: root.clone(),
+            date_format: resolve_date_format(&settings),
+            time_format: resolve_time_format(&settings),
+            docks: EditorDocks {
+                overlay: widgets.editor_overlay.clone(),
+                right_paned: widgets.right_dock_paned.clone(),
+                right_slot: widgets.right_dock_slot.clone(),
+                bottom_paned: widgets.bottom_dock_paned.clone(),
+                bottom_slot: widgets.bottom_dock_slot.clone(),
+                sidebar_pane: widgets.sidebar_pane.clone(),
+                main_content_box: widgets.main_content_box.clone(),
+                current_panel: open_editor_panel,
+            },
+        };
 
         widgets.view_menu_button.set_popover(Some(&build_view_switcher_popover(&sender, &ctx.storage)));
         widgets.view_menu_button.set_label(view_mode_label(model.current_view));
@@ -544,6 +726,7 @@ impl Component for App {
             settings.day_time_scale_minutes,
             settings.day_drag_snap_ctrl_minutes,
             settings.day_drag_snap_ctrl_shift_minutes,
+            settings.day_drag_hold_ms,
         );
         {
             // The sidebar's mini calendar isn't inside a popover of its own, so
@@ -551,7 +734,17 @@ impl Component for App {
             // picking a day both just page the main view (`AppMsg::JumpToDate`),
             // unlike `date_picker`'s two callbacks, which mean different things.
             let jump = jump_to_date_callback(&sender);
-            populate_mini_calendar(&widgets.mini_calendar_grid, &widgets.mini_calendar_title, today, today, &jump, &jump);
+            let range_pick = range_pick_callback(&sender);
+            populate_mini_calendar(
+                &widgets.mini_calendar_grid,
+                &widgets.mini_calendar_title,
+                today,
+                today,
+                &jump,
+                &jump,
+                Some(&range_pick),
+                &[],
+            );
         }
         populate_sidebar(&widgets.sidebar_list, &accounts, &calendars, &sender);
         populate_world_clock(&widgets.world_clock_box, &settings);
@@ -565,6 +758,14 @@ impl Component for App {
                 .unwrap_or(DEFAULT_SIDEBAR_WIDTH_PX as f64 / 1100.0);
             install_sidebar_resize_persistence(&widgets.sidebar_paned, &root, &ctx.storage, fraction);
         }
+        // Unlike the sidebar above, these two attach *only* the debounced-save half of
+        // the pattern — no startup restore, since the event editor panel (and thus
+        // both dock `Paned`s' end children) isn't shown until a user opens it. The
+        // panel's initial size is restored lazily, straight from settings, the first
+        // time it actually docks in a session — see `dock_panel`.
+        install_right_dock_resize_persistence(&widgets.right_dock_paned, &widgets.right_dock_slot, &ctx.storage);
+        install_bottom_dock_resize_persistence(&widgets.bottom_dock_paned, &widgets.bottom_dock_slot, &ctx.storage);
+        install_panel_drag(&widgets.editor_overlay, &ctx.docks, &ctx.storage);
         start_world_clock_ticker(&widgets.world_clock_box, ctx.storage.clone());
         notifications::start_scheduler(sender.clone(), ctx.storage.clone());
         // Shows any reminders still `active` from a previous run immediately, rather
@@ -573,7 +774,7 @@ impl Component for App {
         // storage as soon as the app opens.
         {
             let handle = notifications::ensure_overlay(&model.overlay, &ctx.storage, &sender);
-            notifications::refresh_overlay(&handle);
+            notifications::refresh_overlay(&handle, &root);
         }
 
         // `populate_month_grid`/`populate_day_view` above ran before the window had a
@@ -675,30 +876,48 @@ impl Component for App {
                 self.refresh(widgets, &sender, root);
             }
             AppMsg::PrevPeriod => {
-                self.current_date = match self.current_view {
-                    ViewMode::Month => shift_month(self.current_date, -1),
-                    ViewMode::Day => self.current_date - Duration::days(1),
+                match self.current_view {
+                    ViewMode::Month => self.current_date = shift_month(self.current_date, -1),
+                    ViewMode::Day => self.current_date -= Duration::days(1),
                     ViewMode::FiveDay => {
                         let show_weekends = load_settings(&self.core.storage).unwrap_or_default().show_weekends;
-                        if show_weekends {
+                        self.current_date = if show_weekends {
                             self.current_date - Duration::days(5)
                         } else {
                             step_weekdays(self.current_date, -5)
+                        };
+                    }
+                    ViewMode::Custom => {
+                        let span = self.custom_view_dates.len() as i64;
+                        for date in &mut self.custom_view_dates {
+                            *date -= Duration::days(span);
+                        }
+                        if let Some(&first) = self.custom_view_dates.first() {
+                            self.current_date = first;
                         }
                     }
                 };
                 self.refresh(widgets, &sender, root);
             }
             AppMsg::NextPeriod => {
-                self.current_date = match self.current_view {
-                    ViewMode::Month => shift_month(self.current_date, 1),
-                    ViewMode::Day => self.current_date + Duration::days(1),
+                match self.current_view {
+                    ViewMode::Month => self.current_date = shift_month(self.current_date, 1),
+                    ViewMode::Day => self.current_date += Duration::days(1),
                     ViewMode::FiveDay => {
                         let show_weekends = load_settings(&self.core.storage).unwrap_or_default().show_weekends;
-                        if show_weekends {
+                        self.current_date = if show_weekends {
                             self.current_date + Duration::days(5)
                         } else {
                             step_weekdays(self.current_date, 5)
+                        };
+                    }
+                    ViewMode::Custom => {
+                        let span = self.custom_view_dates.len() as i64;
+                        for date in &mut self.custom_view_dates {
+                            *date += Duration::days(span);
+                        }
+                        if let Some(&first) = self.custom_view_dates.first() {
+                            self.current_date = first;
                         }
                     }
                 };
@@ -707,10 +926,10 @@ impl Component for App {
             AppMsg::SetView(view) => {
                 self.current_view = view;
                 widgets.month_view_container.set_visible(view == ViewMode::Month);
-                widgets.day_view_container.set_visible(matches!(view, ViewMode::Day | ViewMode::FiveDay));
+                widgets.day_view_container.set_visible(matches!(view, ViewMode::Day | ViewMode::FiveDay | ViewMode::Custom));
                 widgets.view_menu_button.set_label(view_mode_label(view));
                 self.refresh(widgets, &sender, root);
-                if matches!(view, ViewMode::Day | ViewMode::FiveDay) {
+                if matches!(view, ViewMode::Day | ViewMode::FiveDay | ViewMode::Custom) {
                     // `day_overlay` was hidden (inside `day_view_container`) until the
                     // `set_visible(true)` above, so the `refresh` just above computed
                     // its event columns off a stale/zero width — correct it once a
@@ -721,11 +940,32 @@ impl Component for App {
                     let today_visible = match view {
                         ViewMode::Day => self.current_date == today,
                         ViewMode::FiveDay => five_day_window(self.current_date, settings.show_weekends).contains(&today),
+                        ViewMode::Custom => self.custom_view_dates.contains(&today),
                         ViewMode::Month => false,
                     };
                     if today_visible {
                         scroll_day_view_to_now(&widgets.day_scroller, settings.day_time_scale_minutes);
                     }
+                }
+            }
+            AppMsg::SetCustomViewDates(dates) => {
+                self.current_view = ViewMode::Custom;
+                if let Some(&first) = dates.first() {
+                    self.current_date = first;
+                }
+                self.custom_view_dates = dates;
+                widgets.month_view_container.set_visible(false);
+                widgets.day_view_container.set_visible(true);
+                widgets.view_menu_button.set_label(view_mode_label(self.current_view));
+                self.refresh(widgets, &sender, root);
+                // Same reasoning as `SetView`'s Day/5-day branch above: `day_overlay`
+                // was hidden until just now, so this refresh's column widths need a
+                // follow-up pass once real geometry is allocated.
+                poll_for_real_width_then_resize(&widgets.day_overlay, &sender);
+                let today = Local::now().date_naive();
+                if self.custom_view_dates.contains(&today) {
+                    let settings = load_settings(&self.core.storage).unwrap_or_default();
+                    scroll_day_view_to_now(&widgets.day_scroller, settings.day_time_scale_minutes);
                 }
             }
             AppMsg::ZoomDayTimeScale { finer } => {
@@ -749,6 +989,19 @@ impl Component for App {
                 tracing::info!(elapsed_ms = started.elapsed().as_millis(), "DEBUG resize refresh done");
             }
             AppMsg::JumpToDate(date) => {
+                // A plain click on the mini calendar while a drag-selected range is
+                // showing (`ViewMode::Custom`) only actually changes anything on
+                // screen if the clicked date falls outside that range — `Custom`'s
+                // visible columns come from `custom_view_dates`, not `current_date`
+                // (see `App::refresh`), so a click *inside* the range is a no-op here
+                // beyond the cosmetic `current_date` sync below. A click outside it
+                // drops out of the range into a plain single-day view instead.
+                if self.current_view == ViewMode::Custom && !self.custom_view_dates.contains(&date) {
+                    self.current_view = ViewMode::Day;
+                    widgets.month_view_container.set_visible(false);
+                    widgets.day_view_container.set_visible(true);
+                    widgets.view_menu_button.set_label(view_mode_label(self.current_view));
+                }
                 self.current_date = date;
                 self.refresh(widgets, &sender, root);
             }
@@ -770,6 +1023,16 @@ impl Component for App {
                             window: root.clone(),
                             date_format: resolve_date_format(&settings),
                             time_format: resolve_time_format(&settings),
+                            docks: EditorDocks {
+                                overlay: widgets.editor_overlay.clone(),
+                                right_paned: widgets.right_dock_paned.clone(),
+                                right_slot: widgets.right_dock_slot.clone(),
+                                bottom_paned: widgets.bottom_dock_paned.clone(),
+                                bottom_slot: widgets.bottom_dock_slot.clone(),
+                                sidebar_pane: widgets.sidebar_pane.clone(),
+                                main_content_box: widgets.main_content_box.clone(),
+                                current_panel: self.open_editor_panel.clone(),
+                            },
                         };
                         show_edit_event_dialog(detail, calendars, ctx);
                     }
@@ -791,32 +1054,32 @@ impl Component for App {
                 if let Err(err) = snooze_reminder(&self.core.storage, id, until) {
                     tracing::warn!(%err, id, "failed to snooze reminder");
                 }
-                self.refresh_overlay(&sender);
+                self.refresh_overlay(&sender, root);
             }
             AppMsg::DismissReminder(id) => {
                 if let Err(err) = dismiss_reminder(&self.core.storage, id) {
                     tracing::warn!(%err, id, "failed to dismiss reminder");
                 }
-                self.refresh_overlay(&sender);
+                self.refresh_overlay(&sender, root);
             }
             AppMsg::DismissAllReminders => {
                 if let Err(err) = dismiss_all_active(&self.core.storage) {
                     tracing::warn!(%err, "failed to dismiss all reminders");
                 }
-                self.refresh_overlay(&sender);
+                self.refresh_overlay(&sender, root);
             }
             AppMsg::SnoozeAllReminders(minutes) => {
                 let until = notifications::snooze_until(minutes);
                 if let Err(err) = snooze_all_active(&self.core.storage, until) {
                     tracing::warn!(%err, "failed to snooze all reminders");
                 }
-                self.refresh_overlay(&sender);
+                self.refresh_overlay(&sender, root);
             }
             AppMsg::ClearHistoryEntry(id) => {
                 if let Err(err) = delete_reminder_notification(&self.core.storage, id) {
                     tracing::warn!(%err, id, "failed to clear reminder history entry");
                 }
-                self.refresh_overlay(&sender);
+                self.refresh_overlay(&sender, root);
             }
         }
     }
@@ -839,7 +1102,7 @@ impl Component for App {
             }
             AppCommandMsg::ReminderCheckFinished { newly_fired } => {
                 if !newly_fired.is_empty() {
-                    self.refresh_overlay(&sender);
+                    self.refresh_overlay(&sender, root);
                 }
             }
         }
@@ -858,9 +1121,9 @@ impl App {
     /// Rebuilds the floating notification dialog from storage — the shared tail end
     /// of every `AppMsg`/`AppCommandMsg` that changes reminder state (snooze,
     /// dismiss, dismiss all, clear history, or a fresh scheduler tick).
-    fn refresh_overlay(&self, sender: &ComponentSender<App>) {
+    fn refresh_overlay(&self, sender: &ComponentSender<App>, root: &adw::Window) {
         let handle = notifications::ensure_overlay(&self.overlay, &self.core.storage, sender);
-        notifications::refresh_overlay(&handle);
+        notifications::refresh_overlay(&handle, root);
     }
 
     fn refresh(&self, widgets: &mut AppWidgets, sender: &ComponentSender<App>, root: &adw::Window) {
@@ -874,10 +1137,21 @@ impl App {
             window: root.clone(),
             date_format: resolve_date_format(&settings),
             time_format: resolve_time_format(&settings),
+            docks: EditorDocks {
+                overlay: widgets.editor_overlay.clone(),
+                right_paned: widgets.right_dock_paned.clone(),
+                right_slot: widgets.right_dock_slot.clone(),
+                bottom_paned: widgets.bottom_dock_paned.clone(),
+                bottom_slot: widgets.bottom_dock_slot.clone(),
+                sidebar_pane: widgets.sidebar_pane.clone(),
+                main_content_box: widgets.main_content_box.clone(),
+                current_panel: self.open_editor_panel.clone(),
+            },
         };
         populate_month_grid(&widgets.month_grid, self.current_date, today, &events, &ctx);
         let day_view_dates: Vec<NaiveDate> = match self.current_view {
             ViewMode::FiveDay => five_day_window(self.current_date, settings.show_weekends),
+            ViewMode::Custom => self.custom_view_dates.clone(),
             ViewMode::Day | ViewMode::Month => vec![self.current_date],
         };
         populate_day_header(&widgets.day_header_box, &widgets.day_all_day_box, &day_view_dates, today, &events, &ctx);
@@ -890,9 +1164,11 @@ impl App {
             settings.day_time_scale_minutes,
             settings.day_drag_snap_ctrl_minutes,
             settings.day_drag_snap_ctrl_shift_minutes,
+            settings.day_drag_hold_ms,
         );
         {
             let jump = jump_to_date_callback(sender);
+            let range_pick = range_pick_callback(sender);
             populate_mini_calendar(
                 &widgets.mini_calendar_grid,
                 &widgets.mini_calendar_title,
@@ -900,12 +1176,15 @@ impl App {
                 today,
                 &jump,
                 &jump,
+                Some(&range_pick),
+                if self.current_view == ViewMode::Custom { &self.custom_view_dates } else { &[] },
             );
         }
         let title = match self.current_view {
             ViewMode::Month => self.current_date.format("%B %Y").to_string(),
             ViewMode::Day => self.current_date.format("%A, %B %-d, %Y").to_string(),
             ViewMode::FiveDay => five_day_title(&day_view_dates),
+            ViewMode::Custom => custom_view_title(&day_view_dates),
         };
         widgets.window_title.set_title(&title);
 
@@ -989,13 +1268,11 @@ fn five_day_window(anchor: NaiveDate, show_weekends: bool) -> Vec<NaiveDate> {
     dates
 }
 
-/// Window-title text for `ViewMode::FiveDay`: `"September 2026"` when the whole window
-/// sits in one month (matching Month view's own `"%B %Y"` convention at
-/// `App::refresh`), else a spanning `"Aug 31 – Sep 4, 2026"` (or, across a year
-/// boundary, `"Dec 29, 2025 – Jan 2, 2026"`).
-fn five_day_title(dates: &[NaiveDate]) -> String {
-    let first = dates[0];
-    let last = *dates.last().expect("five_day_window always returns 5 dates");
+/// Window-title text for a date span: `"September 2026"` when both ends sit in one
+/// month (matching Month view's own `"%B %Y"` convention at `App::refresh`), else a
+/// spanning `"Aug 31 – Sep 4, 2026"` (or, across a year boundary,
+/// `"Dec 29, 2025 – Jan 2, 2026"`). Shared by `five_day_title` and `custom_view_title`.
+fn date_span_title(first: NaiveDate, last: NaiveDate) -> String {
     if first.year() == last.year() && first.month() == last.month() {
         first.format("%B %Y").to_string()
     } else if first.year() == last.year() {
@@ -1003,6 +1280,41 @@ fn five_day_title(dates: &[NaiveDate]) -> String {
     } else {
         format!("{} – {}", first.format("%b %-d, %Y"), last.format("%b %-d, %Y"))
     }
+}
+
+/// Window-title text for `ViewMode::FiveDay`.
+fn five_day_title(dates: &[NaiveDate]) -> String {
+    date_span_title(dates[0], *dates.last().expect("five_day_window always returns 5 dates"))
+}
+
+/// Window-title text for `ViewMode::Custom` — same span-formatting as `five_day_title`,
+/// just over however many dates the mini calendar drag-select produced.
+fn custom_view_title(dates: &[NaiveDate]) -> String {
+    date_span_title(dates[0], *dates.last().expect("custom_view_dates is never empty in ViewMode::Custom"))
+}
+
+/// Max consecutive dates a mini calendar drag-select can produce — the day/5-day view's
+/// column layout is already generic over `&[NaiveDate]`, so this is purely a UX cap
+/// (mirrors "5 day" view's own fixed width) rather than a rendering limit.
+const MINI_CALENDAR_DRAG_MAX_DAYS: i64 = 8;
+
+/// Consecutive dates from `origin` toward `other` (inclusive of both when the span
+/// fits within `max_len`), capping the far end by trimming whichever side is farther
+/// from `origin` — so the cell a mini calendar drag started on is always kept, and the
+/// range only ever grows *toward* wherever the pointer currently is. `other == origin`
+/// yields a single-date `vec![origin]`.
+fn capped_date_range(origin: NaiveDate, other: NaiveDate, max_len: i64) -> Vec<NaiveDate> {
+    let direction = if other >= origin { 1 } else { -1 };
+    let raw_span = (other - origin).num_days().abs().min(max_len - 1);
+    let far = origin + Duration::days(direction * raw_span);
+    let (start, end) = if far >= origin { (origin, far) } else { (far, origin) };
+    let mut dates = Vec::new();
+    let mut d = start;
+    while d <= end {
+        dates.push(d);
+        d += Duration::days(1);
+    }
+    dates
 }
 
 /// Case-insensitive substring match on title, mirroring DESIGN_SPEC.md §10's "simple
@@ -1223,6 +1535,696 @@ fn install_sidebar_resize_persistence(paned: &gtk4::Paned, window: &adw::Window,
     });
 }
 
+/// Wires persistence of the right-docked event editor panel's drag-resized width —
+/// same debounce/clamp shape as `install_sidebar_resize_persistence`, but attached
+/// once at `init` time to the (always-present) `right_dock_paned`, independent of
+/// whether the panel is currently docked into it, since that `Paned` lives for the
+/// app's whole lifetime while the panel's own content only exists while open. No
+/// startup-restore poll here, unlike the sidebar: this dock isn't on screen at
+/// launch, so its saved fraction is only ever applied later, at the moment
+/// `dock_panel` first docks the panel into it in a given session.
+///
+/// Because the dock is the `Paned`'s *end* child (the sidebar's fixed pane is its
+/// *start* child), `position()` measures everything *before* the dock, not the
+/// dock's own width — so the dock's width is `paned.width() - paned.position()`,
+/// and clamping/persisting operate on that derived value, not `position()` itself.
+/// `slot` (the dock's own `Box`) guards every `notify::position` firing: a hidden
+/// `Paned` end child can still report shifting `position()` values as the window
+/// resizes (all resize delta lands on the visible start side), which would
+/// otherwise clamp-correct and persist a meaningless width while nothing is
+/// actually docked here.
+fn install_right_dock_resize_persistence(paned: &gtk4::Paned, slot: &gtk4::Box, storage: &Storage) {
+    let pending_save: Rc<Cell<Option<gtk4::glib::SourceId>>> = Rc::new(Cell::new(None));
+    let slot = slot.clone();
+    let storage = storage.clone();
+    paned.connect_position_notify(move |paned| {
+        if !slot.is_visible() {
+            return;
+        }
+        let total = paned.width().max(1);
+        let raw_dock_width = total - paned.position();
+        let clamped = raw_dock_width.clamp(EDITOR_RIGHT_DOCK_MIN_WIDTH_PX, EDITOR_RIGHT_DOCK_MAX_WIDTH_PX);
+        if clamped != raw_dock_width {
+            paned.set_position(total - clamped); // re-enters here once with clamped == derived width; no further recursion
+            return;
+        }
+        if let Some(id) = pending_save.take() {
+            id.remove();
+        }
+        let storage = storage.clone();
+        let pending_save_for_timer = pending_save.clone();
+        let id = gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(350), move || {
+            pending_save_for_timer.set(None);
+            let mut settings = load_settings(&storage).unwrap_or_default();
+            settings.event_editor_right_width_fraction = Some(clamped as f64 / total as f64);
+            if let Err(err) = save_settings(&storage, &settings) {
+                tracing::warn!(%err, "failed to save event editor right dock width");
+            }
+        });
+        pending_save.set(Some(id));
+    });
+}
+
+/// Bottom-dock counterpart of `install_right_dock_resize_persistence` — same
+/// derived-size-from-the-end-child arithmetic and hidden-slot guard, just measuring
+/// height off a vertical `Paned` instead of width off a horizontal one.
+fn install_bottom_dock_resize_persistence(paned: &gtk4::Paned, slot: &gtk4::Box, storage: &Storage) {
+    let pending_save: Rc<Cell<Option<gtk4::glib::SourceId>>> = Rc::new(Cell::new(None));
+    let slot = slot.clone();
+    let storage = storage.clone();
+    paned.connect_position_notify(move |paned| {
+        if !slot.is_visible() {
+            return;
+        }
+        let total = paned.height().max(1);
+        let raw_dock_height = total - paned.position();
+        let clamped = raw_dock_height.clamp(EDITOR_BOTTOM_DOCK_MIN_HEIGHT_PX, EDITOR_BOTTOM_DOCK_MAX_HEIGHT_PX);
+        if clamped != raw_dock_height {
+            paned.set_position(total - clamped);
+            return;
+        }
+        if let Some(id) = pending_save.take() {
+            id.remove();
+        }
+        let storage = storage.clone();
+        let pending_save_for_timer = pending_save.clone();
+        let id = gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(350), move || {
+            pending_save_for_timer.set(None);
+            let mut settings = load_settings(&storage).unwrap_or_default();
+            settings.event_editor_bottom_height_fraction = Some(clamped as f64 / total as f64);
+            if let Err(err) = save_settings(&storage, &settings) {
+                tracing::warn!(%err, "failed to save event editor bottom dock height");
+            }
+        });
+        pending_save.set(Some(id));
+    });
+}
+
+/// Zeroes out (or restores) the shared-edge margin on the widgets adjacent to
+/// whichever dock is active, so a docked event editor panel gets a clean single
+/// handle-width gap against its neighbor instead of a doubled gap from two
+/// independent outer margins meeting at the same edge — see `EditorDocks`'s doc
+/// comment and DESIGN_SPEC.md §10's "Motion & feel" for why this app's panes only
+/// ever carry a margin on edges that don't already border a `Paned` handle.
+/// `main_content_box`'s margin is affected by *either* dock — its right edge
+/// borders `right_dock_paned`'s handle when right-docked, its bottom edge borders
+/// `bottom_dock_paned`'s handle when bottom-docked. The sidebar sits outside both
+/// docks' `Paned`s entirely (`sidebar_paned` wraps everything else, full window
+/// height) so it never needs a margin adjustment here — bottom-docking only ever
+/// cuts into the main content column.
+fn update_dock_margins(docks: &EditorDocks, mode: EventEditorPanelMode) {
+    let right_active = mode == EventEditorPanelMode::Right;
+    let bottom_active = mode == EventEditorPanelMode::Bottom;
+    docks.main_content_box.set_margin_end(if right_active { 0 } else { 12 });
+    docks.main_content_box.set_margin_bottom(if bottom_active { 0 } else { 12 });
+}
+
+/// Detaches the event editor panel's root from wherever it currently lives (the
+/// floating overlay, or one of the two dock slots — a no-op if it has no parent yet)
+/// and restores both dock slots/margins to their empty, non-docked state. This is
+/// the tear-down half of the panel's lifecycle — called for Save, Duplicate, Delete,
+/// and a confirmed Discard, i.e. every path that actually ends the panel's life,
+/// never for a live floating<->docked drag transition (`dock_panel`/`attach_floating`/
+/// `attach_docked_right`/`attach_docked_bottom` reparent the same still-open panel
+/// instead of tearing it down).
+fn close_panel(panel_root: &adw::ToolbarView, docks: &EditorDocks) {
+    panel_root.unparent();
+    docks.right_slot.set_visible(false);
+    docks.bottom_slot.set_visible(false);
+    update_dock_margins(docks, EventEditorPanelMode::Floating);
+    // Tell the persistent overlay-level drag gesture there's no panel to drag
+    // anymore — otherwise a press on whatever now overlaps the old titlebar's
+    // former bounds could spuriously hit-test against a panel that's already gone.
+    *docks.current_panel.borrow_mut() = None;
+}
+
+/// Styles the panel root for a docked (Bottom or Right) presentation: fills its
+/// slot instead of sizing to its own natural/floating size, and drops the floating
+/// look (see `attach_floating`'s `.floating-editor-panel` class).
+fn style_panel_as_docked(panel_root: &adw::ToolbarView) {
+    panel_root.remove_css_class("floating-editor-panel");
+    // Defensive — present if this dock was just committed straight out of a live
+    // preview (`preview_docked_right`/`preview_docked_bottom`); a real dock slot's
+    // own ancestry already gives the panel an opaque background, so the preview-only
+    // class would be redundant here, not wrong, but there's no reason to leave it on.
+    panel_root.remove_css_class("docking-editor-panel");
+    panel_root.set_size_request(-1, -1);
+    panel_root.set_halign(gtk4::Align::Fill);
+    panel_root.set_valign(gtk4::Align::Fill);
+    panel_root.set_hexpand(true);
+    panel_root.set_vexpand(true);
+    panel_root.set_margin_start(0);
+    panel_root.set_margin_top(0);
+}
+
+/// Reparents the panel into the overlay as a freely-positioned floating card at
+/// `(margin_x, margin_y)` — the "look like `notifications.rs`'s own floating dialog"
+/// styling (border + rounded corners + `@window_bg_color`, via the
+/// `.floating-editor-panel` CSS class in `load_static_css`) plus a fixed size (see
+/// `DEFAULT_EDITOR_FLOATING_SIZE_PX`'s doc comment for why floating isn't
+/// independently resizable). Used both for the initial "open floating" attach
+/// (`dock_panel`) and for a live undock mid-drag (`install_panel_drag`), which is why
+/// the position is a plain parameter rather than read from settings here — the drag
+/// case wants the panel to appear wherever the pointer just pulled it to, not
+/// wherever it was last saved.
+fn attach_floating(panel_root: &adw::ToolbarView, docks: &EditorDocks, margin_x: i32, margin_y: i32) {
+    panel_root.unparent();
+    docks.right_slot.set_visible(false);
+    docks.bottom_slot.set_visible(false);
+    update_dock_margins(docks, EventEditorPanelMode::Floating);
+
+    panel_root.remove_css_class("docking-editor-panel");
+    panel_root.add_css_class("floating-editor-panel");
+    // `Overflow::Hidden` alongside the CSS class, same as `.card`'s own convention —
+    // otherwise the header bar's square corners would poke past the rounded border.
+    panel_root.set_overflow(gtk4::Overflow::Hidden);
+    let (width, height) = DEFAULT_EDITOR_FLOATING_SIZE_PX;
+    panel_root.set_size_request(width, height);
+    panel_root.set_halign(gtk4::Align::Start);
+    panel_root.set_valign(gtk4::Align::Start);
+    panel_root.set_hexpand(false);
+    panel_root.set_vexpand(false);
+    panel_root.set_margin_start(margin_x.max(0));
+    panel_root.set_margin_top(margin_y.max(0));
+    docks.overlay.add_overlay(panel_root);
+}
+
+/// Reparents the panel into `right_dock_slot`, restoring its remembered dock width
+/// (`AppSettings::event_editor_right_width_fraction`, falling back to the built-in
+/// default) against `right_dock_paned`'s *current* width — read synchronously rather
+/// than polled, since (unlike the sidebar, visible from launch) this dock is never
+/// touched before the main window already has a real allocated size (see
+/// `install_right_dock_resize_persistence`'s doc comment).
+fn attach_docked_right(panel_root: &adw::ToolbarView, docks: &EditorDocks, storage: &Storage) {
+    panel_root.unparent();
+    docks.bottom_slot.set_visible(false);
+    update_dock_margins(docks, EventEditorPanelMode::Right);
+    style_panel_as_docked(panel_root);
+
+    docks.right_slot.append(panel_root);
+    docks.right_slot.set_visible(true);
+
+    let settings = load_settings(storage).unwrap_or_default();
+    let total = docks.right_paned.width().max(1);
+    let fraction = settings
+        .event_editor_right_width_fraction
+        .unwrap_or(DEFAULT_EDITOR_RIGHT_DOCK_WIDTH_PX as f64 / 1100.0);
+    let target_dock_width = (total as f64 * fraction).round() as i32;
+    docks.right_paned.set_position((total - target_dock_width).clamp(0, total));
+}
+
+/// Bottom-dock counterpart of `attach_docked_right`.
+fn attach_docked_bottom(panel_root: &adw::ToolbarView, docks: &EditorDocks, storage: &Storage) {
+    panel_root.unparent();
+    docks.right_slot.set_visible(false);
+    update_dock_margins(docks, EventEditorPanelMode::Bottom);
+    style_panel_as_docked(panel_root);
+
+    docks.bottom_slot.append(panel_root);
+    docks.bottom_slot.set_visible(true);
+
+    let settings = load_settings(storage).unwrap_or_default();
+    let total = docks.bottom_paned.height().max(1);
+    let fraction = settings
+        .event_editor_bottom_height_fraction
+        .unwrap_or(DEFAULT_EDITOR_BOTTOM_DOCK_HEIGHT_PX as f64 / 720.0);
+    let target_dock_height = (total as f64 * fraction).round() as i32;
+    docks.bottom_paned.set_position((total - target_dock_height).clamp(0, total));
+}
+
+/// The event editor panel's field rows, bundled so `relayout_editor_body` can freely
+/// reparent them between a single-column stack and a wide multi-column arrangement.
+/// Each field is already exactly one self-contained `gtk4::Box` (`field_row`'s own
+/// icon+widget row, or a row like `date_time_row`/`options_row` built directly as a
+/// `Box`), so moving a whole row between containers never disturbs the individual
+/// field widgets' own signal handlers/state nested inside it.
+struct EditorBodyRows {
+    date_time_row: gtk4::Box,
+    options_row: gtk4::Box,
+    location_row: gtk4::Box,
+    calendar_row: gtk4::Box,
+    notifications_row: gtk4::Box,
+    busy_visibility_row: gtk4::Box,
+    description_row: gtk4::Box,
+}
+
+/// Detaches `widget` from its current parent (if any) and appends it to `container`
+/// — the reparent primitive `relayout_editor_body` uses to move a field row between
+/// layouts. Guarded rather than an unconditional `unparent()` because a row that's
+/// already landed in its target arrangement (e.g. the very first layout call, before
+/// any row has ever had a parent) has nothing to detach from.
+fn move_into(container: &gtk4::Box, widget: &impl IsA<gtk4::Widget>) {
+    if widget.parent().is_some() {
+        widget.unparent();
+    }
+    container.append(widget);
+}
+
+/// Re-flows the event editor panel's field rows for `mode` — called once for the
+/// panel's starting mode and again every time a live drag commits to a new mode
+/// (`OpenEditorPanel::relayout`). The single-column stack (Floating/Right) matches
+/// those two modes' narrow-but-tall shape; Bottom is wide but short, so its fields
+/// split into two side-by-side columns instead, roughly halving the stack's total
+/// height while actually using the dock's extra width — with Description (the field
+/// most likely to want room to read/edit) spanning the full width below both
+/// columns rather than being squeezed into either one.
+fn relayout_editor_body(body: &gtk4::Box, rows: &EditorBodyRows, mode: EventEditorPanelMode) {
+    clear_children(body);
+    match mode {
+        EventEditorPanelMode::Bottom => {
+            let columns = gtk4::Box::new(gtk4::Orientation::Horizontal, 24);
+            let left = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
+            left.set_hexpand(true);
+            for row in [&rows.date_time_row, &rows.options_row, &rows.location_row, &rows.calendar_row] {
+                move_into(&left, row);
+            }
+            let right = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
+            right.set_hexpand(true);
+            for row in [&rows.notifications_row, &rows.busy_visibility_row] {
+                move_into(&right, row);
+            }
+            columns.append(&left);
+            columns.append(&right);
+            body.append(&columns);
+            move_into(body, &rows.description_row);
+        }
+        EventEditorPanelMode::Floating | EventEditorPanelMode::Right => {
+            for row in [
+                &rows.date_time_row,
+                &rows.options_row,
+                &rows.location_row,
+                &rows.calendar_row,
+                &rows.notifications_row,
+                &rows.busy_visibility_row,
+                &rows.description_row,
+            ] {
+                move_into(body, row);
+            }
+        }
+    }
+}
+
+/// Attaches the panel into whichever container `mode` calls for, restoring that
+/// mode's remembered size/position from settings. Used once, when the panel first
+/// opens, to render it in the persisted starting mode — mid-drag transitions call
+/// `attach_floating`/`attach_docked_right`/`attach_docked_bottom` directly instead
+/// (see `attach_floating`'s doc comment for why floating specifically needs that).
+fn dock_panel(panel_root: &adw::ToolbarView, mode: EventEditorPanelMode, docks: &EditorDocks, storage: &Storage) {
+    match mode {
+        EventEditorPanelMode::Floating => {
+            let settings = load_settings(storage).unwrap_or_default();
+            let overlay_w = docks.overlay.width().max(1) as f64;
+            let overlay_h = docks.overlay.height().max(1) as f64;
+            let (margin_x, margin_y) = settings
+                .event_editor_floating_position
+                .map(|(fx, fy)| ((fx * overlay_w).round() as i32, (fy * overlay_h).round() as i32))
+                .unwrap_or(DEFAULT_EDITOR_FLOATING_MARGIN_PX);
+            attach_floating(panel_root, docks, margin_x, margin_y);
+        }
+        EventEditorPanelMode::Right => attach_docked_right(panel_root, docks, storage),
+        EventEditorPanelMode::Bottom => attach_docked_bottom(panel_root, docks, storage),
+    }
+}
+
+/// Panel equivalent of `install_close_guard`: runs `on_close` immediately if nothing
+/// has changed, otherwise shows the same "Discard unsaved changes?" `AlertDialog`.
+/// Called directly from both trigger points (the header's close button and Escape)
+/// instead of being installed as a `close-request` signal handler, since the panel
+/// is a plain embedded widget with no such signal to hang this off of. `window` is
+/// the *main* app window (`ctx.window`), used only as the confirmation dialog's
+/// transient parent — there's no separate top-level window of the panel's own left.
+fn confirm_close(window: &adw::Window, dirty: &Rc<Cell<bool>>, on_close: impl Fn() + 'static) {
+    if !dirty.get() {
+        on_close();
+        return;
+    }
+
+    let confirm = adw::AlertDialog::new(
+        Some("Discard unsaved changes?"),
+        Some("This event has changes that haven't been saved."),
+    );
+    confirm.add_response("keep-editing", "Keep Editing");
+    confirm.add_response("discard", "Discard");
+    confirm.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+    confirm.set_default_response(Some("keep-editing"));
+    confirm.set_close_response("keep-editing");
+
+    confirm.choose(Some(window), gtk4::gio::Cancellable::NONE, move |response| {
+        if response == "discard" {
+            on_close();
+        }
+    });
+}
+
+/// Panel equivalent of `install_escape_to_close`: binds Escape to `on_close` via the
+/// same `Global`-scope `gtk4::ShortcutController` idiom, attached to the panel's own
+/// root instead of a window. `Global` scope resolves at the nearest `Root` ancestor
+/// regardless of which specific widget currently has keyboard focus — the title
+/// entry, the description text view, etc. — the same as the window-based version,
+/// since a `Root` ancestor exists as soon as this panel is parented anywhere in the
+/// main window's tree (`install_view_shortcuts`/`install_search_shortcut` already
+/// establish that a `Global`-scope controller need not be attached to a toplevel
+/// itself, only live under one).
+fn install_panel_escape_to_close(panel_root: &adw::ToolbarView, on_close: impl Fn() + 'static) {
+    let controller = gtk4::ShortcutController::new();
+    controller.set_scope(gtk4::ShortcutScope::Global);
+
+    controller.add_shortcut(gtk4::Shortcut::new(
+        gtk4::ShortcutTrigger::parse_string("Escape"),
+        Some(gtk4::CallbackAction::new(move |_widget, _args| {
+            on_close();
+            gtk4::glib::Propagation::Stop
+        })),
+    ));
+
+    panel_root.add_controller(controller);
+}
+
+/// Live "would look floating here" preview during a drag — the same visual result
+/// `attach_floating` gives (size, CSS class, margins) without any of its
+/// unparent/reparent side effects. Called on every `drag-update` tick while the
+/// dragged panel started the gesture already floating (see
+/// `install_panel_drag`'s doc comment for why a *docked* start can't get this same
+/// live preview).
+fn preview_floating(panel_root: &adw::ToolbarView, margin_x: i32, margin_y: i32) {
+    panel_root.remove_css_class("docking-editor-panel");
+    panel_root.add_css_class("floating-editor-panel");
+    let (width, height) = DEFAULT_EDITOR_FLOATING_SIZE_PX;
+    panel_root.set_halign(gtk4::Align::Start);
+    panel_root.set_valign(gtk4::Align::Start);
+    panel_root.set_hexpand(false);
+    panel_root.set_vexpand(false);
+    panel_root.set_size_request(width, height);
+    panel_root.set_margin_start(margin_x.max(0));
+    panel_root.set_margin_top(margin_y.max(0));
+}
+
+/// Live "would snap into the right dock here" preview — the same shape
+/// `attach_docked_right` would give the panel once actually docked, applied
+/// purely cosmetically: still an `editor_overlay` child, not yet reparented into
+/// `right_dock_slot` (see `install_panel_drag`'s doc comment for why that part
+/// has to wait for `drag-end`). Swaps `.floating-editor-panel` for
+/// `.docking-editor-panel` rather than just dropping it, so the panel stays fully
+/// opaque throughout instead of going translucent mid-preview (see that class's
+/// doc comment in `load_static_css`).
+fn preview_docked_right(panel_root: &adw::ToolbarView, docks: &EditorDocks, storage: &Storage) {
+    panel_root.remove_css_class("floating-editor-panel");
+    panel_root.add_css_class("docking-editor-panel");
+    let overlay_w = docks.overlay.width().max(1);
+    let overlay_h = docks.overlay.height().max(1);
+    let settings = load_settings(storage).unwrap_or_default();
+    let fraction = settings
+        .event_editor_right_width_fraction
+        .unwrap_or(DEFAULT_EDITOR_RIGHT_DOCK_WIDTH_PX as f64 / 1100.0);
+    let width = ((overlay_w as f64) * fraction).round() as i32;
+    panel_root.set_halign(gtk4::Align::Start);
+    panel_root.set_valign(gtk4::Align::Start);
+    panel_root.set_hexpand(false);
+    panel_root.set_vexpand(false);
+    panel_root.set_size_request(width, overlay_h);
+    panel_root.set_margin_top(0);
+    panel_root.set_margin_start((overlay_w - width).max(0));
+}
+
+/// Bottom-dock counterpart of `preview_docked_right`.
+fn preview_docked_bottom(panel_root: &adw::ToolbarView, docks: &EditorDocks, storage: &Storage) {
+    panel_root.remove_css_class("floating-editor-panel");
+    panel_root.add_css_class("docking-editor-panel");
+    let overlay_w = docks.overlay.width().max(1);
+    let overlay_h = docks.overlay.height().max(1);
+    // The real bottom dock only spans the main content column (`sidebar_paned`
+    // wraps it, full window height, entirely outside the bottom dock's own
+    // `Paned`) — offsetting the preview by the sidebar's current width keeps it
+    // from covering the sidebar, matching what actually happens once really
+    // docked instead of jumping narrower at drag-end.
+    let sidebar_w = docks.sidebar_pane.width().max(0);
+    let content_w = (overlay_w - sidebar_w).max(1);
+    let settings = load_settings(storage).unwrap_or_default();
+    let fraction = settings
+        .event_editor_bottom_height_fraction
+        .unwrap_or(DEFAULT_EDITOR_BOTTOM_DOCK_HEIGHT_PX as f64 / 720.0);
+    let height = ((overlay_h as f64) * fraction).round() as i32;
+    panel_root.set_halign(gtk4::Align::Start);
+    panel_root.set_valign(gtk4::Align::Start);
+    panel_root.set_hexpand(false);
+    panel_root.set_vexpand(false);
+    panel_root.set_size_request(content_w, height);
+    panel_root.set_margin_start(sidebar_w);
+    panel_root.set_margin_top((overlay_h - height).max(0));
+}
+
+/// Wires the *one* persistent drag gesture that repositions/(un)docks the event
+/// editor panel — installed once, here, on `editor_overlay` at `init` time, never
+/// on the panel or its titlebar directly, and never reinstalled per panel-open.
+///
+/// This indirection is required, not just convenient. GTK4 resets/cancels a
+/// widget's in-progress gesture sequence whenever that widget is unmapped, and
+/// reparenting a widget (`unparent` + re-add elsewhere) always unmaps it, however
+/// briefly. Docking/undocking the panel necessarily reparents it (between
+/// `editor_overlay` and a dock `Paned`'s end-child slot) — so a `GestureDrag`
+/// attached directly to the panel's own titlebar would die the instant that
+/// reparent happened mid-drag, leaving the panel unresponsive to the rest of that
+/// same physical drag: it snaps into (or out of) a dock once, and then stops
+/// responding even though the pointer is still held down. `editor_overlay` itself
+/// is a permanent part of the main window and is never reparented, so a gesture
+/// attached there survives every transition; `docks.current_panel` is how it
+/// finds out, dynamically, which panel (if any) is currently open and where its
+/// titlebar currently is, since the panel itself is rebuilt fresh on every open
+/// rather than being a persistent singleton.
+///
+/// To keep the gesture alive for the panel's *entire* physical drag, the actual
+/// reparent between the floating overlay and a real dock `Paned` slot is deferred
+/// to `drag-end` (safe — the gesture is already concluding there, so nothing more
+/// needs to reach it afterward) rather than happening live mid-drag. Reparenting
+/// from inside a `drag-update` handler was tried and reverted — even though the
+/// gesture itself lives on `editor_overlay` rather than the panel, unparenting the
+/// panel while a pointer-motion event is still being dispatched through it left
+/// the whole window's input unresponsive, so that reparent genuinely has to wait
+/// for `drag-end`. A drag that starts *floating* still gets a live preview as it
+/// nears an edge (`preview_docked_right`/`preview_docked_bottom` resize/reposition
+/// the same overlay-hosted widget to look like the dock it's about to become,
+/// without reparenting); a drag that starts *docked* can't get that same live
+/// preview without reparenting early — a docked panel is a `Paned` end-child, whose
+/// geometry that `Paned` fully owns — so it shows no visual change until release,
+/// at which point it either snaps back into the same dock (no visible change at
+/// all) or pops out to floating at the final drag position.
+fn install_panel_drag(overlay: &gtk4::Overlay, docks: &EditorDocks, storage: &Storage) {
+    let drag = gtk4::GestureDrag::new();
+    // Populated at `drag-begin` from `docks.current_panel` and read for the rest
+    // of that one gesture — re-reading `current_panel` on every tick would be
+    // wrong anyway, since a panel could close mid-drag (e.g. via Escape) and this
+    // gesture shouldn't suddenly start acting on whatever opens next.
+    let active_panel: Rc<RefCell<Option<OpenEditorPanel>>> = Rc::new(RefCell::new(None));
+    let last_offset: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((0.0, 0.0)));
+    // The panel's logical top-left if it were floating right now — tracked
+    // independently of `panel_root`'s actual on-screen margins, since those get
+    // overwritten with a *dock-shaped* preview whenever `pending_mode` isn't
+    // `Floating`; this is what lets the floating position keep tracking the
+    // pointer correctly even while the panel is currently rendering as a dock
+    // preview.
+    let drag_pos: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((0, 0)));
+    let pending_mode: Rc<Cell<EventEditorPanelMode>> = Rc::new(Cell::new(EventEditorPanelMode::Floating));
+    // What layout `relayout_editor_body` last arranged the panel's *content* into —
+    // distinct from `panel.mode` (which tracks whether the panel has *really* been
+    // reparented out of a dock yet, flipping at most once per drag). This instead
+    // tracks the live preview's current shape so the field layout stays in lock
+    // step with whatever size/shape `preview_floating`/`preview_docked_right`/
+    // `preview_docked_bottom` is showing at each tick — otherwise the outer panel
+    // resizes to a dock's shape while its content is still arranged for whatever
+    // shape it *was*, until release finally reconciles them.
+    let applied_layout: Rc<Cell<EventEditorPanelMode>> = Rc::new(Cell::new(EventEditorPanelMode::Floating));
+
+    {
+        let docks = docks.clone();
+        let active_panel = active_panel.clone();
+        let last_offset = last_offset.clone();
+        let drag_pos = drag_pos.clone();
+        let pending_mode = pending_mode.clone();
+        let applied_layout = applied_layout.clone();
+        drag.connect_drag_begin(move |gesture, start_x, start_y| {
+            let panel = docks.current_panel.borrow().clone();
+            let press_point = gtk4::graphene::Point::new(start_x as f32, start_y as f32);
+            let hit = panel.as_ref().is_some_and(|panel| {
+                panel
+                    .titlebar
+                    .compute_bounds(&docks.overlay)
+                    .is_some_and(|bounds| bounds.contains_point(&press_point))
+            });
+            if !hit {
+                // Not a press on the titlebar (or no panel open at all) — leave it
+                // for whoever else wants it rather than claiming a sequence this
+                // gesture has nothing to do with.
+                gesture.set_state(gtk4::EventSequenceState::Denied);
+                *active_panel.borrow_mut() = None;
+                return;
+            }
+            // Claimed, not left unclaimed for whatever provides this window's own
+            // CSD interactive-move handling to also see — see
+            // `install_day_event_drag` for the same reasoning/precedent; an
+            // unclaimed sequence here is exactly what used to let dragging the
+            // panel move the whole main window instead.
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            let panel = panel.expect("`hit` is only true when `panel` is `Some`");
+            let current_mode = panel.mode.get();
+            pending_mode.set(current_mode);
+            applied_layout.set(current_mode);
+            last_offset.set((0.0, 0.0));
+
+            let start_pos = if current_mode == EventEditorPanelMode::Floating {
+                (panel.root.margin_start(), panel.root.margin_top())
+            } else {
+                // Starting docked: nothing to read a floating position from yet —
+                // seed it from the titlebar's current on-screen spot instead, so
+                // *if* this drag ends up resolving to Floating, it starts from
+                // wherever the panel visually was rather than jumping.
+                panel
+                    .titlebar
+                    .compute_point(&docks.overlay, &gtk4::graphene::Point::new(0.0, 0.0))
+                    .map(|point| (point.x().max(0.0).round() as i32, point.y().max(0.0).round() as i32))
+                    .unwrap_or(DEFAULT_EDITOR_FLOATING_MARGIN_PX)
+            };
+            drag_pos.set(start_pos);
+            *active_panel.borrow_mut() = Some(panel);
+        });
+    }
+    {
+        let docks = docks.clone();
+        let storage = storage.clone();
+        let active_panel = active_panel.clone();
+        let last_offset = last_offset.clone();
+        let drag_pos = drag_pos.clone();
+        let pending_mode = pending_mode.clone();
+        let applied_layout = applied_layout.clone();
+        drag.connect_drag_update(move |_, offset_x, offset_y| {
+            let Some(panel) = active_panel.borrow().clone() else { return };
+
+            // A docked-start panel can't preview live in place (see this
+            // function's doc comment) — pop it out to floating for real instead.
+            // Deferred to the main loop's next idle pass rather than done
+            // synchronously here: reparenting directly from inside a
+            // `drag-update` handler, while a pointer-motion event is still being
+            // dispatched through the panel, previously left the whole window's
+            // input unresponsive. Marking `panel.mode` as `Floating` right away
+            // (before the reparent has actually happened) keeps this branch from
+            // firing again on the tick or two before the idle callback runs.
+            if panel.mode.get() != EventEditorPanelMode::Floating {
+                panel.mode.set(EventEditorPanelMode::Floating);
+                applied_layout.set(EventEditorPanelMode::Floating);
+                let panel_root = panel.root.clone();
+                let docks = docks.clone();
+                let active_panel = active_panel.clone();
+                let relayout = panel.relayout.clone();
+                let (start_x, start_y) = drag_pos.get();
+                gtk4::glib::idle_add_local_once(move || {
+                    // Skip if `drag-end` already concluded this gesture (and
+                    // reparented the panel itself, possibly into a dock rather
+                    // than floating) before this had a chance to run —
+                    // reparenting it again here would undo that.
+                    if active_panel.borrow().is_some() {
+                        attach_floating(&panel_root, &docks, start_x, start_y);
+                        // Without this, the panel's field rows are still in
+                        // whatever arrangement the dock it just left used (e.g.
+                        // Bottom's wide two-column layout) — that content's own
+                        // natural width overrides the 560px floating size request
+                        // (a size request is only a floor, not a cap), so the
+                        // panel renders far wider than a floating panel should
+                        // until this catches it up to match.
+                        relayout(EventEditorPanelMode::Floating);
+                    }
+                });
+                return;
+            }
+
+            let (last_x, last_y) = last_offset.get();
+            let (dx, dy) = (offset_x - last_x, offset_y - last_y);
+            last_offset.set((offset_x, offset_y));
+
+            let overlay_w = docks.overlay.width().max(1);
+            let overlay_h = docks.overlay.height().max(1);
+            let (floating_w, floating_h) = DEFAULT_EDITOR_FLOATING_SIZE_PX;
+
+            let (prev_x, prev_y) = drag_pos.get();
+            let clamped_x = (prev_x as f64 + dx).round() as i32;
+            let clamped_y = (prev_y as f64 + dy).round() as i32;
+            let clamped_x = clamped_x.clamp(0, (overlay_w - floating_w).max(0));
+            let clamped_y = clamped_y.clamp(0, (overlay_h - floating_h).max(0));
+            drag_pos.set((clamped_x, clamped_y));
+
+            let distance_to_right = (overlay_w - (clamped_x + floating_w)).max(0) as f64;
+            let distance_to_bottom = (overlay_h - (clamped_y + floating_h)).max(0) as f64;
+            let new_pending = if distance_to_bottom < EDITOR_PANEL_SNAP_THRESHOLD_PX && distance_to_bottom <= distance_to_right
+            {
+                EventEditorPanelMode::Bottom
+            } else if distance_to_right < EDITOR_PANEL_SNAP_THRESHOLD_PX {
+                EventEditorPanelMode::Right
+            } else {
+                EventEditorPanelMode::Floating
+            };
+            pending_mode.set(new_pending);
+
+            // Keep the panel's *content* arrangement in step with whatever shape
+            // the live preview is about to show — otherwise e.g. floating-drag-
+            // toward-the-bottom-edge would resize the outer panel to the wide
+            // dock preview while its fields are still in the narrow single-column
+            // layout (or vice versa), a size/content mismatch that would only
+            // reconcile at release. Only re-relayouts when the shape actually
+            // changes, not on every tick.
+            if new_pending != applied_layout.get() {
+                (panel.relayout)(new_pending);
+                applied_layout.set(new_pending);
+            }
+
+            // By this point `panel.mode` always reads `Floating` — either this
+            // drag started that way, or the pop-out above just made it so (the
+            // early `return` there skips this same tick, but every tick from here
+            // on reaches this) — so every drag gets the same live preview.
+            match new_pending {
+                EventEditorPanelMode::Floating => preview_floating(&panel.root, clamped_x, clamped_y),
+                EventEditorPanelMode::Right => preview_docked_right(&panel.root, &docks, &storage),
+                EventEditorPanelMode::Bottom => preview_docked_bottom(&panel.root, &docks, &storage),
+            }
+        });
+    }
+    {
+        let docks = docks.clone();
+        let storage = storage.clone();
+        let active_panel = active_panel.clone();
+        let drag_pos = drag_pos.clone();
+        let pending_mode = pending_mode.clone();
+        drag.connect_drag_end(move |_, _, _| {
+            let Some(panel) = active_panel.borrow_mut().take() else { return };
+            let resolved = pending_mode.get();
+            panel.mode.set(resolved);
+            let (x, y) = drag_pos.get();
+            // The one and only reparent for this whole gesture — safe here
+            // specifically because the gesture is already concluding, so there's
+            // nothing left that could be disrupted by the unmap/remap it causes.
+            // Applied unconditionally, even if `resolved` matches where the panel
+            // started (e.g. a docked panel nudged only slightly): idempotent, and
+            // simpler than special-casing "didn't actually change".
+            match resolved {
+                EventEditorPanelMode::Floating => attach_floating(&panel.root, &docks, x, y),
+                EventEditorPanelMode::Right => attach_docked_right(&panel.root, &docks, &storage),
+                EventEditorPanelMode::Bottom => attach_docked_bottom(&panel.root, &docks, &storage),
+            }
+            (panel.relayout)(resolved);
+
+            let mut settings = load_settings(&storage).unwrap_or_default();
+            settings.event_editor_panel_mode = resolved;
+            if resolved == EventEditorPanelMode::Floating {
+                let overlay_w = docks.overlay.width().max(1) as f64;
+                let overlay_h = docks.overlay.height().max(1) as f64;
+                settings.event_editor_floating_position = Some((x as f64 / overlay_w, y as f64 / overlay_h));
+            }
+            if let Err(err) = save_settings(&storage, &settings) {
+                tracing::warn!(%err, "failed to save event editor panel mode/position");
+            }
+        });
+    }
+
+    overlay.add_controller(drag);
+}
+
 /// Binds Ctrl+scroll on the Day view's hour grid to `AppMsg::ZoomDayTimeScale`
 /// (DESIGN_SPEC.md §12's Time scale option) — scrolling up steps to a finer interval
 /// (zoom in), scrolling down to a coarser one (zoom out). Installed with
@@ -1368,6 +2370,7 @@ fn calendar_row(calendar: &CalendarSummary, sender: &ComponentSender<App>) -> gt
     check.add_css_class("calendar-checkbox");
     check.set_icon_name("object-select-symbolic");
     check.set_valign(gtk4::Align::Center);
+    check.set_tooltip_text(Some(&format!("Show or hide {}", calendar.display_name)));
     if let Some(color) = &calendar.color {
         check.add_css_class(&css_class_for_color(color));
     }
@@ -1396,19 +2399,22 @@ fn calendar_row(calendar: &CalendarSummary, sender: &ComponentSender<App>) -> gt
 /// The calendar customizer's color-swatch grid (DESIGN_SPEC.md §10, reference
 /// screenshot) — Google Calendar's 11 built-in event colors plus one extra so the
 /// grid fills a clean 2-row-by-6 layout.
-const CALENDAR_COLOR_PALETTE: &[&str] = &[
-    "#d50000", // Tomato
-    "#e67c73", // Flamingo
-    "#f4511e", // Tangerine
-    "#f6bf26", // Banana
-    "#33b679", // Sage
-    "#0b8043", // Basil
-    "#039be5", // Peacock
-    "#3f51b5", // Blueberry
-    "#7986cb", // Lavender
-    "#8e24aa", // Grape
-    "#616161", // Graphite
-    "#795548", // Cocoa
+// (hex, friendly name) — the name is what a swatch's tooltip actually shows; a bare
+// hex code in a tooltip isn't "info" a user can act on the way Google Calendar's own
+// named palette is.
+const CALENDAR_COLOR_PALETTE: &[(&str, &str)] = &[
+    ("#d50000", "Tomato"),
+    ("#e67c73", "Flamingo"),
+    ("#f4511e", "Tangerine"),
+    ("#f6bf26", "Banana"),
+    ("#33b679", "Sage"),
+    ("#0b8043", "Basil"),
+    ("#039be5", "Peacock"),
+    ("#3f51b5", "Blueberry"),
+    ("#7986cb", "Lavender"),
+    ("#8e24aa", "Grape"),
+    ("#616161", "Graphite"),
+    ("#795548", "Cocoa"),
 ];
 
 /// The "⋮" button on a sidebar calendar row: a popover mirroring the Google Calendar
@@ -1421,7 +2427,6 @@ fn calendar_customizer_button(calendar: &CalendarSummary, sender: &ComponentSend
     let button = gtk4::MenuButton::new();
     button.set_icon_name("view-more-symbolic");
     button.add_css_class("flat");
-    button.add_css_class("circular");
     button.add_css_class("calendar-customizer-button");
     button.set_valign(gtk4::Align::Center);
     button.set_tooltip_text(Some("Calendar options"));
@@ -1458,13 +2463,13 @@ fn calendar_customizer_button(calendar: &CalendarSummary, sender: &ComponentSend
     colors_grid.set_margin_top(8);
     colors_grid.set_halign(gtk4::Align::Center);
 
-    for (index, &color) in CALENDAR_COLOR_PALETTE.iter().enumerate() {
+    for (index, &(color, name)) in CALENDAR_COLOR_PALETTE.iter().enumerate() {
         let swatch = gtk4::Button::new();
         swatch.add_css_class("flat");
         swatch.add_css_class("circular");
         swatch.add_css_class("color-swatch");
         swatch.add_css_class(&css_class_for_color(color));
-        swatch.set_tooltip_text(Some(color));
+        swatch.set_tooltip_text(Some(name));
         if calendar.color.as_deref() == Some(color) {
             swatch.add_css_class("color-swatch-selected");
             swatch.set_icon_name("object-select-symbolic");
@@ -1543,6 +2548,14 @@ fn jump_to_date_callback(sender: &ComponentSender<App>) -> Rc<dyn Fn(NaiveDate)>
     Rc::new(move |date| sender.input(AppMsg::JumpToDate(date)))
 }
 
+/// Wraps `sender` into the `on_range_pick` callback `populate_mini_calendar` takes —
+/// the sidebar-only counterpart of `jump_to_date_callback` for a completed drag-select
+/// (`wire_mini_calendar_drag_select`), sent as `AppMsg::SetCustomViewDates`.
+fn range_pick_callback(sender: &ComponentSender<App>) -> Rc<dyn Fn(Vec<NaiveDate>)> {
+    let sender = sender.clone();
+    Rc::new(move |dates| sender.input(AppMsg::SetCustomViewDates(dates)))
+}
+
 /// Fills the sidebar's mini-month date navigator (DESIGN_SPEC.md §10): a compact
 /// Sunday-first month grid with no event rendering, just clickable day buttons.
 /// Shares `display_month`/`today` with the main month grid, so paging or jumping
@@ -1551,7 +2564,14 @@ fn jump_to_date_callback(sender: &ComponentSender<App>) -> Rc<dyn Fn(NaiveDate)>
 /// (`build_quick_jump_popover`) is rebuilt on every call so its year spinner and
 /// highlighted month always start from whatever month is currently displayed, rather
 /// than staying stuck on the value from whenever the popover was first constructed.
-/// Also reused, with a different `on_pick`, by the edit dialog's `date_picker`.
+/// Also reused, with a different `on_pick`, by the edit dialog's `date_picker` — which
+/// passes `None` for `on_range_pick` so its day grid stays single-click-only; the
+/// sidebar instance passes `Some` to additionally wire each day button for drag-select
+/// (`wire_mini_calendar_drag_select`). `selected_range` paints `.mini-calendar-day-in-range`
+/// on whichever dates it names from the moment the grid is built — so a completed
+/// drag-select (`App::refresh` passing `custom_view_dates` while `ViewMode::Custom` is
+/// active) stays highlighted after the drag ends and the grid is rebuilt, not just
+/// during the live drag itself (`date_picker` passes `&[]`, having no such state).
 fn populate_mini_calendar(
     grid: &gtk4::Grid,
     title_button: &gtk4::MenuButton,
@@ -1559,6 +2579,8 @@ fn populate_mini_calendar(
     today: NaiveDate,
     on_pick: &Rc<dyn Fn(NaiveDate)>,
     on_jump_month: &Rc<dyn Fn(NaiveDate)>,
+    on_range_pick: Option<&Rc<dyn Fn(Vec<NaiveDate>)>>,
+    selected_range: &[NaiveDate],
 ) {
     const WEEKDAYS: [&str; 7] = ["S", "M", "T", "W", "T", "F", "S"];
 
@@ -1581,6 +2603,12 @@ fn populate_mini_calendar(
     let rows = total_cells.div_ceil(7);
     let grid_start = first_of_month - Duration::days(leading as i64);
 
+    // Populated as day buttons are created below, then shared into every button's drop
+    // target (`on_range_pick` only) so a hovered cell can repaint the whole in-progress
+    // range across every cell it spans, not just itself. Rebuilt fresh each call, same
+    // lifetime as the grid it populates.
+    let cells: Rc<RefCell<Vec<(NaiveDate, gtk4::Button)>>> = Rc::new(RefCell::new(Vec::new()));
+
     for cell_index in 0..(rows * 7) {
         let date = grid_start + Duration::days(cell_index as i64);
         let col = (cell_index % 7) as i32;
@@ -1595,12 +2623,120 @@ fn populate_mini_calendar(
         if date == today {
             button.add_css_class("mini-calendar-today");
         }
+        if selected_range.contains(&date) {
+            button.add_css_class("mini-calendar-day-in-range");
+        }
 
-        let on_pick = on_pick.clone();
-        button.connect_clicked(move |_| on_pick(date));
+        let on_pick_cloned = on_pick.clone();
+        button.connect_clicked(move |_| on_pick_cloned(date));
+
+        if let Some(on_range_pick) = on_range_pick {
+            wire_mini_calendar_drag_select(&button, date, &cells, on_range_pick);
+            cells.borrow_mut().push((date, button.clone()));
+        }
 
         grid.attach(&button, col, row, 1, 1);
     }
+}
+
+/// Toggles `.mini-calendar-day-in-range` across every button in `cells` to match
+/// `range` — called on every `connect_motion` tick of a mini calendar drag-select so
+/// the highlighted span always matches `range`'s current extent, not just the button
+/// under the pointer.
+fn highlight_mini_calendar_range(cells: &Rc<RefCell<Vec<(NaiveDate, gtk4::Button)>>>, range: &[NaiveDate]) {
+    for (cell_date, button) in cells.borrow().iter() {
+        if range.contains(cell_date) {
+            button.add_css_class("mini-calendar-day-in-range");
+        } else {
+            button.remove_css_class("mini-calendar-day-in-range");
+        }
+    }
+}
+
+/// Clears both drag-select CSS classes off every button in `cells` — called when a
+/// drag ends, whether committed (`connect_drop`, about to be wiped anyway by the
+/// resulting `refresh`) or cancelled (`connect_drag_cancel`, which needs it since no
+/// refresh follows).
+fn clear_mini_calendar_range_highlight(cells: &Rc<RefCell<Vec<(NaiveDate, gtk4::Button)>>>) {
+    for (_, button) in cells.borrow().iter() {
+        button.remove_css_class("mini-calendar-day-selected");
+        button.remove_css_class("mini-calendar-day-in-range");
+    }
+}
+
+/// Wires one mini calendar day button as both a drag origin and a drop target for
+/// drag-select (`populate_mini_calendar`'s `on_range_pick`) — mirrors
+/// `wire_month_event_drag_source`/`wire_month_cell_drop_target`'s native
+/// `gtk4::DragSource`/`gtk4::DropTarget` pattern (content: the date, as its
+/// `num_days_from_ce` i64) rather than a hand-rolled `GestureDrag`, for the same
+/// reason given there: a native `DragSource` coexists with the button's own
+/// `connect_clicked` with no extra arbitration, so a plain click still jumps a single
+/// day exactly as before. Unlike the Month view's single-cell highlight, `DropTarget`'s
+/// preloaded value (`set_preload`) lets `connect_motion` recompute and repaint the
+/// *whole* capped range (`capped_date_range`) on every cell entered, not just the one
+/// under the pointer — the "select up to `MINI_CALENDAR_DRAG_MAX_DAYS` side by side"
+/// affordance. Every day button is wired as both source and target, since a drag can
+/// start on any cell and later hover any other (including back over its own origin).
+fn wire_mini_calendar_drag_select(
+    button: &gtk4::Button,
+    date: NaiveDate,
+    cells: &Rc<RefCell<Vec<(NaiveDate, gtk4::Button)>>>,
+    on_range_pick: &Rc<dyn Fn(Vec<NaiveDate>)>,
+) {
+    let drag_source = gtk4::DragSource::new();
+    drag_source.set_actions(gtk4::gdk::DragAction::MOVE);
+    let origin_days = date.num_days_from_ce() as i64;
+    drag_source.connect_prepare(move |_, _, _| Some(gtk4::gdk::ContentProvider::for_value(&origin_days.to_value())));
+    {
+        let button = button.clone();
+        drag_source.connect_drag_begin(move |_, _| {
+            button.add_css_class("mini-calendar-day-selected");
+        });
+    }
+    {
+        let cells = cells.clone();
+        drag_source.connect_drag_end(move |_, _, _| {
+            clear_mini_calendar_range_highlight(&cells);
+        });
+    }
+    {
+        let cells = cells.clone();
+        drag_source.connect_drag_cancel(move |_, _, _| {
+            clear_mini_calendar_range_highlight(&cells);
+            false
+        });
+    }
+    button.add_controller(drag_source);
+
+    let drop_target = gtk4::DropTarget::new(i64::static_type(), gtk4::gdk::DragAction::MOVE);
+    drop_target.set_preload(true);
+    {
+        let cells = cells.clone();
+        drop_target.connect_motion(move |target, _, _| {
+            if let Some(origin_days) = target.value().and_then(|v| v.get::<i64>().ok()) {
+                if let Some(origin) = NaiveDate::from_num_days_from_ce_opt(origin_days as i32) {
+                    highlight_mini_calendar_range(&cells, &capped_date_range(origin, date, MINI_CALENDAR_DRAG_MAX_DAYS));
+                }
+            }
+            gtk4::gdk::DragAction::MOVE
+        });
+    }
+    {
+        let cells = cells.clone();
+        let on_range_pick = on_range_pick.clone();
+        drop_target.connect_drop(move |_, value, _, _| {
+            clear_mini_calendar_range_highlight(&cells);
+            let Ok(origin_days) = value.get::<i64>() else { return false };
+            let Some(origin) = NaiveDate::from_num_days_from_ce_opt(origin_days as i32) else { return false };
+            let range = capped_date_range(origin, date, MINI_CALENDAR_DRAG_MAX_DAYS);
+            if range.len() < 2 {
+                return false;
+            }
+            on_range_pick(range);
+            true
+        });
+    }
+    button.add_controller(drop_target);
 }
 
 /// Builds the popover the mini calendar's month/year title button opens — a year
@@ -1817,6 +2953,7 @@ fn compute_max_visible_events(grid: &gtk4::Grid, week_rows: u32) -> usize {
         self_response_status: None,
         reminder_count: 0,
         other_attendee_count: 0,
+        other_attendee_names: Vec::new(),
         attachment_count: 0,
     };
 
@@ -1894,8 +3031,8 @@ fn event_badge_row(event: &DisplayEvent) -> Option<gtk4::Box> {
     }
     match event.other_attendee_count {
         0 => {}
-        1 => icons.push(("avatar-default-symbolic", "1 guest".to_string())),
-        n => icons.push(("system-users-symbolic", format!("{n} guests"))),
+        1 => icons.push(("avatar-default-symbolic", guest_badge_tooltip(1, &event.other_attendee_names))),
+        n => icons.push(("system-users-symbolic", guest_badge_tooltip(n, &event.other_attendee_names))),
     }
 
     if icons.is_empty() {
@@ -1913,6 +3050,31 @@ fn event_badge_row(event: &DisplayEvent) -> Option<gtk4::Box> {
     Some(row)
 }
 
+/// How many attendee names `guest_badge_tooltip` spells out before collapsing the
+/// rest into "and N more" — same "cap it, don't just dump the whole list" idea as
+/// `MAX_VISIBLE_GUESTS` in the popover's own guest list, just a tighter cap since a
+/// chip's tooltip is meant to be a glance, not a second guest list.
+const MAX_GUEST_NAMES_IN_TOOLTIP: usize = 3;
+
+/// Builds the guest badge's tooltip: a plain count when no names came back from the
+/// query (shouldn't normally happen once `count > 0`, but `other_attendee_names` is
+/// populated by a separate `LEFT JOIN` from the count, so treat a mismatch
+/// defensively rather than panicking or under-reporting), otherwise the first few
+/// names followed by "and N more" once there are more than
+/// `MAX_GUEST_NAMES_IN_TOOLTIP`.
+fn guest_badge_tooltip(count: i64, names: &[String]) -> String {
+    if names.is_empty() {
+        return if count == 1 { "1 guest".to_string() } else { format!("{count} guests") };
+    }
+    let shown: Vec<&str> = names.iter().take(MAX_GUEST_NAMES_IN_TOOLTIP).map(String::as_str).collect();
+    let mut tooltip = shown.join(", ");
+    let remaining = names.len().saturating_sub(shown.len());
+    if remaining > 0 {
+        tooltip.push_str(&format!(", and {remaining} more"));
+    }
+    tooltip
+}
+
 fn event_row(event: &DisplayEvent, time_format: TimeFormat) -> gtk4::Box {
     let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
     row_box.add_css_class("event-row");
@@ -1924,6 +3086,7 @@ fn event_row(event: &DisplayEvent, time_format: TimeFormat) -> gtk4::Box {
     let dot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     dot.add_css_class("event-dot");
     dot.set_valign(gtk4::Align::Center);
+    dot.set_tooltip_text(Some(&event.calendar_name));
     if let Some(color) = &event.color {
         dot.add_css_class(&css_class_for_color(color));
     }
@@ -1947,6 +3110,51 @@ fn event_row(event: &DisplayEvent, time_format: TimeFormat) -> gtk4::Box {
     }
 
     row_box
+}
+
+/// One bar in the Day/5-day view's all-day strip (`populate_day_header`, positioned by
+/// `layout_all_day_events`) — a solid-colored, white-text card matching the Google
+/// Calendar PWA's own all-day bars, rather than `event_row`'s small dot-plus-label chip
+/// (which the month grid and event popovers still use). Reuses `day_event_block`'s own
+/// `.day-event-block` CSS class (background/border/radius/declined-opacity already
+/// defined there) plus the same `css_class_for_color` classes every colored dot in this
+/// file draws from, so no new color CSS is needed. `clipped_start`/`clipped_end` (from
+/// `AllDayEventLayout`) each add a small chevron at that edge when true, showing the
+/// event's real range extends past the currently visible dates. Unlike
+/// `day_event_block`, this needs no absolute positioning: `populate_day_header` attaches
+/// it straight into a `Grid` cell (or cell span), which sizes it for us.
+fn all_day_event_bar(event: &DisplayEvent, clipped_start: bool, clipped_end: bool) -> gtk4::Box {
+    let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    bar.add_css_class("day-event-block");
+    bar.add_css_class("day-all-day-event");
+    if event.self_response_status == Some(AttendeeResponseStatus::Declined) {
+        bar.add_css_class("event-declined");
+    }
+    if let Some(color) = &event.color {
+        bar.add_css_class(&css_class_for_color(color));
+    }
+    bar.set_cursor_from_name(Some("pointer"));
+
+    if clipped_start {
+        bar.append(&gtk4::Image::from_icon_name("go-previous-symbolic"));
+    }
+
+    let subject = gtk4::Label::new(Some(&event.title));
+    subject.add_css_class("day-event-subject");
+    subject.set_halign(gtk4::Align::Start);
+    subject.set_hexpand(true);
+    subject.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    bar.append(&subject);
+
+    if let Some(badges) = event_badge_row(event) {
+        bar.append(&badges);
+    }
+
+    if clipped_end {
+        bar.append(&gtk4::Image::from_icon_name("go-next-symbolic"));
+    }
+
+    bar
 }
 
 /// Max gap `wire_event_click`/`install_day_event_drag` wait after a first click before
@@ -2329,6 +3537,7 @@ fn view_mode_label(view: ViewMode) -> &'static str {
         ViewMode::Month => "Month",
         ViewMode::Day => "Day",
         ViewMode::FiveDay => "5 days",
+        ViewMode::Custom => "Custom",
     }
 }
 
@@ -2457,14 +3666,19 @@ fn build_view_switcher_popover(sender: &ComponentSender<App>, storage: &Storage)
 /// several dates this centering trick doesn't apply (each cell already evenly divides
 /// the remaining width, matching `populate_day_hour_grid`'s per-day hour cells), so the
 /// spacer is omitted. Also (re)builds the all-day strip directly underneath from any
-/// `all_day` events on each date, reusing `event_row`/`wire_event_click` so an all-day
-/// event opens the same detail popover a month-view chip does — a single vertical stack
-/// for one date, or `dates.len()` side-by-side columns (behind a leading gutter-width
-/// spacer) for several; the strip hides itself via `set_visible` when there are no
-/// all-day events on any date shown, rather than always reserving empty space.
+/// `all_day` events overlapping `dates` — a `gtk4::Grid` sharing the exact column
+/// scheme `populate_day_hour_grid` uses (a `GUTTER_WIDTH_PX` column 0, one hexpand
+/// column per date after it), so a bar's edges land exactly under the hour grid's day
+/// dividers instead of drifting the way three independently-laid-out containers could.
+/// `layout_all_day_events` computes each event's row/column span (clipped to `dates`,
+/// with multi-day events spanning every column they cover via `Grid::attach`'s
+/// `width` — a single widget rather than one per day, so the strip reads as one
+/// continuous colored bar, `all_day_event_bar`), reusing `wire_event_click` so it opens
+/// the same detail popover a month-view chip does. Hides itself via `set_visible` when
+/// nothing overlaps `dates`, rather than always reserving empty space.
 fn populate_day_header(
     header: &gtk4::Box,
-    all_day: &gtk4::Box,
+    all_day: &gtk4::Grid,
     dates: &[NaiveDate],
     today: NaiveDate,
     events: &[DisplayEvent],
@@ -2515,43 +3729,28 @@ fn populate_day_header(
     }
 
     clear_children(all_day);
-    if dates.len() == 1 {
-        all_day.set_orientation(gtk4::Orientation::Vertical);
-        all_day.remove_css_class("day-all-day-row-multi");
-        all_day.add_css_class("day-all-day-row");
-        let date_key = dates[0].format("%Y-%m-%d").to_string();
-        let mut has_all_day = false;
-        for event in events.iter().filter(|e| e.all_day && e.start_date() == date_key) {
-            has_all_day = true;
-            let row = event_row(event, ctx.time_format);
-            wire_event_click(&row, event, ctx);
-            all_day.append(&row);
-        }
-        all_day.set_visible(has_all_day);
-    } else {
-        all_day.set_orientation(gtk4::Orientation::Horizontal);
-        all_day.remove_css_class("day-all-day-row");
-        all_day.add_css_class("day-all-day-row-multi");
 
-        let gutter_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        gutter_spacer.set_width_request(GUTTER_WIDTH_PX);
-        all_day.append(&gutter_spacer);
-
-        let mut has_any = false;
-        for &date in dates {
-            let column = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-            column.set_hexpand(true);
-            let date_key = date.format("%Y-%m-%d").to_string();
-            for event in events.iter().filter(|e| e.all_day && e.start_date() == date_key) {
-                has_any = true;
-                let row = event_row(event, ctx.time_format);
-                wire_event_click(&row, event, ctx);
-                column.append(&row);
-            }
-            all_day.append(&column);
-        }
-        all_day.set_visible(has_any);
+    // Row 0 is a "pinning" row that's never used for event bars: a `GtkGrid` only
+    // sizes a column from cells that actually touch it, so without this, a date with
+    // no all-day events of its own (and no spanning bar crossing it) would collapse to
+    // zero width instead of matching `header`/the hour grid's column for that date.
+    let gutter_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    gutter_spacer.set_width_request(GUTTER_WIDTH_PX);
+    all_day.attach(&gutter_spacer, 0, 0, 1, 1);
+    for day_index in 0..dates.len() {
+        let day_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        day_spacer.set_hexpand(true);
+        day_spacer.set_size_request(-1, 0);
+        all_day.attach(&day_spacer, 1 + day_index as i32, 0, 1, 1);
     }
+
+    let layout = layout_all_day_events(events, dates);
+    for item in &layout {
+        let bar = all_day_event_bar(item.event, item.clipped_start, item.clipped_end);
+        wire_event_click(&bar, item.event, ctx);
+        all_day.attach(&bar, 1 + item.start_col as i32, 1 + item.row as i32, item.span_cols as i32, 1);
+    }
+    all_day.set_visible(!layout.is_empty());
 }
 
 /// Which "boundary" a Day view hour-grid row's `minute_of_day % 60` lands on —
@@ -2688,6 +3887,7 @@ fn populate_day_view(
     scale_minutes: i64,
     ctrl_snap_minutes: i64,
     ctrl_shift_snap_minutes: i64,
+    hold_ms: i64,
 ) {
     // The grid itself is the Overlay's persistent main child (declared in the `view!`
     // macro), so only its own children get cleared/rebuilt here — `Overlay`'s other
@@ -2724,6 +3924,7 @@ fn populate_day_view(
                 scale_minutes,
                 ctrl_snap_minutes,
                 ctrl_shift_snap_minutes,
+                hold_ms,
                 dates,
                 day_index,
                 ctx,
@@ -2841,6 +4042,80 @@ fn layout_day_events<'a>(events: &'a [DisplayEvent], date_key: &str) -> Vec<DayE
     out
 }
 
+/// One all-day event's position within `populate_day_header`'s all-day strip: `row` is
+/// its vertical slot (0-based, shared across every date-column it touches, so two
+/// events assigned the same row never overlap in date range) and `start_col`/
+/// `span_cols` mark which of `dates`'s columns it covers — both already clipped to
+/// `dates`'s own bounds, so `populate_day_header` can hand them straight to
+/// `Grid::attach` without any further date arithmetic. `clipped_start`/`clipped_end`
+/// record whether the event's *real* (unclipped) range extends past `dates[0]`/
+/// `dates.last()` respectively, so `all_day_event_bar` knows which edge(s), if any,
+/// need a continuation chevron instead of a plain rounded corner.
+struct AllDayEventLayout<'a> {
+    event: &'a DisplayEvent,
+    row: usize,
+    start_col: usize,
+    span_cols: usize,
+    clipped_start: bool,
+    clipped_end: bool,
+}
+
+/// Lays out every `all_day` event overlapping `dates` into rows: a greedy sweep (events
+/// sorted by clipped start date, then by span length descending, then by title for a
+/// deterministic tie-break) hands each event the lowest-numbered row whose
+/// last-occupied date is before this event's own clipped start — the same
+/// greedy-interval idea `layout_day_events` uses for its lanes, just measured in whole
+/// days instead of minutes, and with no analog to `MAX_DAY_EVENT_COLUMNS`: an
+/// unbounded number of simultaneous multi-day events just makes the strip taller, not
+/// narrower, so there's no reason to cap rows and start collapsing them together.
+/// Longer events sort first within a shared start date so a week-long event claims row
+/// 0 ahead of a same-day one-off, mirroring Google Calendar's own banner stacking.
+fn layout_all_day_events<'a>(events: &'a [DisplayEvent], dates: &[NaiveDate]) -> Vec<AllDayEventLayout<'a>> {
+    let Some(&window_start) = dates.first() else { return Vec::new() };
+    let window_end = *dates.last().expect("dates is non-empty (checked via .first() above)");
+
+    let mut items: Vec<(&DisplayEvent, NaiveDate, NaiveDate, bool, bool)> = events
+        .iter()
+        .filter(|e| e.all_day)
+        .filter_map(|e| {
+            let start = NaiveDate::parse_from_str(e.start_date(), "%Y-%m-%d").ok()?;
+            let end_exclusive = NaiveDate::parse_from_str(e.end.get(0..10).unwrap_or(&e.end), "%Y-%m-%d").ok()?;
+            let end = end_exclusive.pred_opt().unwrap_or(end_exclusive).max(start);
+            if end < window_start || start > window_end {
+                return None;
+            }
+            let clipped_start = start.max(window_start);
+            let clipped_end = end.min(window_end);
+            Some((e, clipped_start, clipped_end, start < window_start, end > window_end))
+        })
+        .collect();
+    items.sort_by(|a, b| a.1.cmp(&b.1).then((b.2 - b.1).cmp(&(a.2 - a.1))).then(a.0.title.cmp(&b.0.title)));
+
+    let mut row_occupied_through: Vec<NaiveDate> = Vec::new();
+    let mut out = Vec::with_capacity(items.len());
+    for (event, clipped_start, clipped_end, clipped_start_flag, clipped_end_flag) in items {
+        let row = match row_occupied_through.iter().position(|&occupied_through| occupied_through < clipped_start) {
+            Some(row) => {
+                row_occupied_through[row] = clipped_end;
+                row
+            }
+            None => {
+                row_occupied_through.push(clipped_end);
+                row_occupied_through.len() - 1
+            }
+        };
+        out.push(AllDayEventLayout {
+            event,
+            row,
+            start_col: (clipped_start - window_start).num_days() as usize,
+            span_cols: (clipped_end - clipped_start).num_days() as usize + 1,
+            clipped_start: clipped_start_flag,
+            clipped_end: clipped_end_flag,
+        });
+    }
+    out
+}
+
 /// One day's horizontal slot within the Day/5-day view's hour grid — `width_px` is
 /// that day's share of the grid's total width (the whole width for `ViewMode::Day`,
 /// one-fifth of it for `ViewMode::FiveDay`), `x_offset_px` is where that slot starts
@@ -2954,6 +4229,7 @@ fn day_event_block(
     scale_minutes: i64,
     ctrl_snap_minutes: i64,
     ctrl_shift_snap_minutes: i64,
+    hold_ms: i64,
     dates: &[NaiveDate],
     day_index: usize,
     ctx: &EventCtx,
@@ -3106,6 +4382,7 @@ fn day_event_block(
         scale_minutes,
         ctrl_snap_minutes,
         ctrl_shift_snap_minutes,
+        hold_ms,
         start_only,
         dates.to_vec(),
         day_index,
@@ -3481,6 +4758,7 @@ fn install_day_event_drag(
     scale_minutes: i64,
     ctrl_snap_minutes: i64,
     ctrl_shift_snap_minutes: i64,
+    hold_ms: i64,
     start_only: bool,
     dates: Vec<NaiveDate>,
     day_index: usize,
@@ -3493,24 +4771,61 @@ fn install_day_event_drag(
     // rather than shown immediately — see `wire_event_click`'s doc comment for why —
     // so a following double-click can cancel it via this handle before it ever shows.
     let pending_popover: Rc<Cell<Option<gtk4::glib::SourceId>>> = Rc::new(Cell::new(None));
+    // `AppSettings::day_drag_hold_ms`'s hold gate: move/resize only actually engages
+    // (cursor change, `drag_hint`, and `connect_drag_update` applying geometry) once
+    // a press has been held this long — `held_engaged` tracks whether that's
+    // happened yet for the gesture currently in progress, and `hold_timer` is the
+    // pending timeout that flips it, cancelled on an early release so it can't fire
+    // after the gesture it belongs to has already ended.
+    let held_engaged: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let hold_timer: Rc<Cell<Option<gtk4::glib::SourceId>>> = Rc::new(Cell::new(None));
 
     {
         let hit_box = hit_box.clone();
         let drag_hint = drag_hint.clone();
         let event = event.clone();
         let drag_state = drag_state.clone();
+        let held_engaged = held_engaged.clone();
+        let hold_timer = hold_timer.clone();
         gesture.connect_drag_begin(move |gesture, _start_x, start_y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
             let start = DateTime::parse_from_rfc3339(&event.start).ok().map(|d| d.with_timezone(&Local));
             let end = DateTime::parse_from_rfc3339(&event.end).ok().map(|d| d.with_timezone(&Local));
             let (Some(original_start), Some(original_end)) = (start, end) else { return };
             let zone = classify_day_drag_zone(start_y, hit_box.height());
-            hit_box.set_cursor_from_name(Some(match zone {
-                DayDragZone::Move => "grabbing",
-                DayDragZone::ResizeTop | DayDragZone::ResizeBottom => "ns-resize",
-            }));
-            drag_hint.set_visible(true);
             *drag_state.borrow_mut() = Some(DayDragState { zone, original_start, original_end });
+
+            if hold_ms <= 0 {
+                held_engaged.set(true);
+                hit_box.set_cursor_from_name(Some(match zone {
+                    DayDragZone::Move => "grabbing",
+                    DayDragZone::ResizeTop | DayDragZone::ResizeBottom => "ns-resize",
+                }));
+                drag_hint.set_visible(true);
+            } else {
+                held_engaged.set(false);
+                let hit_box = hit_box.clone();
+                let drag_hint = drag_hint.clone();
+                let held_engaged = held_engaged.clone();
+                let drag_state = drag_state.clone();
+                let hold_timer_in_timer = hold_timer.clone();
+                let id = gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(hold_ms as u64), move || {
+                    // The gesture may have already ended (released early) by the time
+                    // this fires — only engage if it's still in progress.
+                    if drag_state.borrow().is_some() {
+                        held_engaged.set(true);
+                        // GLib already auto-removed this one-shot source; clear it so
+                        // `connect_drag_end` doesn't try to remove it again and panic.
+                        hold_timer_in_timer.set(None);
+                        hit_box.set_cursor_from_name(Some(match zone {
+                            DayDragZone::Move => "grabbing",
+                            DayDragZone::ResizeTop | DayDragZone::ResizeBottom => "ns-resize",
+                        }));
+                        drag_hint.set_visible(true);
+                    }
+                });
+                hold_timer.set(Some(id));
+            }
         });
     }
 
@@ -3519,9 +4834,13 @@ fn install_day_event_drag(
         let time_bubble = time_bubble.clone();
         let drag_hint = drag_hint.clone();
         let drag_state = drag_state.clone();
+        let held_engaged = held_engaged.clone();
         let time_format = ctx.time_format;
         let dates = dates.clone();
         gesture.connect_drag_update(move |gesture, offset_x, offset_y| {
+            if !held_engaged.get() {
+                return;
+            }
             let state_guard = drag_state.borrow();
             let Some(state) = state_guard.as_ref() else { return };
             // Checked live (not latched at drag-begin), so toggling Ctrl/Shift mid-drag
@@ -3562,9 +4881,14 @@ fn install_day_event_drag(
         let event = event.clone();
         let ctx = ctx.clone();
         let drag_state = drag_state.clone();
+        let held_engaged = held_engaged.clone();
+        let hold_timer = hold_timer.clone();
         let pending_popover = pending_popover.clone();
         let dates = dates.clone();
         gesture.connect_drag_end(move |gesture, offset_x, offset_y| {
+            if let Some(id) = hold_timer.take() {
+                id.remove();
+            }
             hit_box.set_cursor_from_name(Some("pointer"));
             drag_hint.set_visible(false);
             let Some(state) = drag_state.borrow_mut().take() else { return };
@@ -3586,6 +4910,14 @@ fn install_day_event_drag(
                     show_event_popover(&card, &event, &ctx);
                 });
                 pending_popover.set(Some(id));
+                return;
+            }
+            if !held_engaged.get() {
+                // Moved far enough not to count as a plain click, but released
+                // before `day_drag_hold_ms`'s hold gate engaged — per that setting's
+                // contract this does nothing: `connect_drag_update` never applied any
+                // geometry while un-engaged, so there's nothing to commit or roll
+                // back, the card just never moved.
                 return;
             }
             // Commit whichever granularity was in effect at release (mirrors
@@ -3746,6 +5078,7 @@ fn show_event_popover(anchor: &gtk4::Box, event: &DisplayEvent, ctx: &EventCtx) 
     let title_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
     let dot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     dot.add_css_class("event-popover-dot");
+    dot.set_tooltip_text(Some(&event.calendar_name));
     if let Some(color) = &event.color {
         dot.add_css_class(&css_class_for_color(color));
     }
@@ -3953,35 +5286,72 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
         end_date = end_date.pred_opt().unwrap_or(end_date).max(start_date);
     }
 
-    let window = adw::Window::builder()
-        .transient_for(&ctx.window)
-        .modal(true)
-        .default_width(560)
-        .build();
+    // The panel's own root: an embedded widget (never a separate top-level window —
+    // see DESIGN_SPEC.md §10's redesigned dockable editor) that gets reparented
+    // across floating/bottom/right at runtime instead of being torn down and
+    // rebuilt on every mode change. `mode` tracks which of the three is currently
+    // active so `install_panel_drag`'s state machine and the initial `dock_panel`
+    // call below agree on it.
+    let panel_root = adw::ToolbarView::new();
+    let mode = Rc::new(Cell::new(EventEditorPanelMode::Floating));
 
     // Tracks whether anything has actually changed since the dialog opened, so
-    // closing it (via Escape, the header's close button, or a WM close request) can
-    // ask before throwing away an in-progress edit — but close silently when nothing
-    // was touched, matching the pre-fill signals below being wired up *after* every
-    // field's initial value is set.
+    // closing it (via Escape or the header's close button) can ask before throwing
+    // away an in-progress edit — but close silently when nothing was touched,
+    // matching the pre-fill signals below being wired up *after* every field's
+    // initial value is set.
     let dirty = Rc::new(Cell::new(false));
-    install_close_guard(&window, &dirty);
-    install_escape_to_close(&window);
 
-    let header = adw::HeaderBar::new();
-    header.set_show_start_title_buttons(false);
-    header.set_show_end_title_buttons(false);
+    // A slim strip above the controls row — a real window has a titlebar to grab
+    // regardless of what's in its toolbar underneath, so this panel gets one too,
+    // and it's the one and only widget `install_panel_drag`'s `GestureDrag` attaches
+    // to (both floating and docked — undocking needs a drag handle just as much as
+    // floating does). Left blank (no title text) — the actual editable title field
+    // lives in the row underneath, which already reads as "this is titled X".
+    let titlebar = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    titlebar.add_css_class("event-editor-titlebar");
+    titlebar.set_margin_start(10);
+    titlebar.set_margin_end(10);
+    titlebar.set_margin_top(4);
+    titlebar.set_margin_bottom(4);
+    titlebar.set_cursor_from_name(Some("grab"));
+
+    // A plain `Box`, not `adw::HeaderBar` — deliberately, even though it means giving
+    // up `HeaderBar`'s automatic centered-title layout. `HeaderBar`/`AdwHeaderBar`
+    // wires up "drag empty space to move the window" unconditionally, targeting
+    // whatever toplevel surface it happens to live under — harmless when it's a
+    // window's own titlebar, but this header lives inside the *main* window's
+    // surface, so that built-in drag would move the whole app window instead of
+    // just this panel. `notifications.rs`'s floating dialog avoids the same
+    // conflict the same way: a plain `Box` has no built-in window-drag behavior of
+    // its own to fight.
+    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    header.add_css_class("event-editor-header");
+    header.set_margin_all(6);
 
     let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
     close_btn.add_css_class("flat");
     close_btn.set_tooltip_text(Some("Close"));
     {
-        let window = window.clone();
-        close_btn.connect_clicked(move |_| window.close());
+        let panel_root = panel_root.clone();
+        let docks = ctx.docks.clone();
+        let window = ctx.window.clone();
+        let dirty = dirty.clone();
+        close_btn.connect_clicked(move |_| {
+            let panel_root = panel_root.clone();
+            let docks = docks.clone();
+            confirm_close(&window, &dirty, move || close_panel(&panel_root, &docks));
+        });
     }
-    header.pack_start(&close_btn);
+    header.append(&close_btn);
 
     let title_entry = gtk4::Entry::new();
+    // `.flat` alone still leaves a visible border/focus outline in this theme —
+    // `.event-editor-title-entry` (load_static_css) explicitly zeroes out
+    // border/background/box-shadow in every state so it truly reads as inline text
+    // rather than a boxed form field sitting in the header strip.
+    title_entry.add_css_class("flat");
+    title_entry.add_css_class("event-editor-title-entry");
     title_entry.set_placeholder_text(Some("Add title"));
     title_entry.set_text(&event.title);
     title_entry.set_hexpand(true);
@@ -3989,12 +5359,15 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
         let dirty = dirty.clone();
         title_entry.connect_changed(move |_| dirty.set(true));
     }
-    header.set_title_widget(Some(&title_entry));
+    // Not centered the way `HeaderBar::set_title_widget` would center it — a plain
+    // `Box` just lays children out left-to-right — but it reads fine for an embedded
+    // panel that was never trying to look like a titlebar in the first place.
+    header.append(&title_entry);
 
     let save_btn = gtk4::Button::with_label("Save");
     save_btn.add_css_class("suggested-action");
-    header.pack_end(&save_btn);
-    header.pack_end(&more_actions_button(&event, &calendars, &ctx, &window));
+    header.append(&save_btn);
+    header.append(&more_actions_button(&event, &calendars, &ctx, &panel_root));
 
     let body = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
     body.set_margin_all(18);
@@ -4015,7 +5388,6 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
     date_time_row.append(&start_button);
     date_time_row.append(&time_row);
     date_time_row.append(&end_button);
-    body.append(&date_time_row);
 
     let options_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
     let all_day_check = gtk4::CheckButton::with_label("All day");
@@ -4031,9 +5403,8 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
     options_row.append(&all_day_check);
 
     let (repeat_btn, recurrence_state) =
-        build_repeat_control(&event, start_picked.clone(), dirty.clone(), ctx.date_format, &window);
+        build_repeat_control(&event, start_picked.clone(), dirty.clone(), ctx.date_format, &ctx.window);
     options_row.append(&repeat_btn);
-    body.append(&options_row);
 
     let location_entry = gtk4::Entry::new();
     location_entry.set_placeholder_text(Some("Add location"));
@@ -4042,7 +5413,7 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
         let dirty = dirty.clone();
         location_entry.connect_changed(move |_| dirty.set(true));
     }
-    body.append(&field_row("mark-location-symbolic", &location_entry));
+    let location_row = field_row("mark-location-symbolic", "Location", &location_entry);
 
     // Built here (right after Location, matching where the field naturally reads in
     // the code) but not appended to `body` until after the calendar/color,
@@ -4067,7 +5438,7 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
     let description_container = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
     description_container.append(&description_toolbar);
     description_container.append(&description_frame);
-    let description_row = field_row("view-list-symbolic", &description_container);
+    let description_row = field_row("view-list-symbolic", "Description", &description_container);
 
     let calendar_names: Vec<&str> = calendars.iter().map(|c| c.display_name.as_str()).collect();
     let calendar_dropdown = gtk4::DropDown::from_strings(&calendar_names);
@@ -4083,7 +5454,7 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
     let calendar_and_color_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     calendar_and_color_row.append(&calendar_dropdown);
     calendar_and_color_row.append(&event_color_button);
-    body.append(&field_row("x-office-calendar-symbolic", &calendar_and_color_row));
+    let calendar_row = field_row("x-office-calendar-symbolic", "Calendar", &calendar_and_color_row);
 
     // Reminders (reference screenshots): a list of "[method ▾] [qty] [unit ▾] [✕]"
     // rows, pre-filled from `event.reminders`, plus an "Add notification" button that
@@ -4128,7 +5499,7 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
     notif_hint.add_css_class("dim-label");
     notif_hint.set_halign(gtk4::Align::Start);
     notif_box.append(&notif_hint);
-    body.append(&field_row("alarm-symbolic", &notif_box));
+    let notifications_row = field_row("alarm-symbolic", "Notifications", &notif_box);
 
     // Busy/Free and visibility (reference screenshot): both local-only for now, like
     // the color override above — `events.transparency`/`events.visibility` round-trip
@@ -4170,9 +5541,25 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
     busy_visibility_row.append(&busy_dropdown);
     busy_visibility_row.append(&visibility_dropdown);
     busy_visibility_row.append(&visibility_help);
-    body.append(&field_row("view-reveal-symbolic", &busy_visibility_row));
+    let busy_visibility_field_row = field_row("view-reveal-symbolic", "Busy/visibility", &busy_visibility_row);
 
-    body.append(&description_row);
+    // Every field row now exists as its own free-standing `Box` — none of them have
+    // been appended to `body` yet. `relayout_editor_body` (called below, once the
+    // panel's starting mode is known, and again on every live dock-mode change) owns
+    // arranging them into `body` from here on.
+    let body_rows = EditorBodyRows {
+        date_time_row: date_time_row.clone(),
+        options_row: options_row.clone(),
+        location_row,
+        calendar_row,
+        notifications_row,
+        busy_visibility_row: busy_visibility_field_row,
+        description_row,
+    };
+    let relayout_body: Rc<dyn Fn(EventEditorPanelMode)> = {
+        let body = body.clone();
+        Rc::new(move |mode| relayout_editor_body(&body, &body_rows, mode))
+    };
 
     let scroller = gtk4::ScrolledWindow::builder()
         .vexpand(true)
@@ -4180,14 +5567,32 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
         .child(&body)
         .build();
 
-    let toolbar_view = adw::ToolbarView::new();
-    toolbar_view.add_top_bar(&header);
-    toolbar_view.set_content(Some(&scroller));
-    window.set_content(Some(&toolbar_view));
+    panel_root.add_top_bar(&titlebar);
+    panel_root.add_top_bar(&header);
+    panel_root.set_content(Some(&scroller));
+    install_panel_escape_to_close(&panel_root, {
+        let panel_root = panel_root.clone();
+        let docks = ctx.docks.clone();
+        let window = ctx.window.clone();
+        let dirty = dirty.clone();
+        move || {
+            let panel_root = panel_root.clone();
+            let docks = docks.clone();
+            confirm_close(&window, &dirty, move || close_panel(&panel_root, &docks));
+        }
+    });
 
     let event_id = event.id;
     {
-        let window = window.clone();
+        let panel_root = panel_root.clone();
+        let docks = ctx.docks.clone();
+        // Cloned rather than capturing `ctx` itself — `ctx.storage`/`ctx.docks` are
+        // read again after this closure (the `dock_panel`/`install_panel_drag` calls
+        // at the end of this function), and a `move` closure would otherwise move
+        // those fields out of `ctx` here, since `Storage`/`ComponentSender` aren't
+        // `Copy`.
+        let storage = ctx.storage.clone();
+        let sender = ctx.sender.clone();
         let description_tags = description_tags.clone();
         save_btn.connect_clicked(move |_| {
             let title = title_entry.text().trim().to_string();
@@ -4225,10 +5630,10 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
 
             let Some(calendar) = calendars.get(calendar_dropdown.selected() as usize) else {
                 tracing::warn!(event_id, "no calendar selected in edit dialog; discarding save");
-                // `destroy`, not `close` — Save (successful or not) is the user's own
-                // resolution of the dialog, so it should never trigger the dirty
-                // "discard changes?" guard `close` would otherwise run into.
-                window.destroy();
+                // `close_panel`, not `confirm_close` — Save (successful or not) is the
+                // user's own resolution of the dialog, so it should never trigger the
+                // dirty "discard changes?" guard `confirm_close` would otherwise run into.
+                close_panel(&panel_root, &docks);
                 return;
             };
 
@@ -4266,20 +5671,32 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
                 recurrence,
             };
             let result = if event_id > 0 {
-                update_event(&ctx.storage, event_id, calendar.id, calendar.account_id, &edits)
+                update_event(&storage, event_id, calendar.id, calendar.account_id, &edits)
             } else {
-                create_event(&ctx.storage, calendar.id, calendar.account_id, &edits).map(|_| ())
+                create_event(&storage, calendar.id, calendar.account_id, &edits).map(|_| ())
             };
             if let Err(err) = result {
                 tracing::warn!(%err, event_id, "failed to save event");
             } else {
-                ctx.sender.input(AppMsg::EventUpdated);
+                sender.input(AppMsg::EventUpdated);
             }
-            window.destroy();
+            close_panel(&panel_root, &docks);
         });
     }
 
-    window.present();
+    let settings = load_settings(&ctx.storage).unwrap_or_default();
+    mode.set(settings.event_editor_panel_mode);
+    dock_panel(&panel_root, mode.get(), &ctx.docks, &ctx.storage);
+    relayout_body(mode.get());
+    // Makes this panel visible to the one persistent drag gesture installed on
+    // `editor_overlay` at `init` time — see `install_panel_drag`'s doc comment for
+    // why that gesture lives there instead of on this panel's own titlebar.
+    *ctx.docks.current_panel.borrow_mut() = Some(OpenEditorPanel {
+        root: panel_root.clone(),
+        titlebar: titlebar.clone(),
+        mode: mode.clone(),
+        relayout: relayout_body,
+    });
 }
 
 /// Builds the edit dialog's "More actions" header button — a flat, icon-only
@@ -4293,7 +5710,7 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
 /// Duplicate/Delete/Print act on `event` as last loaded/saved, not on any in-progress
 /// edits in the dialog's fields — same as closing the dialog without saving would
 /// discard those edits anyway.
-fn more_actions_button(event: &EventDetail, calendars: &[CalendarSummary], ctx: &EventCtx, window: &adw::Window) -> gtk4::MenuButton {
+fn more_actions_button(event: &EventDetail, calendars: &[CalendarSummary], ctx: &EventCtx, panel_root: &adw::ToolbarView) -> gtk4::MenuButton {
     let button = gtk4::MenuButton::new();
     button.set_label("More actions");
     button.add_css_class("flat");
@@ -4311,7 +5728,7 @@ fn more_actions_button(event: &EventDetail, calendars: &[CalendarSummary], ctx: 
     duplicate_btn.set_sensitive(has_saved_event);
     if has_saved_event {
         let ctx = ctx.clone();
-        let window = window.clone();
+        let panel_root = panel_root.clone();
         let popover = popover.clone();
         let calendar_id = event.calendar_id;
         let account_id = calendars.iter().find(|c| c.id == calendar_id).map(|c| c.account_id);
@@ -4337,7 +5754,7 @@ fn more_actions_button(event: &EventDetail, calendars: &[CalendarSummary], ctx: 
             match create_event(&ctx.storage, calendar_id, account_id, &edits) {
                 Ok(_) => {
                     ctx.sender.input(AppMsg::EventUpdated);
-                    window.destroy();
+                    close_panel(&panel_root, &ctx.docks);
                 }
                 Err(err) => tracing::warn!(%err, calendar_id, "failed to duplicate event"),
             }
@@ -4347,13 +5764,13 @@ fn more_actions_button(event: &EventDetail, calendars: &[CalendarSummary], ctx: 
     }
     root.append(&duplicate_btn);
 
-    root.append(&copy_to_calendar_button(event, calendars, ctx, window));
+    root.append(&copy_to_calendar_button(event, calendars, ctx, panel_root));
 
     let print_btn = menu_row_button("Print");
     print_btn.set_sensitive(has_saved_event);
     if has_saved_event {
         let popover = popover.clone();
-        let window = window.clone();
+        let window = ctx.window.clone();
         let event = event.clone();
         let calendar_name = calendars.iter().find(|c| c.id == event.calendar_id).map(|c| c.display_name.clone());
         let date_format = ctx.date_format;
@@ -4374,17 +5791,18 @@ fn more_actions_button(event: &EventDetail, calendars: &[CalendarSummary], ctx: 
     delete_btn.set_sensitive(has_saved_event);
     if has_saved_event {
         let ctx = ctx.clone();
-        let window = window.clone();
+        let panel_root = panel_root.clone();
         let popover = popover.clone();
         let event_id = event.id;
         let event_title = event.title.clone();
         delete_btn.connect_clicked(move |_| {
             popover.popdown();
-            // Same reasoning as Save's `destroy` above: clicking Delete is the user's
-            // own resolution of this dialog, so it shouldn't trip the dirty-guard
-            // "discard changes?" prompt. `confirm_delete_event` still asks before the
-            // deletion itself happens, same as the event popover's delete button.
-            window.destroy();
+            // Same reasoning as Save's `close_panel` above: clicking Delete is the
+            // user's own resolution of this dialog, so it shouldn't trip the
+            // dirty-guard "discard changes?" prompt. `confirm_delete_event` still asks
+            // before the deletion itself happens, same as the event popover's delete
+            // button.
+            close_panel(&panel_root, &ctx.docks);
             confirm_delete_event(&event_title, event_id, ctx.clone());
         });
     } else {
@@ -4404,7 +5822,7 @@ fn more_actions_button(event: &EventDetail, calendars: &[CalendarSummary], ctx: 
 /// `SearchEntry` filters the list as you type, since scanning a long list by eye stops
 /// being faster than typing a few letters of the target calendar's name right about
 /// there.
-fn copy_to_calendar_button(event: &EventDetail, calendars: &[CalendarSummary], ctx: &EventCtx, window: &adw::Window) -> gtk4::MenuButton {
+fn copy_to_calendar_button(event: &EventDetail, calendars: &[CalendarSummary], ctx: &EventCtx, panel_root: &adw::ToolbarView) -> gtk4::MenuButton {
     let label = gtk4::Label::new(Some("Copy to another calendar"));
     label.set_halign(gtk4::Align::Start);
     label.set_hexpand(true);
@@ -4445,7 +5863,7 @@ fn copy_to_calendar_button(event: &EventDetail, calendars: &[CalendarSummary], c
         let calendar_btn = menu_row_button(&calendar.display_name);
         {
             let ctx = ctx.clone();
-            let window = window.clone();
+            let panel_root = panel_root.clone();
             let popover = popover.clone();
             let target_calendar_id = calendar.id;
             let target_account_id = calendar.account_id;
@@ -4467,7 +5885,7 @@ fn copy_to_calendar_button(event: &EventDetail, calendars: &[CalendarSummary], c
                 match create_event(&ctx.storage, target_calendar_id, target_account_id, &edits) {
                     Ok(_) => {
                         ctx.sender.input(AppMsg::EventUpdated);
-                        window.destroy();
+                        close_panel(&panel_root, &ctx.docks);
                     }
                     Err(err) => tracing::warn!(%err, target_calendar_id, "failed to copy event to calendar"),
                 }
@@ -4801,7 +6219,7 @@ fn refresh_date_picker(
             refresh_date_picker(&day_grid, &title_button, &display_month, today, &on_pick);
         })
     };
-    populate_mini_calendar(day_grid, title_button, display_month.get(), today, on_pick, &on_jump_month);
+    populate_mini_calendar(day_grid, title_button, display_month.get(), today, on_pick, &on_jump_month, None, &[]);
 }
 
 /// A Google-Calendar-style time field for the edit dialog's start/end time (reference
@@ -5335,13 +6753,13 @@ fn event_color_picker(initial: Option<String>, dirty: Rc<Cell<bool>>) -> (gtk4::
     colors_grid.set_margin_top(8);
     colors_grid.set_halign(gtk4::Align::Center);
 
-    for (index, &color) in CALENDAR_COLOR_PALETTE.iter().enumerate() {
+    for (index, &(color, name)) in CALENDAR_COLOR_PALETTE.iter().enumerate() {
         let swatch = gtk4::Button::new();
         swatch.add_css_class("flat");
         swatch.add_css_class("circular");
         swatch.add_css_class("color-swatch");
         swatch.add_css_class(&css_class_for_color(color));
-        swatch.set_tooltip_text(Some(color));
+        swatch.set_tooltip_text(Some(name));
         if initial.as_deref() == Some(color) {
             swatch.add_css_class("color-swatch-selected");
             swatch.set_icon_name("object-select-symbolic");
@@ -5521,42 +6939,6 @@ fn add_reminder_row(
     });
 }
 
-/// Guards the edit dialog's `close-request` (fired by `Window::close` — the header
-/// bar's close button, `install_escape_to_close`, and any window-manager close
-/// action all go through it) so an in-progress, unsaved edit isn't lost to a stray
-/// Escape or a misclick. Saving instead calls `Window::destroy`, which skips
-/// `close-request` entirely, so a successful (or abandoned) save never hits this
-/// prompt.
-fn install_close_guard(window: &adw::Window, dirty: &Rc<Cell<bool>>) {
-    let dirty = dirty.clone();
-    window.connect_close_request(move |window| {
-        if !dirty.get() {
-            return gtk4::glib::Propagation::Proceed;
-        }
-
-        let confirm = adw::AlertDialog::new(
-            Some("Discard unsaved changes?"),
-            Some("This event has changes that haven't been saved."),
-        );
-        confirm.add_response("keep-editing", "Keep Editing");
-        confirm.add_response("discard", "Discard");
-        confirm.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
-        confirm.set_default_response(Some("keep-editing"));
-        confirm.set_close_response("keep-editing");
-
-        let window_for_response = window.clone();
-        confirm.choose(Some(window), gtk4::gio::Cancellable::NONE, move |response| {
-            if response == "discard" {
-                // `destroy`, not `close` — bypasses `close-request` so confirming
-                // the discard doesn't just re-trigger this same guard.
-                window_for_response.destroy();
-            }
-        });
-
-        gtk4::glib::Propagation::Stop
-    });
-}
-
 /// Binds Escape to closing the edit dialog via `Window::close`, so it runs through
 /// the same `close-request` dirty guard as the header bar's close button rather than
 /// discarding an in-progress edit unconditionally. `Global` scope (mirroring
@@ -5581,13 +6963,17 @@ fn install_escape_to_close(window: &adw::Window) {
 /// One `<icon> <widget>` row in the edit dialog — the same icon-prefixed field shape
 /// Google Calendar's own event editor uses for location/description/calendar/
 /// notifications, generalized from `detail_row` (which only ever holds a text label)
-/// to hold any interactive widget.
-fn field_row(icon_name: &str, widget: &impl IsA<gtk4::Widget>) -> gtk4::Box {
+/// to hold any interactive widget. `tooltip` names what the row's icon stands for
+/// (e.g. "Location", "Busy/visibility") — several of these symbolic icons aren't
+/// self-explanatory on their own (`view-reveal-symbolic` for busy/visibility, say),
+/// same reasoning as `event_badge_row`'s chip icons.
+fn field_row(icon_name: &str, tooltip: &str, widget: &impl IsA<gtk4::Widget>) -> gtk4::Box {
     let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
 
     let icon = gtk4::Image::from_icon_name(icon_name);
     icon.add_css_class("dim-label");
     icon.set_valign(gtk4::Align::Start);
+    icon.set_tooltip_text(Some(tooltip));
     row.append(&icon);
 
     widget.set_hexpand(true);
@@ -6042,6 +7428,7 @@ fn guest_row(attendee: &EventAttendeeInfo, organizer_email: Option<&str>) -> gtk
     status_dot.add_css_class("event-popover-guest-status");
     status_dot.add_css_class(guest_status_css_class(attendee.response_status));
     status_dot.set_valign(gtk4::Align::Center);
+    status_dot.set_tooltip_text(Some(guest_status_label(attendee.response_status)));
     row.append(&status_dot);
 
     let mut name =
@@ -6069,6 +7456,18 @@ fn guest_status_css_class(status: AttendeeResponseStatus) -> &'static str {
         AttendeeResponseStatus::Declined => "event-popover-guest-status-declined",
         AttendeeResponseStatus::Tentative => "event-popover-guest-status-tentative",
         AttendeeResponseStatus::NeedsAction => "event-popover-guest-status-needs-action",
+    }
+}
+
+/// Human-readable RSVP status for `guest_row`'s status-dot tooltip — a bare colored
+/// dot conveys nothing on its own without hovering it, same reasoning as every other
+/// bare-icon tooltip in this file.
+fn guest_status_label(status: AttendeeResponseStatus) -> &'static str {
+    match status {
+        AttendeeResponseStatus::Accepted => "Accepted",
+        AttendeeResponseStatus::Declined => "Declined",
+        AttendeeResponseStatus::Tentative => "Maybe",
+        AttendeeResponseStatus::NeedsAction => "Awaiting response",
     }
 }
 
@@ -6503,16 +7902,17 @@ fn world_clock_zone_label(zone: &str) -> String {
     zone.rsplit('/').next().unwrap_or(zone).replace('_', " ")
 }
 
-/// Maps a zone's local hour (0-23) to a symbolic icon name suggesting time of day.
+/// Maps a zone's local hour (0-23) to a symbolic icon name suggesting time of day,
+/// plus a CSS class that tints that icon to match (see `load_static_css`).
 /// Bucket boundaries are approximate (no sunrise/sunset calculation) — just a
 /// glanceable cue, not astronomically accurate. All four names are confirmed present
 /// in the Adwaita icon theme installed on this machine.
-fn world_clock_time_of_day_icon(hour: u32) -> &'static str {
+fn world_clock_time_of_day_icon(hour: u32) -> (&'static str, &'static str) {
     match hour {
-        5..=8 => "daytime-sunrise-symbolic",  // morning
-        9..=16 => "weather-clear-symbolic",   // noon / daytime
-        17..=19 => "daytime-sunset-symbolic", // evening
-        _ => "weather-clear-night-symbolic",  // twilight / night
+        5..=8 => ("daytime-sunrise-symbolic", "world-clock-icon-sunrise"), // morning
+        9..=16 => ("weather-clear-symbolic", "world-clock-icon-day"),     // noon / daytime
+        17..=19 => ("daytime-sunset-symbolic", "world-clock-icon-sunset"), // evening
+        _ => ("weather-clear-night-symbolic", "world-clock-icon-night"), // twilight / night
     }
 }
 
@@ -6545,17 +7945,19 @@ fn populate_world_clock(container: &gtk4::Box, settings: &AppSettings) {
 
         let local_time = zone.parse::<Tz>().map(|tz| now.with_timezone(&tz)).ok();
 
-        let icon = gtk4::Image::from_icon_name(
-            local_time.map(|dt| world_clock_time_of_day_icon(dt.hour())).unwrap_or("weather-clear-symbolic"),
-        );
-        icon.add_css_class("dim-label");
-        icon.set_pixel_size(16);
-        row.append(&icon);
+        let (icon_name, icon_css_class) = local_time
+            .map(|dt| world_clock_time_of_day_icon(dt.hour()))
+            .unwrap_or(("weather-clear-symbolic", "world-clock-icon-day"));
 
         let time_text = local_time.map(|dt| dt.format("%-I:%M %p").to_string()).unwrap_or_else(|| "--:--".to_string());
         let time_label = gtk4::Label::new(Some(&time_text));
         time_label.add_css_class("dim-label");
         row.append(&time_label);
+
+        let icon = gtk4::Image::from_icon_name(icon_name);
+        icon.add_css_class(icon_css_class);
+        icon.set_pixel_size(16);
+        row.append(&icon);
 
         container.append(&row);
     }
@@ -6682,6 +8084,7 @@ fn rebuild_world_clock_zone_rows(
         let drag_handle = gtk4::Image::from_icon_name("list-drag-handle-symbolic");
         drag_handle.add_css_class("dim-label");
         drag_handle.set_cursor_from_name(Some("grab"));
+        drag_handle.set_tooltip_text(Some("Drag to reorder"));
 
         let drag_source = gtk4::DragSource::new();
         drag_source.set_actions(gtk4::gdk::DragAction::MOVE);
@@ -7860,15 +9263,16 @@ fn show_preferences_window(ctx: SettingsCtx) {
 
     let (snooze_quantity, snooze_unit_index) = minutes_to_quantity_unit(settings.borrow().default_snooze_minutes, &SNOOZE_UNITS);
 
-    let snooze_quantity_combo = gtk4::ComboBoxText::with_entry();
-    for preset in ["5", "10", "15", "30", "60"] {
-        snooze_quantity_combo.append_text(preset);
-    }
-    if let Some(entry) = snooze_quantity_combo.child().and_downcast::<gtk4::Entry>() {
-        entry.set_text(&snooze_quantity.to_string());
-        entry.set_width_chars(3);
-    }
-    snooze_quantity_combo.set_valign(gtk4::Align::Center);
+    // A `SpinButton`, not `ComboBoxText::with_entry` (deprecated since GTK 4.10) —
+    // same "type a small positive integer quantity" widget `add_reminder_row`'s own
+    // `quantity_spin` already uses, trading the old preset dropdown for up/down
+    // steppers (the adjacent unit dropdown already covers most of the "quick pick"
+    // need). Floor of 1, not 0 — unlike a reminder's "0 minutes before" (at event
+    // time), a 0-length snooze isn't meaningful.
+    let snooze_quantity_spin = gtk4::SpinButton::with_range(1.0, 999.0, 1.0);
+    snooze_quantity_spin.set_value(snooze_quantity as f64);
+    snooze_quantity_spin.set_width_chars(3);
+    snooze_quantity_spin.set_valign(gtk4::Align::Center);
 
     let snooze_unit_names: Vec<&str> = SNOOZE_UNITS.iter().map(|(name, _)| *name).collect();
     let snooze_unit_dropdown = gtk4::DropDown::from_strings(&snooze_unit_names);
@@ -7878,16 +9282,10 @@ fn show_preferences_window(ctx: SettingsCtx) {
     let save_snooze_duration = {
         let settings = settings.clone();
         let storage = ctx.storage.clone();
-        let snooze_quantity_combo = snooze_quantity_combo.clone();
+        let snooze_quantity_spin = snooze_quantity_spin.clone();
         let snooze_unit_dropdown = snooze_unit_dropdown.clone();
         move || {
-            let Some(quantity) = snooze_quantity_combo
-                .active_text()
-                .and_then(|text| text.trim().parse::<i64>().ok())
-                .filter(|&q| q > 0)
-            else {
-                return;
-            };
+            let quantity = snooze_quantity_spin.value_as_int() as i64;
             let multiplier = SNOOZE_UNITS[snooze_unit_dropdown.selected() as usize].1;
             settings.borrow_mut().default_snooze_minutes = quantity * multiplier;
             if let Err(err) = save_settings(&storage, &settings.borrow()) {
@@ -7897,14 +9295,14 @@ fn show_preferences_window(ctx: SettingsCtx) {
     };
     {
         let save_snooze_duration = save_snooze_duration.clone();
-        snooze_quantity_combo.connect_changed(move |_| save_snooze_duration());
+        snooze_quantity_spin.connect_value_changed(move |_| save_snooze_duration());
     }
     {
         let save_snooze_duration = save_snooze_duration.clone();
         snooze_unit_dropdown.connect_selected_notify(move |_| save_snooze_duration());
     }
 
-    snoozed_row.add_suffix(&snooze_quantity_combo);
+    snoozed_row.add_suffix(&snooze_quantity_spin);
     snoozed_row.add_suffix(&snooze_unit_dropdown);
     notif_group.add(&snoozed_row);
 
@@ -8055,6 +9453,32 @@ fn show_preferences_window(ctx: SettingsCtx) {
         });
     }
     layout_group.add(&ctrl_shift_snap_row);
+
+    let drag_hold_row = adw::SpinRow::builder()
+        .title("Drag hold delay")
+        .subtitle("Milliseconds to hold before a click starts moving/resizing an event in Day view")
+        .build();
+    drag_hold_row.set_adjustment(Some(&gtk4::Adjustment::new(
+        settings.borrow().day_drag_hold_ms as f64,
+        0.0,
+        2000.0,
+        50.0,
+        100.0,
+        0.0,
+    )));
+    {
+        let settings = settings.clone();
+        let storage = ctx.storage.clone();
+        let sender = ctx.sender.clone();
+        drag_hold_row.connect_value_notify(move |row| {
+            settings.borrow_mut().day_drag_hold_ms = row.value() as i64;
+            if let Err(err) = save_settings(&storage, &settings.borrow()) {
+                tracing::warn!(%err, "failed to save preferences");
+            }
+            sender.input(AppMsg::EventUpdated);
+        });
+    }
+    layout_group.add(&drag_hold_row);
 
     content_box.append(&layout_group);
     add_settings_nav_item(&sidebar_list, &nav_anchors, &nav_search_rows, "View options", layout_group.upcast_ref());
@@ -8522,6 +9946,63 @@ fn load_static_css() {
         .notification-overlay {
             border-radius: 12px;
         }
+        /* Floating event editor panel (DESIGN_SPEC.md §10's redesigned dockable
+           editor): same floating-card look as .notification-overlay-root above
+           rather than a new one-off style — it's this app's one other floating
+           surface, sitting over the calendar as an editor_overlay overlay child
+           instead of a bordered/margined Paned pane, so it needs its own border
+           and background where a docked pane gets both for free from .card. */
+        .floating-editor-panel {
+            border: 1px solid alpha(currentColor, 0.15);
+            border-radius: 12px;
+            background-color: @window_bg_color;
+        }
+        /* Live about-to-dock preview (preview_docked_right/preview_docked_bottom) —
+           still an overlay child at this point, not yet reparented into the real
+           dock slot (see install_panel_drag's doc comment), so without an opaque
+           background of its own it would show the calendar content behind it
+           bleeding through: a translucent ghost rather than a solid panel. This
+           keeps it fully opaque (matching what the panel will look like once really
+           docked) but square-cornered/borderless already, so the eventual real dock
+           commit at drag-end causes no visible jump. */
+        .docking-editor-panel {
+            background-color: @window_bg_color;
+        }
+        /* The event editor panel's own header row is a plain Box, not a real
+           HeaderBar (see install_panel_drag's doc comment for why), so it gets none
+           of HeaderBar's look for free — this reproduces just the visual part: a
+           subtle tint plus a hairline separator from the body below. */
+        .event-editor-header {
+            background-color: alpha(currentColor, 0.03);
+            border-bottom: 1px solid alpha(currentColor, 0.1);
+        }
+        /* `.flat` alone doesn't fully suppress GtkEntry's border/focus outline in
+           this theme, which read as a boxed form field sitting in the header strip —
+           this hard-overrides border/background/shadow in every state (including
+           focus) so the title truly reads as inline editable text. */
+        .event-editor-title-entry,
+        .event-editor-title-entry:focus,
+        .event-editor-title-entry:focus-within {
+            border: none;
+            background: none;
+            background-color: transparent;
+            box-shadow: none;
+            outline: none;
+        }
+        /* The slim titlebar strip above .event-editor-header — a plain, obvious
+           grab-anywhere drag handle. Same background as the panel itself
+           (@window_bg_color, matching .floating-editor-panel) rather than a
+           contrasting tint, so it reads as part of one continuous panel with a
+           dedicated drag region at top instead of a mismatched bar; the hairline
+           border below is what actually separates it from the header row beneath.
+           It carries no label/content of its own (blank by design), so it needs an
+           explicit min-height here — without one, a childless Box collapses to
+           just its own margins, leaving almost nothing left to see or grab. */
+        .event-editor-titlebar {
+            background-color: @window_bg_color;
+            border-bottom: 1px solid alpha(currentColor, 0.1);
+            min-height: 28px;
+        }
         menubutton.view-switcher-button {
             border: 1px solid white;
             border-radius: 999px;
@@ -8587,12 +10068,37 @@ fn load_static_css() {
         .event-row.event-declined {
             opacity: 0.4;
         }
-        .event-badge-row {
-            opacity: 0.75;
-        }
         .event-badge-row image {
-            min-width: 11px;
-            min-height: 11px;
+            min-width: 13px;
+            min-height: 13px;
+        }
+        /* Overrides `dim-label`'s 55% opacity for Day view specifically — its cards
+           sit on an arbitrary per-calendar accent color (`css_class_for_color`), unlike
+           Month view's neutral grid background, so a badge needs guaranteed full-
+           strength contrast rather than the muted treatment that reads fine elsewhere.
+           More specific than the bare `dim-label` class, so it wins the cascade. */
+        .day-event-block .event-badge-row image {
+            opacity: 1;
+            color: white;
+        }
+        /* World Clock sidebar row icons (`populate_world_clock`) — tinted per
+           time-of-day bucket instead of `dim-label`'s flat gray, so the color
+           reinforces the sunrise/day/sunset/night glyph at a glance. */
+        image.world-clock-icon-sunrise {
+            opacity: 1;
+            color: #f6a623;
+        }
+        image.world-clock-icon-day {
+            opacity: 1;
+            color: #fdd835;
+        }
+        image.world-clock-icon-sunset {
+            opacity: 1;
+            color: #ff7043;
+        }
+        image.world-clock-icon-night {
+            opacity: 1;
+            color: white;
         }
         .event-popover contents {
             padding: 0;
@@ -8679,6 +10185,13 @@ fn load_static_css() {
             background-color: @accent_bg_color;
             color: @accent_fg_color;
         }
+        .mini-calendar-day.mini-calendar-day-in-range {
+            background-color: alpha(@accent_bg_color, 0.35);
+        }
+        .mini-calendar-day.mini-calendar-day-selected {
+            background-color: @accent_bg_color;
+            color: @accent_fg_color;
+        }
         .sidebar-section-header {
             font-size: 0.78em;
             font-weight: 700;
@@ -8697,15 +10210,15 @@ fn load_static_css() {
             font-weight: 600;
         }
         .sidebar-calendar-row {
-            padding: 3px 4px;
+            padding: 2.4px 4px;
             border-radius: 6px;
         }
         .sidebar-calendar-row:hover {
             background-color: alpha(currentColor, 0.1);
         }
         button.calendar-checkbox {
-            min-width: 18px;
-            min-height: 18px;
+            min-width: 14.4px;
+            min-height: 14.4px;
             padding: 0;
             border-radius: 4px;
             background-color: transparent;
@@ -8716,13 +10229,15 @@ fn load_static_css() {
             color: white;
         }
         .calendar-customizer-button {
-            min-width: 16px;
-            min-height: 16px;
-            padding: 2px;
+            min-width: 14.4px;
+            min-height: 14.4px;
+            padding: 1.6px;
+            border-radius: 9999px;
             opacity: 0.6;
         }
         .calendar-customizer-button:hover, .calendar-customizer-button:checked {
             opacity: 1;
+            background-color: alpha(currentColor, 0.1);
         }
         .customizer-menu-row {
             padding: 6px 8px;
@@ -8791,7 +10306,7 @@ fn load_static_css() {
             font-size: 0.68em;
         }
         .compact-density .sidebar-calendar-row {
-            padding: 1px 4px;
+            padding: 0.8px 4px;
         }
         .compact-density .sidebar-section-header {
             margin-top: 6px;
@@ -8828,11 +10343,11 @@ fn load_static_css() {
             min-height: 34px;
             padding: 2px;
         }
-        .day-all-day-row {
-            padding: 2px 4px 6px calc(52px + 4px);
-        }
-        .day-all-day-row-multi {
+        .day-all-day-strip {
             padding: 2px 4px 6px 0;
+        }
+        .day-all-day-event {
+            padding: 3px 8px;
         }
         .day-header-cell {
             border-right: 1px solid alpha(currentColor, 0.12);
@@ -8969,7 +10484,7 @@ fn load_calendar_color_css(calendars: &[CalendarSummary]) {
 /// which only covers colors calendars are already assigned.
 fn load_palette_color_css() {
     let mut css = String::new();
-    for color in CALENDAR_COLOR_PALETTE {
+    for (color, _name) in CALENDAR_COLOR_PALETTE {
         let class = css_class_for_color(color);
         css.push_str(&format!(".{class} {{ background-color: {color}; }}\n"));
     }
@@ -9022,6 +10537,7 @@ mod day_view_layout_tests {
             self_response_status: None,
             reminder_count: 0,
             other_attendee_count: 0,
+            other_attendee_names: Vec::new(),
             attachment_count: 0,
         }
     }
@@ -9095,6 +10611,87 @@ mod day_view_layout_tests {
         }
     }
 
+    fn all_day_ev(id: i64, start_date: &str, end_date_exclusive: &str) -> DisplayEvent {
+        let mut event = ev(id, start_date, end_date_exclusive);
+        event.all_day = true;
+        event
+    }
+
+    #[test]
+    fn single_day_all_day_event_lines_up_under_its_own_column() {
+        let events = vec![all_day_ev(1, "2026-09-02", "2026-09-03")];
+        let window = [d(2026, 9, 1), d(2026, 9, 2), d(2026, 9, 3), d(2026, 9, 4), d(2026, 9, 5)];
+        let layout = layout_all_day_events(&events, &window);
+        assert_eq!(layout.len(), 1);
+        assert_eq!(layout[0].row, 0);
+        assert_eq!(layout[0].start_col, 1, "Sep 2 is column index 1 in a Sep1..5 window");
+        assert_eq!(layout[0].span_cols, 1);
+        assert!(!layout[0].clipped_start);
+        assert!(!layout[0].clipped_end);
+    }
+
+    #[test]
+    fn multiday_event_spanning_the_whole_window_gets_full_span() {
+        let events = vec![all_day_ev(1, "2026-09-01", "2026-09-06")];
+        let window = [d(2026, 9, 1), d(2026, 9, 2), d(2026, 9, 3), d(2026, 9, 4), d(2026, 9, 5)];
+        let layout = layout_all_day_events(&events, &window);
+        assert_eq!(layout.len(), 1);
+        assert_eq!(layout[0].start_col, 0);
+        assert_eq!(layout[0].span_cols, 5, "a strip covering every visible date should span all 5 columns");
+        assert!(!layout[0].clipped_start);
+        assert!(!layout[0].clipped_end);
+    }
+
+    #[test]
+    fn multiday_event_starting_before_the_window_is_clipped_at_the_left_edge() {
+        let events = vec![all_day_ev(1, "2026-08-28", "2026-09-03")];
+        let window = [d(2026, 9, 1), d(2026, 9, 2), d(2026, 9, 3), d(2026, 9, 4), d(2026, 9, 5)];
+        let layout = layout_all_day_events(&events, &window);
+        assert_eq!(layout.len(), 1);
+        assert_eq!(layout[0].start_col, 0, "clipped to the window's first column, not its real (off-screen) start");
+        assert_eq!(layout[0].span_cols, 2);
+        assert!(layout[0].clipped_start);
+        assert!(!layout[0].clipped_end);
+    }
+
+    #[test]
+    fn multiday_event_ending_after_the_window_is_clipped_at_the_right_edge() {
+        let events = vec![all_day_ev(1, "2026-09-04", "2026-09-10")];
+        let window = [d(2026, 9, 1), d(2026, 9, 2), d(2026, 9, 3), d(2026, 9, 4), d(2026, 9, 5)];
+        let layout = layout_all_day_events(&events, &window);
+        assert_eq!(layout.len(), 1);
+        assert_eq!(layout[0].start_col, 3);
+        assert_eq!(layout[0].span_cols, 2, "clipped to the window's last column, not its real (off-screen) end");
+        assert!(!layout[0].clipped_start);
+        assert!(layout[0].clipped_end);
+    }
+
+    #[test]
+    fn event_entirely_outside_the_window_is_dropped() {
+        let events = vec![all_day_ev(1, "2026-09-10", "2026-09-12")];
+        let window = [d(2026, 9, 1), d(2026, 9, 2), d(2026, 9, 3), d(2026, 9, 4), d(2026, 9, 5)];
+        assert!(layout_all_day_events(&events, &window).is_empty());
+    }
+
+    #[test]
+    fn two_overlapping_multiday_events_land_on_different_rows() {
+        let events = vec![all_day_ev(1, "2026-09-01", "2026-09-04"), all_day_ev(2, "2026-09-02", "2026-09-05")];
+        let window = [d(2026, 9, 1), d(2026, 9, 2), d(2026, 9, 3), d(2026, 9, 4), d(2026, 9, 5)];
+        let layout = layout_all_day_events(&events, &window);
+        assert_eq!(layout.len(), 2);
+        assert_ne!(layout[0].row, layout[1].row, "overlapping date ranges must not share a row");
+    }
+
+    #[test]
+    fn non_overlapping_multiday_events_share_a_row() {
+        let events = vec![all_day_ev(1, "2026-09-01", "2026-09-03"), all_day_ev(2, "2026-09-03", "2026-09-05")];
+        let window = [d(2026, 9, 1), d(2026, 9, 2), d(2026, 9, 3), d(2026, 9, 4), d(2026, 9, 5)];
+        let layout = layout_all_day_events(&events, &window);
+        assert_eq!(layout.len(), 2);
+        assert_eq!(layout[0].row, 0);
+        assert_eq!(layout[1].row, 0, "back-to-back (non-overlapping) events should pack into the same row");
+    }
+
     #[test]
     fn cycle_day_time_scale_steps_through_options_and_clamps() {
         assert_eq!(cycle_day_time_scale(60, true), 30);
@@ -9157,6 +10754,42 @@ mod day_view_layout_tests {
         // Thu 2026-01-01 anchor: window spans Dec 30, 2025 .. Jan 3, 2026.
         let dates = five_day_window(d(2026, 1, 1), true);
         assert_eq!(five_day_title(&dates), "Dec 30, 2025 – Jan 3, 2026");
+    }
+
+    #[test]
+    fn capped_date_range_single_date_when_other_equals_origin() {
+        assert_eq!(capped_date_range(d(2026, 9, 3), d(2026, 9, 3), 8), vec![d(2026, 9, 3)]);
+    }
+
+    #[test]
+    fn capped_date_range_within_cap_is_inclusive_both_directions() {
+        assert_eq!(
+            capped_date_range(d(2026, 9, 3), d(2026, 9, 5), 8),
+            vec![d(2026, 9, 3), d(2026, 9, 4), d(2026, 9, 5)]
+        );
+        assert_eq!(
+            capped_date_range(d(2026, 9, 5), d(2026, 9, 3), 8),
+            vec![d(2026, 9, 3), d(2026, 9, 4), d(2026, 9, 5)],
+            "origin after other still returns the same dates in order"
+        );
+    }
+
+    #[test]
+    fn capped_date_range_exactly_at_cap_boundary() {
+        // origin .. origin+7 is exactly 8 dates — the cap, not one over it.
+        let range = capped_date_range(d(2026, 9, 1), d(2026, 9, 8), 8);
+        assert_eq!(range, (1..=8).map(|day| d(2026, 9, day)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn capped_date_range_trims_the_far_end_beyond_cap() {
+        // Dragging 10 days forward from the origin still only keeps 8, anchored on it.
+        let range = capped_date_range(d(2026, 9, 1), d(2026, 9, 11), 8);
+        assert_eq!(range, (1..=8).map(|day| d(2026, 9, day)).collect::<Vec<_>>());
+
+        // Same, dragging backward — origin is kept as the *last* date instead.
+        let range = capped_date_range(d(2026, 9, 20), d(2026, 9, 1), 8);
+        assert_eq!(range, (13..=20).map(|day| d(2026, 9, day)).collect::<Vec<_>>());
     }
 
     #[test]

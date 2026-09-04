@@ -11,5 +11,7 @@ pub use keyring::{InMemoryKeyring, Keyring, OAuthTokens, SecretServiceKeyring};
 pub use notifier::{DbusNotifier, NotifyRequest, SystemNotifier, Urgency};
 pub use oauth::GoogleOAuthConfig;
 pub use service::{Service, ServiceContext, ServiceKind, ServiceRegistry};
-pub use settings::{load_settings, save_settings, AppSettings, DateFormat, InvitationAutoAdd, TimeFormat};
+pub use settings::{
+    load_settings, save_settings, AppSettings, DateFormat, EventEditorPanelMode, InvitationAutoAdd, TimeFormat,
+};
 pub use storage::Storage;

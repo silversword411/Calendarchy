@@ -37,6 +37,12 @@ pub struct DisplayEvent {
     /// account's own row — "1 guest" should mean one other invited person, not "just
     /// you," which is why this isn't a raw `COUNT(*)` over the table.
     pub other_attendee_count: i64,
+    /// Display name (or email, when no display name is set) for each of those same
+    /// non-self attendees — carried alongside the count so a chip's guest badge can
+    /// name names in its tooltip instead of just a bare number. Not truncated here;
+    /// `event_badge_row` decides how many to actually show before falling back to
+    /// "and N more".
+    pub other_attendee_names: Vec<String>,
     /// How many `event_attachments` rows this event has.
     pub attachment_count: i64,
 }
@@ -71,7 +77,8 @@ pub fn events_for_visible_calendars(storage: &Storage) -> anyhow::Result<Vec<Dis
                     events.self_response_status, \
                     COALESCE(reminder_counts.cnt, 0), \
                     COALESCE(attendee_counts.cnt, 0), \
-                    COALESCE(attachment_counts.cnt, 0) \
+                    COALESCE(attachment_counts.cnt, 0), \
+                    attendee_names.names \
              FROM events \
              JOIN calendars ON calendars.id = events.calendar_id \
              LEFT JOIN (SELECT event_id, COUNT(*) AS cnt FROM event_reminders GROUP BY event_id) \
@@ -81,6 +88,9 @@ pub fn events_for_visible_calendars(storage: &Storage) -> anyhow::Result<Vec<Dis
                  attendee_counts ON attendee_counts.event_id = events.id \
              LEFT JOIN (SELECT event_id, COUNT(*) AS cnt FROM event_attachments GROUP BY event_id) \
                  attachment_counts ON attachment_counts.event_id = events.id \
+             LEFT JOIN (SELECT event_id, GROUP_CONCAT(COALESCE(NULLIF(display_name, ''), email), '\u{1f}') AS names \
+                 FROM event_attendees WHERE is_self = 0 GROUP BY event_id) \
+                 attendee_names ON attendee_names.event_id = events.id \
              WHERE calendars.is_visible = 1 \
              ORDER BY events.start",
         )?;
@@ -103,6 +113,10 @@ pub fn events_for_visible_calendars(storage: &Storage) -> anyhow::Result<Vec<Dis
                 reminder_count: row.get(13)?,
                 other_attendee_count: row.get(14)?,
                 attachment_count: row.get(15)?,
+                other_attendee_names: row
+                    .get::<_, Option<String>>(16)?
+                    .map(|names| names.split('\u{1f}').map(str::to_string).collect())
+                    .unwrap_or_default(),
             })
         })?;
         let mut out = Vec::new();
@@ -1129,6 +1143,13 @@ mod tests {
         let event = &visible[0];
         assert_eq!(event.reminder_count, 2);
         assert_eq!(event.other_attendee_count, 3, "excludes the signed-in account's own attendee row");
+        let mut names = event.other_attendee_names.clone();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["guest1@example.com", "guest2@example.com", "guest3@example.com"],
+            "falls back to email for attendees with no display name, and excludes the signed-in account's own row"
+        );
         assert_eq!(event.attachment_count, 1);
         assert!(event.is_recurring);
         assert!(event.has_video_call);
