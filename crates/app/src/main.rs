@@ -8492,12 +8492,12 @@ fn load_static_css() {
             padding-right: 8px;
         }
         .day-hour-label-half {
-            font-size: 0.68em;
-            opacity: 0.45;
+            font-size: 0.70em;
+            opacity: 0.48;
         }
         .day-hour-label-quarter {
-            font-size: 0.62em;
-            opacity: 0.35;
+            font-size: 0.66em;
+            opacity: 0.40;
         }
         .day-hour-cell {
             border-top: 1px solid alpha(currentColor, 0.12);
