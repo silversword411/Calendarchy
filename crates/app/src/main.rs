@@ -12,8 +12,9 @@ use calendarchy_service_calendar::query::{
     calendars_by_account, clear_calendar_cache, create_event, delete_event, delete_reminder_notification,
     dismiss_all_active, dismiss_reminder, event_detail, events_for_visible_calendars, set_calendar_color,
     set_calendar_visibility, show_all_calendars, show_all_calendars_for_account, show_only_calendar,
-    snooze_reminder, update_event, AttendeeResponseStatus, CalendarSummary, DisplayEvent, DueReminder,
-    EventAttendeeInfo, EventBusyStatus, EventDetail, EventEdits, EventReminder, EventVisibility, ReminderMethod,
+    snooze_all_active, snooze_reminder, update_event, AttendeeResponseStatus, CalendarSummary, DisplayEvent,
+    DueReminder, EventAttendeeInfo, EventBusyStatus, EventDetail, EventEdits, EventReminder, EventVisibility,
+    ReminderMethod,
 };
 use calendarchy_service_calendar::recurrence::{self, Recurrence, RecurrenceEnd};
 use calendarchy_service_calendar::CalendarService;
@@ -160,6 +161,10 @@ enum AppMsg {
     DismissReminder(i64),
     /// The floating dialog's "Dismiss all" button.
     DismissAllReminders,
+    /// The floating dialog's "Snooze all" split button (shown alongside "Dismiss all"
+    /// once 2+ alerts are active) — same `minutes` shape as `SnoozeReminder`, applied
+    /// to every currently active alert at once.
+    SnoozeAllReminders(i64),
     /// A "Past" history row's Clear button — removes that row for good, distinct from
     /// `DismissReminder` (active → dismissed, which is how a row *becomes* history).
     ClearHistoryEntry(i64),
@@ -497,6 +502,9 @@ impl Component for App {
         // cached on the model, so a change made in Preferences can never go stale.
         let settings = load_settings(&core.storage).unwrap_or_default();
         apply_compact_density(&root, settings.compact_density);
+        // No search query yet at startup, but "Show declined events" still applies —
+        // see `filter_events`'s doc comment for why this half lives app-side.
+        let events = filter_events(&events, "", settings.show_declined_events);
 
         // Built before `core` moves into `model` below — `Storage` is a cheap
         // `Arc`-backed clone (calendarchy_core::Storage), and `root` (the app's one
@@ -797,6 +805,13 @@ impl Component for App {
                 }
                 self.refresh_overlay(&sender);
             }
+            AppMsg::SnoozeAllReminders(minutes) => {
+                let until = notifications::snooze_until(minutes);
+                if let Err(err) = snooze_all_active(&self.core.storage, until) {
+                    tracing::warn!(%err, "failed to snooze all reminders");
+                }
+                self.refresh_overlay(&sender);
+            }
             AppMsg::ClearHistoryEntry(id) => {
                 if let Err(err) = delete_reminder_notification(&self.core.storage, id) {
                     tracing::warn!(%err, id, "failed to clear reminder history entry");
@@ -850,9 +865,9 @@ impl App {
 
     fn refresh(&self, widgets: &mut AppWidgets, sender: &ComponentSender<App>, root: &adw::Window) {
         let today = Local::now().date_naive();
-        let events = events_for_visible_calendars(&self.core.storage).unwrap_or_default();
-        let events = filter_events(&events, &self.search_query);
         let settings = load_settings(&self.core.storage).unwrap_or_default();
+        let events = events_for_visible_calendars(&self.core.storage).unwrap_or_default();
+        let events = filter_events(&events, &self.search_query, settings.show_declined_events);
         let ctx = EventCtx {
             storage: self.core.storage.clone(),
             sender: sender.clone(),
@@ -992,13 +1007,21 @@ fn five_day_title(dates: &[NaiveDate]) -> String {
 
 /// Case-insensitive substring match on title, mirroring DESIGN_SPEC.md §10's "simple
 /// local full-text filter" — an empty query is treated as "no filter" rather than
-/// matching nothing.
-fn filter_events(events: &[DisplayEvent], query: &str) -> Vec<DisplayEvent> {
+/// matching nothing. Also applies §12's "Show declined events" preference: Google
+/// Calendar's own semantics for that toggle are "on" = show declined events, dimmed
+/// (`event_row`/`day_event_block` add an `.event-declined` CSS class for that half),
+/// "off" = hide them from the grid entirely, which is the half this function owns —
+/// done here, app-side, rather than in `events_for_visible_calendars`'s SQL, matching
+/// where the search-query filter above already lives (a UI preference, not something
+/// the storage layer needs to know about).
+fn filter_events(events: &[DisplayEvent], query: &str, show_declined: bool) -> Vec<DisplayEvent> {
     let query = query.trim().to_lowercase();
-    if query.is_empty() {
-        return events.to_vec();
-    }
-    events.iter().filter(|e| e.title.to_lowercase().contains(&query)).cloned().collect()
+    events
+        .iter()
+        .filter(|e| query.is_empty() || e.title.to_lowercase().contains(&query))
+        .filter(|e| show_declined || e.self_response_status != Some(AttendeeResponseStatus::Declined))
+        .cloned()
+        .collect()
 }
 
 /// The blank starting point for the header bar's Create button (DESIGN_SPEC.md §10):
@@ -1788,6 +1811,13 @@ fn compute_max_visible_events(grid: &gtk4::Grid, week_rows: u32) -> usize {
         all_day: true,
         color: None,
         calendar_name: String::new(),
+        is_recurring: false,
+        has_video_call: false,
+        is_private: false,
+        self_response_status: None,
+        reminder_count: 0,
+        other_attendee_count: 0,
+        attachment_count: 0,
     };
 
     // A row-0-style cell (weekday label + date label + `n` probe events + a
@@ -1829,9 +1859,66 @@ fn compute_max_visible_events(grid: &gtk4::Grid, week_rows: u32) -> usize {
 /// only — kept free of any click handling so `compute_max_visible_events` can build an
 /// unwired probe row purely for measurement; `wire_event_click` adds the interactive
 /// part for rows that actually go on the grid.
+/// A small cluster of at-a-glance icons for one event — shared by `event_row` (Month
+/// view) and `day_event_block` (Day view) so the two chip renderers don't duplicate
+/// this icon-selection logic. Returns `None` when none of the conditions below hold,
+/// so a plain event with nothing notable renders exactly as it did before this existed
+/// (no empty row taking up space). Each icon reuses `"dim-label"` — the same muted-icon
+/// treatment `detail_row`'s leading icon already uses elsewhere in this file — and
+/// carries a tooltip, since a bare tiny symbolic icon isn't self-explanatory on its own.
+///
+/// The video-call icon is informational only here (not clickable) — a real "Join"
+/// action lives in `show_event_popover` instead (via `EventDetail::hangout_link`),
+/// since nesting a clickable control inside the chip's own click gesture isn't worth
+/// the complexity for what a popover already does better. `attachment_count` isn't
+/// surfaced as its own chip icon (kept out to limit how many badges a busy event can
+/// accumulate at once) — it's still on `DisplayEvent` for the popover, per the same
+/// rationale.
+fn event_badge_row(event: &DisplayEvent) -> Option<gtk4::Box> {
+    let mut icons: Vec<(&'static str, String)> = Vec::new(); // (icon name, tooltip)
+
+    if event.is_recurring {
+        icons.push(("media-playlist-repeat-symbolic", "Recurring event".to_string()));
+    }
+    if event.has_video_call {
+        icons.push(("camera-web-symbolic", "Has a video call".to_string()));
+    }
+    if event.is_private {
+        icons.push(("channel-secure-symbolic", "Private".to_string()));
+    }
+    if event.reminder_count > 0 {
+        icons.push(("alarm-symbolic", "Has a reminder".to_string()));
+    }
+    if let Some(location) = event.location.as_deref().filter(|s| !s.is_empty()) {
+        icons.push(("mark-location-symbolic", location.to_string()));
+    }
+    match event.other_attendee_count {
+        0 => {}
+        1 => icons.push(("avatar-default-symbolic", "1 guest".to_string())),
+        n => icons.push(("system-users-symbolic", format!("{n} guests"))),
+    }
+
+    if icons.is_empty() {
+        return None;
+    }
+
+    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 3);
+    row.add_css_class("event-badge-row");
+    for (icon_name, tooltip) in icons {
+        let icon = gtk4::Image::from_icon_name(icon_name);
+        icon.add_css_class("dim-label");
+        icon.set_tooltip_text(Some(&tooltip));
+        row.append(&icon);
+    }
+    Some(row)
+}
+
 fn event_row(event: &DisplayEvent, time_format: TimeFormat) -> gtk4::Box {
     let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
     row_box.add_css_class("event-row");
+    if event.self_response_status == Some(AttendeeResponseStatus::Declined) {
+        row_box.add_css_class("event-declined");
+    }
     row_box.set_cursor_from_name(Some("pointer"));
 
     let dot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -1854,6 +1941,10 @@ fn event_row(event: &DisplayEvent, time_format: TimeFormat) -> gtk4::Box {
     title_label.set_hexpand(true);
     title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     row_box.append(&title_label);
+
+    if let Some(badges) = event_badge_row(event) {
+        row_box.append(&badges);
+    }
 
     row_box
 }
@@ -2270,12 +2361,11 @@ type SettingsCheckboxSpec = (&'static str, fn(&AppSettings) -> bool, fn(&mut App
 /// down after a click needs a handle to it that the macro's own `connect_clicked =>
 /// Msg` sugar doesn't give us.
 ///
-/// Only "Show weekends" has any actual effect (it feeds `five_day_window` on the next
-/// refresh, via `AppMsg::EventUpdated`); "Show declined events"/"Show completed tasks"
-/// are deliberate no-op settings writes, matching the app-wide scope those two fields
-/// have everywhere else today (no view anywhere reads RSVP status or task-completion
-/// data — see their Preferences-window rows, which stay disabled/"Coming soon" even
-/// though these dropdown checkboxes for the same fields are live).
+/// "Show weekends" feeds `five_day_window` and "Show declined events" feeds
+/// `filter_events` (both via `AppMsg::EventUpdated`'s next refresh) — real effects, not
+/// no-ops. "Show completed tasks" is still a deliberate no-op settings write, matching
+/// its app-wide scope everywhere else today (no Tasks service exists yet to supply
+/// completion data — see its still-disabled/"Coming soon" Preferences-window row).
 fn build_view_switcher_popover(sender: &ComponentSender<App>, storage: &Storage) -> gtk4::Popover {
     let popover = gtk4::Popover::new();
 
@@ -2881,6 +2971,9 @@ fn day_event_block(
 
     let card = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
     card.add_css_class("day-event-block");
+    if event.self_response_status == Some(AttendeeResponseStatus::Declined) {
+        card.add_css_class("event-declined");
+    }
     if let Some(color) = &event.color {
         card.add_css_class(&css_class_for_color(color));
     }
@@ -2934,6 +3027,16 @@ fn day_event_block(
         body.set_max_width_chars(1);
         body.set_hexpand(true);
         text_column.append(&body);
+    }
+
+    // Its own line, after the subject/body text, rather than inline alongside
+    // `subject` — `subject_has_room`'s width budget above only accounts for
+    // `time_bubble`'s width against `card_width`, so folding badges into that same
+    // row would silently invalidate that calculation. A card too short to fit this
+    // (a very brief event) just clips it via `card`'s `Overflow::Hidden`, the same
+    // degradation a too-long `body` line already gets.
+    if let Some(badges) = event_badge_row(event) {
+        text_column.append(&badges);
     }
 
     let time_bubble = gtk4::Label::new(None);
@@ -3686,6 +3789,43 @@ fn show_event_popover(anchor: &gtk4::Box, event: &DisplayEvent, ctx: &EventCtx) 
 
             if !detail.attendees.is_empty() {
                 body.append(&guest_list_section(&detail.attendees, detail.organizer_email.as_deref()));
+            }
+
+            for reminder in &detail.reminders {
+                body.append(&detail_row("alarm-symbolic", &format_reminder_lead_time(reminder)));
+            }
+
+            if let Some(link) = detail.hangout_link.as_deref().filter(|s| !s.is_empty()) {
+                // Not `detail_row` — that helper renders plain text, and this needs a
+                // real clickable action, so it's built directly with the same
+                // `.event-popover-detail-row` icon+content layout for visual
+                // consistency with the rows around it.
+                let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+                row.add_css_class("event-popover-detail-row");
+
+                let icon = gtk4::Image::from_icon_name("camera-web-symbolic");
+                icon.add_css_class("dim-label");
+                icon.set_valign(gtk4::Align::Start);
+                row.append(&icon);
+
+                let join_btn = gtk4::Button::with_label("Join video call");
+                join_btn.add_css_class("flat");
+                join_btn.set_halign(gtk4::Align::Start);
+                let link = link.to_string();
+                join_btn.connect_clicked(move |_| {
+                    if let Err(err) = gtk4::gio::AppInfo::launch_default_for_uri(&link, None::<&gtk4::gio::AppLaunchContext>)
+                    {
+                        tracing::warn!(%err, "failed to open video call link");
+                    }
+                });
+                row.append(&join_btn);
+
+                body.append(&row);
+            }
+
+            for attachment in &detail.attachments {
+                let label = attachment.title.as_deref().filter(|s| !s.is_empty()).unwrap_or(&attachment.file_url);
+                body.append(&detail_row("mail-attachment-symbolic", label));
             }
         }
         Ok(None) => {
@@ -5277,6 +5417,22 @@ pub(crate) fn minutes_to_quantity_unit(total_minutes: i64, units: &[(&str, i64)]
         }
     }
     (total_minutes, 0)
+}
+
+/// A reminder's lead time as a read-only sentence for `show_event_popover`, e.g.
+/// "Notification — 10 minutes before" or "Email — 1 day before" — reuses
+/// `minutes_to_quantity_unit`/`REMINDER_UNITS` (the same pair the edit dialog's
+/// "[10] [minutes ▾]" row already converts a stored `minutes` value through) rather
+/// than re-deriving the unit breakdown.
+fn format_reminder_lead_time(reminder: &EventReminder) -> String {
+    let (quantity, unit_index) = minutes_to_quantity_unit(reminder.minutes, &REMINDER_UNITS);
+    let unit = REMINDER_UNITS[unit_index as usize].0;
+    let unit = if quantity == 1 { unit.trim_end_matches('s') } else { unit };
+    let method = match reminder.method {
+        ReminderMethod::Popup => "Notification",
+        ReminderMethod::Email => "Email",
+    };
+    format!("{method} — {quantity} {unit} before")
 }
 
 /// One reminder row's live widgets, kept around (in the edit dialog's
@@ -7922,14 +8078,24 @@ fn show_preferences_window(ctx: SettingsCtx) {
         });
     }
     view_events_group.add(&show_weekends_row);
-    view_events_group.add(
-        &adw::SwitchRow::builder()
-            .title("Show declined events")
-            .subtitle("Coming soon — requires RSVP data from the Calendar API")
-            .active(settings.borrow().show_declined_events)
-            .sensitive(false)
-            .build(),
-    );
+    let show_declined_row = adw::SwitchRow::builder()
+        .title("Show declined events")
+        .subtitle("Dims rather than hides — off hides them from the grid entirely")
+        .active(settings.borrow().show_declined_events)
+        .build();
+    {
+        let settings = settings.clone();
+        let storage = ctx.storage.clone();
+        let sender = ctx.sender.clone();
+        show_declined_row.connect_active_notify(move |row| {
+            settings.borrow_mut().show_declined_events = row.is_active();
+            if let Err(err) = save_settings(&storage, &settings.borrow()) {
+                tracing::warn!(%err, "failed to save preferences");
+            }
+            sender.input(AppMsg::EventUpdated);
+        });
+    }
+    view_events_group.add(&show_declined_row);
     view_events_group.add(
         &adw::SwitchRow::builder()
             .title("Show completed tasks")
@@ -8418,6 +8584,16 @@ fn load_static_css() {
         .event-row.event-row-dragging {
             opacity: 0.35;
         }
+        .event-row.event-declined {
+            opacity: 0.4;
+        }
+        .event-badge-row {
+            opacity: 0.75;
+        }
+        .event-badge-row image {
+            min-width: 11px;
+            min-height: 11px;
+        }
         .event-popover contents {
             padding: 0;
         }
@@ -8711,6 +8887,9 @@ fn load_static_css() {
         .day-event-block:hover {
             opacity: 1;
         }
+        .day-event-block.event-declined {
+            opacity: 0.5;
+        }
         .day-event-subject {
             font-size: 0.85em;
             font-weight: 700;
@@ -8837,6 +9016,13 @@ mod day_view_layout_tests {
             all_day: false,
             color: None,
             calendar_name: "cal".into(),
+            is_recurring: false,
+            has_video_call: false,
+            is_private: false,
+            self_response_status: None,
+            reminder_count: 0,
+            other_attendee_count: 0,
+            attachment_count: 0,
         }
     }
 

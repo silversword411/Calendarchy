@@ -139,6 +139,7 @@ fn play_sound_file(path: &Path) -> anyhow::Result<()> {
 #[derive(Clone)]
 pub struct OverlayHandle {
     window: gtk4::Window,
+    bulk_actions_box: gtk4::Box,
     cards_box: gtk4::Box,
     history_box: gtk4::Box,
     storage: Storage,
@@ -205,19 +206,19 @@ fn build_overlay_window(storage: Storage, sender: ComponentSender<App>) -> Overl
     header_label.set_hexpand(true);
     header_label.set_halign(gtk4::Align::Start);
     header.append(&header_label);
-
-    let dismiss_all_button = gtk4::Button::with_label("Dismiss all");
-    dismiss_all_button.add_css_class("flat");
-    {
-        let sender = sender.clone();
-        dismiss_all_button.connect_clicked(move |_| sender.input(AppMsg::DismissAllReminders));
-    }
-    header.append(&dismiss_all_button);
     root.append(&header);
 
     if layer_shell_supported {
         header.add_controller(drag_controller(&window, &storage));
     }
+
+    // Holds "Snooze all" / "Dismiss all" once 2+ alerts are active — empty and
+    // hidden otherwise, since bulk actions don't mean anything below that.
+    // Rebuilt fresh on every `refresh_overlay` call (see `bulk_actions_row`), not
+    // built once here, so its Snooze-all button's label always reflects the current
+    // `AppSettings::default_snooze_minutes`.
+    let bulk_actions_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    root.append(&bulk_actions_box);
 
     let cards_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
     root.append(&cards_box);
@@ -244,6 +245,7 @@ fn build_overlay_window(storage: Storage, sender: ComponentSender<App>) -> Overl
 
     OverlayHandle {
         window,
+        bulk_actions_box,
         cards_box,
         history_box,
         storage,
@@ -334,6 +336,14 @@ pub fn refresh_overlay(handle: &OverlayHandle) {
             .append(&alert_card(reminder, time_format, settings.default_snooze_minutes, &handle.sender));
     }
 
+    crate::clear_children(&handle.bulk_actions_box);
+    handle.bulk_actions_box.set_visible(active.len() >= 2);
+    if active.len() >= 2 {
+        handle
+            .bulk_actions_box
+            .append(&bulk_actions_row(settings.default_snooze_minutes, &handle.sender));
+    }
+
     let history = recent_reminder_history(&handle.storage, HISTORY_LIMIT).unwrap_or_default();
     crate::clear_children(&handle.history_box);
     for entry in &history {
@@ -394,7 +404,8 @@ fn alert_card(reminder: &ActiveReminder, time_format: TimeFormat, default_snooze
         });
     }
     snooze_box.append(&snooze_button);
-    snooze_box.append(&snooze_presets_menu_button(reminder.id, sender));
+    let id = reminder.id;
+    snooze_box.append(&snooze_presets_menu_button(sender, move |minutes| AppMsg::SnoozeReminder { id, minutes }));
     card.append(&snooze_box);
 
     let dismiss_button = gtk4::Button::from_icon_name("window-close-symbolic");
@@ -411,11 +422,13 @@ fn alert_card(reminder: &ActiveReminder, time_format: TimeFormat, default_snooze
     card
 }
 
-/// The Snooze split-button's dropdown arrow — a `MenuButton` with no label, popping
-/// up `SNOOZE_PRESETS` as a column of flat buttons. Picking one sends
-/// `AppMsg::SnoozeReminder` directly (bypassing the main button's default duration)
-/// and closes the popover.
-fn snooze_presets_menu_button(reminder_id: i64, sender: &ComponentSender<App>) -> gtk4::MenuButton {
+/// A Snooze split-button's dropdown arrow — a `MenuButton` with no label, popping up
+/// `SNOOZE_PRESETS` as a column of flat buttons. `to_msg` turns a picked preset's
+/// minutes into the `AppMsg` to send — `SnoozeReminder` for one alert's card,
+/// `SnoozeAllReminders` for the bulk-actions row — so this one popover builder serves
+/// both without duplicating the popover-construction code. Picking a preset closes
+/// the popover.
+fn snooze_presets_menu_button(sender: &ComponentSender<App>, to_msg: impl Fn(i64) -> AppMsg + Clone + 'static) -> gtk4::MenuButton {
     let menu_button = gtk4::MenuButton::new();
     menu_button.set_icon_name("pan-down-symbolic");
     menu_button.set_tooltip_text(Some("Snooze for…"));
@@ -428,8 +441,9 @@ fn snooze_presets_menu_button(reminder_id: i64, sender: &ComponentSender<App>) -
         button.add_css_class("flat");
         let sender = sender.clone();
         let popover_weak = popover.downgrade();
+        let to_msg = to_msg.clone();
         button.connect_clicked(move |_| {
-            sender.input(AppMsg::SnoozeReminder { id: reminder_id, minutes });
+            sender.input(to_msg(minutes));
             if let Some(popover) = popover_weak.upgrade() {
                 popover.popdown();
             }
@@ -440,6 +454,39 @@ fn snooze_presets_menu_button(reminder_id: i64, sender: &ComponentSender<App>) -
     menu_button.set_popover(Some(&popover));
 
     menu_button
+}
+
+/// The "Snooze all" / "Dismiss all" row shown once 2+ alerts are active
+/// (`refresh_overlay` hides `OverlayHandle::bulk_actions_box` below that count).
+/// "Snooze all" is a linked split button shaped exactly like a card's own Snooze
+/// control — main button applies `default_snooze_minutes` to every active alert,
+/// its dropdown offers `SNOOZE_PRESETS` instead.
+fn bulk_actions_row(default_snooze_minutes: i64, sender: &ComponentSender<App>) -> gtk4::Box {
+    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    row.set_halign(gtk4::Align::End);
+
+    let snooze_all_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    snooze_all_box.add_css_class("linked");
+
+    let (quantity, unit_index) = crate::minutes_to_quantity_unit(default_snooze_minutes, &crate::SNOOZE_UNITS);
+    let snooze_all_button = gtk4::Button::with_label(&format!("Snooze all {quantity}{}", crate::SNOOZE_UNITS[unit_index as usize].0));
+    {
+        let sender = sender.clone();
+        snooze_all_button.connect_clicked(move |_| sender.input(AppMsg::SnoozeAllReminders(default_snooze_minutes)));
+    }
+    snooze_all_box.append(&snooze_all_button);
+    snooze_all_box.append(&snooze_presets_menu_button(sender, AppMsg::SnoozeAllReminders));
+    row.append(&snooze_all_box);
+
+    let dismiss_all_button = gtk4::Button::with_label("Dismiss all");
+    dismiss_all_button.add_css_class("flat");
+    {
+        let sender = sender.clone();
+        dismiss_all_button.connect_clicked(move |_| sender.input(AppMsg::DismissAllReminders));
+    }
+    row.append(&dismiss_all_button);
+
+    row
 }
 
 fn history_row(entry: &ReminderHistoryEntry, time_format: TimeFormat, sender: &ComponentSender<App>) -> gtk4::Box {

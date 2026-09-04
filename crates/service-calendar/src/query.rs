@@ -16,6 +16,29 @@ pub struct DisplayEvent {
     pub all_day: bool,
     pub color: Option<String>,
     pub calendar_name: String,
+    /// Whether `events.recurrence_rule` is set — enough for a chip badge; the actual
+    /// rule text is only needed by the editor, which reads it via `EventDetail` instead.
+    pub is_recurring: bool,
+    /// Whether `events.hangout_link` is set — the chip badge is informational only, so
+    /// (unlike `EventDetail::hangout_link`) the actual URL isn't needed here.
+    pub has_video_call: bool,
+    /// `events.visibility` is anything other than `Default` (Private/Confidential) —
+    /// a single lock badge covers both, mirroring Google Calendar's own chip treatment.
+    pub is_private: bool,
+    /// The signed-in account's own RSVP, mirrored from `events.self_response_status`
+    /// (populated at sync time — see `crates/service-calendar/src/storage.rs`'s
+    /// `upsert_event`). `None` when the event has no attendee list at all.
+    pub self_response_status: Option<AttendeeResponseStatus>,
+    /// How many `event_reminders` rows this event has — a chip only needs to know
+    /// "any at all," but the count is cheap to carry and more useful in a tooltip than
+    /// a bare boolean.
+    pub reminder_count: i64,
+    /// How many `event_attendees` rows this event has *excluding* the signed-in
+    /// account's own row — "1 guest" should mean one other invited person, not "just
+    /// you," which is why this isn't a raw `COUNT(*)` over the table.
+    pub other_attendee_count: i64,
+    /// How many `event_attachments` rows this event has.
+    pub attachment_count: i64,
 }
 
 impl DisplayEvent {
@@ -28,21 +51,41 @@ impl DisplayEvent {
 }
 
 /// All events on calendars the user has left visible, across every connected account
-/// — the source of truth for the Month/Agenda views (DESIGN_SPEC.md §10), which never
-/// talk to the network directly (§5).
+/// — the source of truth for the Month/Day views (DESIGN_SPEC.md §10), which never
+/// talk to the network directly (§5). The three `LEFT JOIN`ed subqueries each count
+/// rows in a child table per event (`reminder_counts`/`attendee_counts` — the latter
+/// excluding the signed-in account's own attendee row —
+/// `attachment_counts`) — a `GROUP BY` per subquery rather than a per-event follow-up
+/// query, so annotating every visible event with these counts stays one query
+/// regardless of how many events are visible. `COALESCE(..., 0)` covers events with no
+/// matching child rows at all, which is the common case and the reason these are
+/// `LEFT` (not inner) joins.
 pub fn events_for_visible_calendars(storage: &Storage) -> anyhow::Result<Vec<DisplayEvent>> {
     storage.with_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT events.id, COALESCE(events.title, '(No title)'), events.description, \
                     events.location, events.start, events.end, events.all_day, \
                     COALESCE(events.color, calendars.color), \
-                    calendars.display_name \
+                    calendars.display_name, \
+                    events.recurrence_rule, events.hangout_link, events.visibility, \
+                    events.self_response_status, \
+                    COALESCE(reminder_counts.cnt, 0), \
+                    COALESCE(attendee_counts.cnt, 0), \
+                    COALESCE(attachment_counts.cnt, 0) \
              FROM events \
              JOIN calendars ON calendars.id = events.calendar_id \
+             LEFT JOIN (SELECT event_id, COUNT(*) AS cnt FROM event_reminders GROUP BY event_id) \
+                 reminder_counts ON reminder_counts.event_id = events.id \
+             LEFT JOIN (SELECT event_id, SUM(CASE WHEN is_self = 0 THEN 1 ELSE 0 END) AS cnt \
+                 FROM event_attendees GROUP BY event_id) \
+                 attendee_counts ON attendee_counts.event_id = events.id \
+             LEFT JOIN (SELECT event_id, COUNT(*) AS cnt FROM event_attachments GROUP BY event_id) \
+                 attachment_counts ON attachment_counts.event_id = events.id \
              WHERE calendars.is_visible = 1 \
              ORDER BY events.start",
         )?;
         let rows = stmt.query_map([], |row| {
+            let visibility = EventVisibility::parse(&row.get::<_, String>(11)?);
             Ok(DisplayEvent {
                 id: row.get(0)?,
                 title: row.get(1)?,
@@ -53,6 +96,13 @@ pub fn events_for_visible_calendars(storage: &Storage) -> anyhow::Result<Vec<Dis
                 all_day: row.get::<_, i64>(6)? != 0,
                 color: row.get(7)?,
                 calendar_name: row.get(8)?,
+                is_recurring: row.get::<_, Option<String>>(9)?.is_some(),
+                has_video_call: row.get::<_, Option<String>>(10)?.is_some(),
+                is_private: visibility != EventVisibility::Default,
+                self_response_status: row.get::<_, Option<String>>(12)?.map(|s| AttendeeResponseStatus::parse(&s)),
+                reminder_count: row.get(13)?,
+                other_attendee_count: row.get(14)?,
+                attachment_count: row.get(15)?,
             })
         })?;
         let mut out = Vec::new();
@@ -968,6 +1018,122 @@ mod tests {
             .expect("hide calendar");
 
         assert!(events_for_visible_calendars(&storage).expect("query").is_empty());
+    }
+
+    #[test]
+    fn events_for_visible_calendars_surfaces_reminder_attendee_and_attachment_counts_and_flags() {
+        let storage = setup();
+        let account_id = AccountId(1);
+        let calendar_id = storage
+            .with_conn(|conn| {
+                upsert_calendar(
+                    conn,
+                    account_id,
+                    &CalendarListEntry {
+                        id: "jane@gmail.com".into(),
+                        summary: "Jane".into(),
+                        background_color: None,
+                        access_role: "owner".into(),
+                        primary: true,
+                    },
+                )
+            })
+            .expect("calendar");
+
+        storage
+            .with_conn(|conn| {
+                crate::storage::upsert_event(
+                    conn,
+                    calendar_id,
+                    &crate::google_api::Event {
+                        id: "busy-1".into(),
+                        status: Some("confirmed".into()),
+                        summary: Some("Quarterly review".into()),
+                        start: EventDateTime {
+                            date_time: Some("2026-09-05T09:00:00-04:00".into()),
+                            ..Default::default()
+                        },
+                        end: EventDateTime {
+                            date_time: Some("2026-09-05T10:00:00-04:00".into()),
+                            ..Default::default()
+                        },
+                        recurrence: vec!["RRULE:FREQ=WEEKLY".into()],
+                        hangout_link: Some("https://meet.google.com/abc-defg-hij".into()),
+                        visibility: Some("private".into()),
+                        attendees: vec![
+                            crate::google_api::EventAttendee {
+                                email: "jane@gmail.com".into(),
+                                display_name: Some("Jane".into()),
+                                response_status: "accepted".into(),
+                                is_self: true,
+                                optional: false,
+                                organizer: true,
+                            },
+                            crate::google_api::EventAttendee {
+                                email: "guest1@example.com".into(),
+                                display_name: None,
+                                response_status: "needsAction".into(),
+                                is_self: false,
+                                optional: false,
+                                organizer: false,
+                            },
+                            crate::google_api::EventAttendee {
+                                email: "guest2@example.com".into(),
+                                display_name: None,
+                                response_status: "declined".into(),
+                                is_self: false,
+                                optional: false,
+                                organizer: false,
+                            },
+                            crate::google_api::EventAttendee {
+                                email: "guest3@example.com".into(),
+                                display_name: None,
+                                response_status: "tentative".into(),
+                                is_self: false,
+                                optional: false,
+                                organizer: false,
+                            },
+                        ],
+                        attachments: vec![crate::google_api::EventAttachment {
+                            file_url: "https://example.com/agenda.pdf".into(),
+                            title: Some("Agenda".into()),
+                            mime_type: Some("application/pdf".into()),
+                            icon_link: None,
+                            file_id: None,
+                        }],
+                        ..Default::default()
+                    },
+                )
+            })
+            .expect("insert event");
+        let event_id: i64 = storage
+            .with_conn(|conn| {
+                Ok(conn.query_row("SELECT id FROM events WHERE google_event_id = 'busy-1'", [], |r| r.get(0))?)
+            })
+            .expect("event id");
+        storage
+            .with_conn(|conn| {
+                replace_reminders(
+                    conn,
+                    event_id,
+                    &[
+                        EventReminder { method: ReminderMethod::Popup, minutes: 10 },
+                        EventReminder { method: ReminderMethod::Email, minutes: 60 },
+                    ],
+                )
+            })
+            .expect("insert reminders");
+
+        let visible = events_for_visible_calendars(&storage).expect("query");
+        assert_eq!(visible.len(), 1);
+        let event = &visible[0];
+        assert_eq!(event.reminder_count, 2);
+        assert_eq!(event.other_attendee_count, 3, "excludes the signed-in account's own attendee row");
+        assert_eq!(event.attachment_count, 1);
+        assert!(event.is_recurring);
+        assert!(event.has_video_call);
+        assert!(event.is_private);
+        assert_eq!(event.self_response_status, Some(AttendeeResponseStatus::Accepted));
     }
 
     fn seed_event(storage: &Storage, calendar_id: i64) -> i64 {
