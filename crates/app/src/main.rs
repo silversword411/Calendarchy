@@ -12,7 +12,7 @@ use calendarchy_service_calendar::query::{
     calendars_by_account, clear_calendar_cache, create_event, delete_event, delete_reminder_notification,
     dismiss_all_active, dismiss_reminder, event_detail, events_for_visible_calendars, set_calendar_color,
     set_calendar_visibility, show_all_calendars, show_all_calendars_for_account, show_only_calendar,
-    snooze_all_active, snooze_reminder, update_event, AttendeeResponseStatus, CalendarSummary, DisplayEvent,
+    snooze_all_active, snooze_reminder, undo_last_event_edit, update_event, AttendeeResponseStatus, CalendarSummary, DisplayEvent,
     DueReminder, EventAttendeeInfo, EventBusyStatus, EventDetail, EventEdits, EventReminder, EventVisibility,
     ReminderMethod,
 };
@@ -205,6 +205,7 @@ enum AppMsg {
     /// these dates side by side.
     SetCustomViewDates(Vec<NaiveDate>),
     EventUpdated,
+    UndoEventEdit,
     ToggleSidebar,
     CreateEvent,
     ShowPreferences,
@@ -751,6 +752,7 @@ impl Component for App {
         install_search_shortcut(&root, &widgets.search_entry);
         install_preferences_shortcut(&root, &sender);
         install_view_shortcuts(&root, &sender);
+        install_undo_shortcut(&root, &sender);
         install_day_zoom_controller(&widgets.day_scroller, &sender);
         {
             let fraction = settings
@@ -1007,6 +1009,13 @@ impl Component for App {
             }
             AppMsg::EventUpdated => {
                 self.refresh(widgets, &sender, root);
+            }
+            AppMsg::UndoEventEdit => {
+                match undo_last_event_edit(&self.core.storage) {
+                    Ok(true) => self.refresh(widgets, &sender, root),
+                    Ok(false) => {}
+                    Err(err) => tracing::warn!(%err, "failed to undo event edit"),
+                }
             }
             AppMsg::ToggleSidebar => {
                 self.sidebar_visible = !self.sidebar_visible;
@@ -1422,6 +1431,23 @@ fn install_preferences_shortcut(root: &impl IsA<gtk4::Widget>, sender: &Componen
         })),
     ));
 
+    root.add_controller(controller);
+}
+
+fn install_undo_shortcut(root: &impl IsA<gtk4::Widget>, sender: &ComponentSender<App>) {
+    let controller = gtk4::ShortcutController::new();
+    controller.set_scope(gtk4::ShortcutScope::Global);
+    let sender = sender.clone();
+    controller.add_shortcut(gtk4::Shortcut::new(
+        gtk4::ShortcutTrigger::parse_string("<Control>z"),
+        Some(gtk4::CallbackAction::new(move |widget, _args| {
+            if focus_is_editable(widget) {
+                return gtk4::glib::Propagation::Proceed;
+            }
+            sender.input(AppMsg::UndoEventEdit);
+            gtk4::glib::Propagation::Stop
+        })),
+    ));
     root.add_controller(controller);
 }
 
@@ -7544,6 +7570,7 @@ const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             ("/", "Search events"),
             ("?", "Show this keyboard shortcuts window"),
             ("Ctrl+,", "Open preferences"),
+            ("Ctrl+Z", "Undo the last event edit"),
         ],
     },
 ];
