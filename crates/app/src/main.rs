@@ -324,6 +324,11 @@ impl Component for App {
                     #[name = "sidebar_pane"]
                     #[wrap(Some)]
                     set_start_child = &gtk4::ScrolledWindow {
+                        add_css_class: "card",
+                        set_overflow: gtk4::Overflow::Hidden,
+                        set_margin_start: 12,
+                        set_margin_top: 12,
+                        set_margin_bottom: 12,
                         set_width_request: SIDEBAR_MIN_WIDTH_PX,
                         set_hexpand: false,
                         set_vexpand: true,
@@ -399,11 +404,13 @@ impl Component for App {
                         set_hexpand: true,
                         set_vexpand: true,
                         set_spacing: 12,
-                        set_margin_all: 12,
+                        set_margin_top: 12,
+                        set_margin_bottom: 12,
+                        set_margin_end: 12,
 
                         #[name = "month_view_container"]
                         gtk4::ScrolledWindow {
-                            add_css_class: "calendar-card",
+                            add_css_class: "card",
                             set_overflow: gtk4::Overflow::Hidden,
                             set_vexpand: true,
                             set_hexpand: true,
@@ -421,7 +428,7 @@ impl Component for App {
 
                         #[name = "day_view_container"]
                         gtk4::Box {
-                            add_css_class: "calendar-card",
+                            add_css_class: "card",
                             set_orientation: gtk4::Orientation::Vertical,
                             set_overflow: gtk4::Overflow::Hidden,
                             set_vexpand: true,
@@ -1691,6 +1698,7 @@ fn populate_month_grid(
         cell.add_css_class("month-cell");
         cell.set_hexpand(true);
         cell.set_vexpand(true);
+        wire_month_cell_drop_target(&cell, date, ctx);
 
         if row == 0 {
             let weekday_label = gtk4::Label::new(Some(WEEKDAYS[col as usize]));
@@ -1722,6 +1730,7 @@ fn populate_month_grid(
             for event in day_events.iter().take(max_visible_events) {
                 let row = event_row(event, ctx.time_format);
                 wire_event_click(&row, event, ctx);
+                wire_month_event_drag_source(&row, event);
                 cell.append(&row);
             }
             if day_events.len() > max_visible_events {
@@ -1753,7 +1762,7 @@ fn compute_max_visible_events(grid: &gtk4::Grid, week_rows: u32) -> usize {
     const FALLBACK: usize = 4;
     const MAX_CANDIDATE: usize = 20; // generous ceiling; no real day needs more
 
-    // Measured off the parent (the `calendar-card` `ScrolledWindow`), not the grid
+    // Measured off the parent (the `.card` `ScrolledWindow`), not the grid
     // itself: a `ScrolledWindow` can allocate its child *more* height than is
     // actually visible — that's how scrolling works — so `grid.height()` tracks
     // the content's full demanded size and never shrinks below whatever was last
@@ -1898,6 +1907,159 @@ fn wire_event_click(row: &gtk4::Box, event: &DisplayEvent, ctx: &EventCtx) {
         pending_popover.set(Some(id));
     });
     row.add_controller(gesture);
+}
+
+/// Makes a Month view event chip (built by `event_row`) draggable to another day cell —
+/// paired with `wire_month_cell_drop_target` on the receiving `.month-cell`. Uses GTK4's
+/// native `gtk4::DragSource`/`gtk4::DropTarget` (content: the event's `i64` id) rather
+/// than a hand-rolled `GestureDrag` like the Day/5-day view's `install_day_event_drag` —
+/// Month view only needs whole-cell granularity, so there's no need for that function's
+/// fine-grained offset math, and a native `DragSource` coexists with `wire_event_click`'s
+/// `GestureClick` on the same widget with no extra arbitration: it only claims the
+/// sequence once its own drag threshold is exceeded, so a plain click still reaches the
+/// click gesture normally (contrast `install_day_event_drag`'s doc comment, which
+/// explains why a single custom `GestureDrag` was needed there instead). Mirrors the
+/// World Clock zone-reorder drag source in Preferences (`rebuild_world_clock_zone_rows`)
+/// for the drag-icon/dim-while-dragging treatment.
+fn wire_month_event_drag_source(row: &gtk4::Box, event: &DisplayEvent) {
+    let drag_source = gtk4::DragSource::new();
+    drag_source.set_actions(gtk4::gdk::DragAction::MOVE);
+    let event_id = event.id;
+    drag_source.connect_prepare(move |_, _, _| Some(gtk4::gdk::ContentProvider::for_value(&event_id.to_value())));
+    {
+        let row = row.clone();
+        drag_source.connect_drag_begin(move |source, _drag| {
+            row.add_css_class("event-row-dragging");
+            let paintable = gtk4::WidgetPaintable::new(Some(&row));
+            source.set_icon(Some(&paintable), row.width() / 2, row.height() / 2);
+        });
+    }
+    {
+        let row = row.clone();
+        drag_source.connect_drag_end(move |_, _, _| {
+            row.remove_css_class("event-row-dragging");
+        });
+    }
+    {
+        let row = row.clone();
+        drag_source.connect_drag_cancel(move |_, _, _| {
+            row.remove_css_class("event-row-dragging");
+            false
+        });
+    }
+    row.add_controller(drag_source);
+}
+
+/// Accepts a drop from `wire_month_event_drag_source` on one Month view day cell —
+/// highlighting it (`.month-cell-drop-target`) while a drag hovers over it, and moving
+/// the dropped event to `date` (`commit_month_drag`) on release.
+fn wire_month_cell_drop_target(cell: &gtk4::Box, date: NaiveDate, ctx: &EventCtx) {
+    let drop_target = gtk4::DropTarget::new(i64::static_type(), gtk4::gdk::DragAction::MOVE);
+    {
+        let cell = cell.clone();
+        drop_target.connect_enter(move |_, _, _| {
+            cell.add_css_class("month-cell-drop-target");
+            gtk4::gdk::DragAction::MOVE
+        });
+    }
+    {
+        let cell = cell.clone();
+        drop_target.connect_leave(move |_| {
+            cell.remove_css_class("month-cell-drop-target");
+        });
+    }
+    {
+        let cell = cell.clone();
+        let ctx = ctx.clone();
+        drop_target.connect_drop(move |_, value, _, _| {
+            cell.remove_css_class("month-cell-drop-target");
+            let Ok(event_id) = value.get::<i64>() else { return false };
+            commit_month_drag(event_id, date, &ctx);
+            true
+        });
+    }
+    cell.add_controller(drop_target);
+}
+
+/// Shifts an event's start/end string (RFC 3339 for timed events, plain `YYYY-MM-DD`
+/// for all-day ones — the same two representations `DisplayEvent`/`EventDetail` store,
+/// per `DisplayEvent::start_date`'s doc comment) by `delta_days`, preserving
+/// time-of-day/timezone for timed events. Shared by `commit_month_drag` for both
+/// `start` and `end`, so a multi-day (or plain multi-hour) event keeps its duration —
+/// no all-day-vs-timed branching needed at the call site.
+fn shift_date_string(s: &str, delta_days: i64) -> Option<String> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        Some((dt + Duration::days(delta_days)).to_rfc3339())
+    } else {
+        Some((NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()? + Duration::days(delta_days)).format("%Y-%m-%d").to_string())
+    }
+}
+
+/// Persists a Month view drag-to-another-day for event `event_id`, following the same
+/// look-up-detail → resolve-calendar/account → build-`EventEdits` → `update_event` →
+/// `AppMsg::EventUpdated` sequence `commit_day_drag` uses — but shifting `start`/`end`
+/// by the gap between the event's current start date and `target_date` (via
+/// `shift_date_string`) rather than replacing them outright, so duration/time-of-day
+/// (or an all-day event's span) carry over unchanged. A drop back onto the event's own
+/// day is a no-op. Always ends by requesting a refresh, success or failure — matching
+/// `commit_day_drag`'s own reasoning.
+fn commit_month_drag(event_id: i64, target_date: NaiveDate, ctx: &EventCtx) {
+    let detail = match event_detail(&ctx.storage, event_id) {
+        Ok(Some(detail)) => detail,
+        Ok(None) => {
+            tracing::warn!(event_id, "event no longer exists; discarding drag");
+            ctx.sender.input(AppMsg::EventUpdated);
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(%err, event_id, "failed to load event after drag");
+            ctx.sender.input(AppMsg::EventUpdated);
+            return;
+        }
+    };
+
+    let Some(original_start_date) = NaiveDate::parse_from_str(detail.start.get(0..10).unwrap_or(&detail.start), "%Y-%m-%d").ok()
+    else {
+        tracing::warn!(event_id, "event start date failed to parse; discarding drag");
+        ctx.sender.input(AppMsg::EventUpdated);
+        return;
+    };
+    let delta_days = (target_date - original_start_date).num_days();
+    if delta_days == 0 {
+        return;
+    }
+
+    let (Some(new_start), Some(new_end)) = (shift_date_string(&detail.start, delta_days), shift_date_string(&detail.end, delta_days))
+    else {
+        tracing::warn!(event_id, "event start/end failed to parse; discarding drag");
+        ctx.sender.input(AppMsg::EventUpdated);
+        return;
+    };
+
+    let calendars = calendars_by_account(&ctx.storage).unwrap_or_default();
+    let Some(calendar) = calendars.iter().find(|c| c.id == detail.calendar_id) else {
+        tracing::warn!(event_id, "no calendar found for event; discarding drag");
+        ctx.sender.input(AppMsg::EventUpdated);
+        return;
+    };
+
+    let edits = EventEdits {
+        title: detail.title,
+        description: detail.description,
+        location: detail.location,
+        start: new_start,
+        end: new_end,
+        all_day: detail.all_day,
+        color: detail.color,
+        reminders: detail.reminders,
+        busy: detail.busy,
+        visibility: detail.visibility,
+        recurrence: detail.recurrence,
+    };
+    if let Err(err) = update_event(&ctx.storage, event_id, detail.calendar_id, calendar.account_id, &edits) {
+        tracing::warn!(%err, event_id, "failed to save dragged event");
+    }
+    ctx.sender.input(AppMsg::EventUpdated);
 }
 
 /// Pixel height of one hour row in the Day view's hour grid (`populate_day_hour_grid`)
@@ -2181,35 +2343,73 @@ fn populate_day_header(
     }
 }
 
+/// Which "boundary" a Day view hour-grid row's `minute_of_day % 60` lands on —
+/// `populate_day_hour_grid`'s label text/CSS class and gridline weight both key off
+/// this, so a row's line and its label always agree on how significant it is.
+/// `QuarterHour`/`Minor` only actually occur at finer `DAY_TIME_SCALE_OPTIONS` values
+/// (15 and 5 minutes respectively divide evenly into quarter-hours; 10 minutes doesn't,
+/// so its non-hour/half-hour rows land in `Minor` instead) — every option produces
+/// exactly the tiers it can, with no per-scale special-casing needed here.
+enum DayHourMarkTier {
+    Hour,
+    HalfHour,
+    QuarterHour,
+    Minor,
+}
+
+fn day_hour_mark_tier(minute_of_hour: i64) -> DayHourMarkTier {
+    match minute_of_hour {
+        0 => DayHourMarkTier::Hour,
+        30 => DayHourMarkTier::HalfHour,
+        15 | 45 => DayHourMarkTier::QuarterHour,
+        _ => DayHourMarkTier::Minor,
+    }
+}
+
 /// Fills the Day/5-day view's hour grid (DESIGN_SPEC.md §12's Time scale option) with
 /// one fixed-height row per `scale_minutes` interval (24*60/`scale_minutes` rows —
 /// always a whole number, since `DAY_TIME_SCALE_OPTIONS` all divide 60 evenly): a time
-/// label in the left gutter at every hour boundary (blank elsewhere, and blank at
-/// midnight — matching Google Calendar's own day view, which doesn't label the very
-/// top edge) and `day_count` bordered cells to its right (one per day column; `1` for
-/// `ViewMode::Day`, `5` for `ViewMode::FiveDay`) whose top edge draws that row's line,
-/// styled slightly lighter for the sub-hour lines a finer scale adds than for the hour
-/// lines, plus a right-border divider between adjacent day columns when `day_count >
-/// 1`. Each row is `DAY_ROW_HEIGHT_PX` tall regardless of the grid's allocated size,
-/// since (unlike `populate_month_grid`'s row-homogeneous stretch-to-fit grid) the Day
-/// view is meant to scroll, not shrink events to fit — so a finer `scale_minutes`
-/// (more, shorter intervals) makes the whole grid taller rather than each row shorter.
-/// Called on every `App::refresh` (cheap: no measurement pass like
-/// `compute_max_visible_events` needs, just plain fixed-size widgets).
+/// label in the left gutter at every hour/half-hour/quarter-hour boundary (blank at any
+/// finer residual tick a 5- or 10-minute scale adds, and blank at midnight — matching
+/// Google Calendar's own day view, which doesn't label the very top edge), each styled
+/// per `DayHourMarkTier` so hour labels read as most significant, then half-hour, then
+/// quarter-hour. `day_count` bordered cells to its right (one per day column; `1` for
+/// `ViewMode::Day`, `5` for `ViewMode::FiveDay`) draw that row's line, its border weight
+/// following the same tier (heaviest on the hour, lightest for a finer residual tick),
+/// plus a right-border divider between adjacent day columns when `day_count > 1`. Each
+/// row is `DAY_ROW_HEIGHT_PX` tall regardless of the grid's allocated size, since
+/// (unlike `populate_month_grid`'s row-homogeneous stretch-to-fit grid) the Day view is
+/// meant to scroll, not shrink events to fit — so a finer `scale_minutes` (more, shorter
+/// intervals) makes the whole grid taller rather than each row shorter. Called on every
+/// `App::refresh` (cheap: no measurement pass like `compute_max_visible_events` needs,
+/// just plain fixed-size widgets).
 fn populate_day_hour_grid(grid: &gtk4::Grid, time_format: TimeFormat, scale_minutes: i64, day_count: usize) {
     clear_children(grid);
 
     let row_count = 24 * 60 / scale_minutes;
     for row in 0..row_count {
         let minute_of_day = row * scale_minutes;
-        let label_text = if minute_of_day == 0 || minute_of_day % 60 != 0 {
+        let minute_of_hour = minute_of_day % 60;
+        let tier = day_hour_mark_tier(minute_of_hour);
+
+        let label_text = if minute_of_day == 0 {
             String::new()
         } else {
-            let hour = (minute_of_day / 60) as u32;
-            format_clock(NaiveTime::from_hms_opt(hour, 0, 0).expect("valid hour"), time_format)
+            match tier {
+                DayHourMarkTier::Minor => String::new(),
+                DayHourMarkTier::Hour | DayHourMarkTier::HalfHour | DayHourMarkTier::QuarterHour => {
+                    let hour = (minute_of_day / 60) as u32;
+                    format_clock(NaiveTime::from_hms_opt(hour, minute_of_hour as u32, 0).expect("valid time"), time_format)
+                }
+            }
         };
         let label = gtk4::Label::new(Some(&label_text));
         label.add_css_class("day-hour-label");
+        match tier {
+            DayHourMarkTier::Hour | DayHourMarkTier::Minor => {}
+            DayHourMarkTier::HalfHour => label.add_css_class("day-hour-label-half"),
+            DayHourMarkTier::QuarterHour => label.add_css_class("day-hour-label-quarter"),
+        }
         label.set_halign(gtk4::Align::End);
         label.set_valign(gtk4::Align::Start);
         label.set_width_request(GUTTER_WIDTH_PX);
@@ -2220,8 +2420,13 @@ fn populate_day_hour_grid(grid: &gtk4::Grid, time_format: TimeFormat, scale_minu
             cell.add_css_class("day-hour-cell");
             if row == 0 {
                 cell.add_css_class("day-hour-cell-first");
-            } else if minute_of_day % 60 != 0 {
-                cell.add_css_class("day-hour-cell-minor");
+            } else {
+                match tier {
+                    DayHourMarkTier::Hour => {}
+                    DayHourMarkTier::HalfHour => cell.add_css_class("day-hour-cell-half"),
+                    DayHourMarkTier::QuarterHour => cell.add_css_class("day-hour-cell-quarter"),
+                    DayHourMarkTier::Minor => cell.add_css_class("day-hour-cell-minor"),
+                }
             }
             if day_count > 1 && day_index + 1 < day_count {
                 cell.add_css_class("day-hour-cell-divider");
@@ -2308,6 +2513,8 @@ fn populate_day_view(
                 scale_minutes,
                 ctrl_snap_minutes,
                 ctrl_shift_snap_minutes,
+                dates,
+                day_index,
                 ctx,
             );
         }
@@ -2536,6 +2743,8 @@ fn day_event_block(
     scale_minutes: i64,
     ctrl_snap_minutes: i64,
     ctrl_shift_snap_minutes: i64,
+    dates: &[NaiveDate],
+    day_index: usize,
     ctx: &EventCtx,
 ) {
     let Some(start) = DateTime::parse_from_rfc3339(&event.start).ok().map(|d| d.with_timezone(&Local)) else { return };
@@ -2668,11 +2877,15 @@ fn day_event_block(
         &drag_hint,
         event,
         card_width,
+        card_margin_start,
         pixels_per_minute,
         scale_minutes,
         ctrl_snap_minutes,
         ctrl_shift_snap_minutes,
         start_only,
+        dates.to_vec(),
+        day_index,
+        column.width_px,
         ctx,
     );
 
@@ -2712,6 +2925,12 @@ struct DayDragResult {
     day_start: DateTime<Local>,
     start: DateTime<Local>,
     end: DateTime<Local>,
+    /// The drag's proposed day column index into the `dates` slice it was computed
+    /// against — unchanged from the card's original column for `ResizeTop`/
+    /// `ResizeBottom` (a resize never changes the day) and for the single-column Day
+    /// view, and used by `apply_day_drag_geometry` to reposition the card
+    /// horizontally when a `Move` drag crosses into a different day column.
+    column_index: usize,
 }
 
 /// Max pixel thickness of the top/bottom edge-grab zones `classify_day_drag_zone`
@@ -2806,52 +3025,78 @@ fn resolve_minutes(minutes: f64, scale_minutes: Option<i64>) -> i64 {
 }
 
 /// Computes this drag's current proposed `(start, end)` from `state`'s pre-drag values
-/// plus the gesture's `offset_y` (px, positive = downward — same convention
-/// `card.set_margin_top` uses), clamped to the event's own calendar day and to
-/// `DAY_EVENT_MIN_DURATION_MINUTES`. `scale_minutes` (via `resolve_minutes`) controls
+/// plus the gesture's `offset_x`/`offset_y` (px; `offset_y` positive = downward, same
+/// convention `card.set_margin_top` uses), clamped to the event's own calendar day and
+/// to `DAY_EVENT_MIN_DURATION_MINUTES`. `scale_minutes` (via `resolve_minutes`) controls
 /// whether the resulting *absolute* clock time snaps to the nearest gridline
 /// (`Some`, used once on commit) or just the nearest whole minute (`None`, used on
 /// every live-feedback frame so the drag tracks the pointer smoothly instead of
 /// visibly stepping between gridlines). Shared by both paths so they apply identical
 /// math to identical inputs, differing only in that one parameter.
+///
+/// `offset_x` only moves the event to a different day for `DayDragZone::Move` — resize
+/// drags always keep the event's original day, matching Google Calendar's own day-view
+/// affordances (an edge handle only ever changes duration). The target day is resolved
+/// as a *column index* into `dates` (`day_index + round(offset_x / day_column_width)`,
+/// clamped to the visible range), not raw calendar-day arithmetic, since `dates` can
+/// skip weekends (`five_day_window`) — crossing from Friday's column into the next one
+/// should land on Monday, not Saturday.
 fn compute_day_drag_times(
     state: &DayDragState,
+    offset_x: f64,
     offset_y: f64,
     pixels_per_minute: f64,
+    day_column_width: f64,
+    dates: &[NaiveDate],
+    day_index: usize,
     scale_minutes: Option<i64>,
 ) -> DayDragResult {
     let raw_delta_minutes = offset_y / pixels_per_minute;
 
+    let target_column = match state.zone {
+        DayDragZone::Move if dates.len() > 1 => {
+            let column_delta = (offset_x / day_column_width).round() as i64;
+            (day_index as i64 + column_delta).clamp(0, dates.len() as i64 - 1) as usize
+        }
+        _ => day_index,
+    };
+    let target_date = dates.get(target_column).copied().unwrap_or_else(|| state.original_start.date_naive());
+
     let midnight = NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is always valid");
-    let day_start = local_datetime(state.original_start.date_naive(), midnight);
+    // The pre-drag start/end's time-of-day is always read against *their own* day's
+    // midnight, even when the drag has moved the event to a different day's column —
+    // `raw_delta_minutes` is a pure time-of-day adjustment, independent of which day
+    // it ends up applied to.
+    let original_day_start = local_datetime(state.original_start.date_naive(), midnight);
+    let day_start = local_datetime(target_date, midnight);
     let day_end = day_start + Duration::days(1);
     let min_duration = Duration::minutes(DAY_EVENT_MIN_DURATION_MINUTES);
     let duration = state.original_end - state.original_start;
 
     let (start, end) = match state.zone {
         DayDragZone::Move => {
-            let original_start_min = (state.original_start - day_start).num_minutes() as f64;
+            let original_start_min = (state.original_start - original_day_start).num_minutes() as f64;
             let resolved_min = resolve_minutes(original_start_min + raw_delta_minutes, scale_minutes);
             let start = (day_start + Duration::minutes(resolved_min)).max(day_start).min(day_end - duration);
             (start, start + duration)
         }
         DayDragZone::ResizeTop => {
             let end = state.original_end;
-            let original_start_min = (state.original_start - day_start).num_minutes() as f64;
+            let original_start_min = (state.original_start - original_day_start).num_minutes() as f64;
             let resolved_min = resolve_minutes(original_start_min + raw_delta_minutes, scale_minutes);
             let start = (day_start + Duration::minutes(resolved_min)).max(day_start).min(end - min_duration);
             (start, end)
         }
         DayDragZone::ResizeBottom => {
             let start = state.original_start;
-            let original_end_min = (state.original_end - day_start).num_minutes() as f64;
+            let original_end_min = (state.original_end - original_day_start).num_minutes() as f64;
             let resolved_min = resolve_minutes(original_end_min + raw_delta_minutes, scale_minutes);
             let end = (day_start + Duration::minutes(resolved_min)).max(start + min_duration).min(day_end);
             (start, end)
         }
     };
 
-    DayDragResult { day_start, start, end }
+    DayDragResult { day_start, start, end, column_index: target_column }
 }
 
 /// Applies `result` to `card`'s geometry and `time_bubble`'s text — exactly the two
@@ -2867,11 +3112,21 @@ fn compute_day_drag_times(
 /// (`day_event_block`'s own `subject_has_room` verdict for this card): the label is
 /// kept to whichever form the card started the drag in rather than re-measured on every
 /// pointer-move, so it doesn't flip formats mid-drag.
+///
+/// `card`'s horizontal position shifts too, by a plain delta —
+/// `card_margin_start + (result.column_index - day_index) * day_column_width` — rather
+/// than being recomputed from scratch, so it's correct regardless of how many other
+/// events share the target day's lanes (that real layout only gets resolved once the
+/// drag commits and `AppMsg::EventUpdated` triggers a full repopulate; live-dragging
+/// never reshuffles other cards out of the way, same as it already doesn't vertically).
 fn apply_day_drag_geometry(
     card: &gtk4::Box,
     time_bubble: &gtk4::Label,
     drag_hint: &gtk4::Label,
     card_width: i32,
+    card_margin_start: i32,
+    day_index: usize,
+    day_column_width: i32,
     result: &DayDragResult,
     pixels_per_minute: f64,
     time_format: TimeFormat,
@@ -2879,9 +3134,12 @@ fn apply_day_drag_geometry(
 ) {
     let top = ((result.start - result.day_start).num_minutes() as f64 * pixels_per_minute).round() as i32;
     let height = ((result.end - result.start).num_minutes() as f64 * pixels_per_minute).round() as i32;
+    let left = card_margin_start + (result.column_index as i32 - day_index as i32) * day_column_width;
     card.set_margin_top(top);
+    card.set_margin_start(left);
     card.set_size_request(card_width, height.max(18));
     drag_hint.set_margin_top((top - DAY_DRAG_HINT_OFFSET_PX).max(0));
+    drag_hint.set_margin_start(left);
     time_bubble.set_label(&if start_only {
         format_clock(result.start.time(), time_format)
     } else {
@@ -2994,11 +3252,15 @@ fn install_day_event_drag(
     drag_hint: &gtk4::Label,
     event: &DisplayEvent,
     card_width: i32,
+    card_margin_start: i32,
     pixels_per_minute: f64,
     scale_minutes: i64,
     ctrl_snap_minutes: i64,
     ctrl_shift_snap_minutes: i64,
     start_only: bool,
+    dates: Vec<NaiveDate>,
+    day_index: usize,
+    day_column_width: i32,
     ctx: &EventCtx,
 ) {
     let gesture = gtk4::GestureDrag::new();
@@ -3034,7 +3296,8 @@ fn install_day_event_drag(
         let drag_hint = drag_hint.clone();
         let drag_state = drag_state.clone();
         let time_format = ctx.time_format;
-        gesture.connect_drag_update(move |gesture, _offset_x, offset_y| {
+        let dates = dates.clone();
+        gesture.connect_drag_update(move |gesture, offset_x, offset_y| {
             let state_guard = drag_state.borrow();
             let Some(state) = state_guard.as_ref() else { return };
             // Checked live (not latched at drag-begin), so toggling Ctrl/Shift mid-drag
@@ -3042,8 +3305,29 @@ fn install_day_event_drag(
             // `install_day_zoom_controller` already uses for its own Ctrl+scroll check.
             let scale =
                 day_drag_snap_scale(gesture.current_event_state(), scale_minutes, ctrl_snap_minutes, ctrl_shift_snap_minutes);
-            let result = compute_day_drag_times(state, offset_y, pixels_per_minute, scale);
-            apply_day_drag_geometry(&card, &time_bubble, &drag_hint, card_width, &result, pixels_per_minute, time_format, start_only);
+            let result = compute_day_drag_times(
+                state,
+                offset_x,
+                offset_y,
+                pixels_per_minute,
+                day_column_width as f64,
+                &dates,
+                day_index,
+                scale,
+            );
+            apply_day_drag_geometry(
+                &card,
+                &time_bubble,
+                &drag_hint,
+                card_width,
+                card_margin_start,
+                day_index,
+                day_column_width,
+                &result,
+                pixels_per_minute,
+                time_format,
+                start_only,
+            );
         });
     }
 
@@ -3055,6 +3339,7 @@ fn install_day_event_drag(
         let ctx = ctx.clone();
         let drag_state = drag_state.clone();
         let pending_popover = pending_popover.clone();
+        let dates = dates.clone();
         gesture.connect_drag_end(move |gesture, offset_x, offset_y| {
             hit_box.set_cursor_from_name(Some("pointer"));
             drag_hint.set_visible(false);
@@ -3084,7 +3369,16 @@ fn install_day_event_drag(
             // matches what was last shown on screen).
             let scale =
                 day_drag_snap_scale(gesture.current_event_state(), scale_minutes, ctrl_snap_minutes, ctrl_shift_snap_minutes);
-            let result = compute_day_drag_times(&state, offset_y, pixels_per_minute, scale);
+            let result = compute_day_drag_times(
+                &state,
+                offset_x,
+                offset_y,
+                pixels_per_minute,
+                day_column_width as f64,
+                &dates,
+                day_index,
+                scale,
+            );
             commit_day_drag(event.id, &result, &ctx);
         });
     }
@@ -7399,11 +7693,13 @@ fn show_preferences_window(ctx: SettingsCtx) {
     {
         let settings = settings.clone();
         let storage = ctx.storage.clone();
+        let sender = ctx.sender.clone();
         ctrl_snap_row.connect_value_notify(move |row| {
             settings.borrow_mut().day_drag_snap_ctrl_minutes = row.value() as i64;
             if let Err(err) = save_settings(&storage, &settings.borrow()) {
                 tracing::warn!(%err, "failed to save preferences");
             }
+            sender.input(AppMsg::EventUpdated);
         });
     }
     layout_group.add(&ctrl_snap_row);
@@ -7423,11 +7719,13 @@ fn show_preferences_window(ctx: SettingsCtx) {
     {
         let settings = settings.clone();
         let storage = ctx.storage.clone();
+        let sender = ctx.sender.clone();
         ctrl_shift_snap_row.connect_value_notify(move |row| {
             settings.borrow_mut().day_drag_snap_ctrl_shift_minutes = row.value() as i64;
             if let Err(err) = save_settings(&storage, &settings.borrow()) {
                 tracing::warn!(%err, "failed to save preferences");
             }
+            sender.input(AppMsg::EventUpdated);
         });
     }
     layout_group.add(&ctrl_shift_snap_row);
@@ -7843,22 +8141,42 @@ fn clear_children(widget: &impl IsA<gtk4::Widget>) {
     }
 }
 
-/// The static part of the app's look: a bordered, rounded-corner "card" around the
-/// main calendar area, hairline month-grid cell borders inside it (rather than a
-/// separate card per day), muted weekday/section labels, a today badge in the
-/// system accent color (via libadwaita's `@accent_bg_color`/`@accent_fg_color`, so
-/// it follows Omarchy's theme automatically — DESIGN_SPEC.md §13), and the
-/// sidebar's account-section/calendar-row styling. Per-calendar checkbox coloring
-/// is layered on top by `load_calendar_color_css`, since it depends on which
+/// The static part of the app's look: hairline month-grid cell borders (rather
+/// than a separate card per day), muted weekday/section labels, a today badge in
+/// the system accent color (via libadwaita's `@accent_bg_color`/`@accent_fg_color`,
+/// so it follows Omarchy's theme automatically — DESIGN_SPEC.md §13), and the
+/// sidebar's account-section/calendar-row styling. The sidebar and main calendar
+/// area themselves aren't styled here — they use libadwaita's built-in `.card`
+/// class directly in the `view!` macro so each floats as its own theme-matched
+/// rounded panel over the window background, with that background visible as a
+/// gap on every edge. Each pane carries a 12px margin against the *outer* window
+/// edges (top/bottom, and its own outer side) but none on the edge it shares with
+/// a neighboring pane — there, VS Code-style, the gap between the two cards *is*
+/// the resize handle (see the `paned > separator` rule below) rather than a
+/// separate thick divider bar layered on top of two more margins. Any future pane
+/// should follow the same convention: `.card` + `Overflow::Hidden` + margin on
+/// outer edges only, none on edges shared with an adjacent pane's handle. Per-calendar
+/// checkbox coloring is layered on top by `load_calendar_color_css`, since it depends on which
 /// calendars are actually loaded.
 fn load_static_css() {
     let provider = gtk4::CssProvider::new();
     provider.load_from_string(
         "
-        .calendar-card {
-            border: 1px solid alpha(currentColor, 0.15);
-            border-radius: 12px;
-            background-color: alpha(currentColor, 0.02);
+        /* Sidebar `Paned` handle: like VS Code, there's no separate thick divider
+           bar — the handle *is* the gap between the sidebar and main content cards
+           (which carry no margin of their own on this shared edge), sized just wide
+           enough to show the window background as a seam and stay grabbable. No
+           grip dots, no divider line by default; a faint highlight appears only on
+           hover/drag so the resize affordance is still discoverable. */
+        paned > separator {
+            background: none;
+            background-image: none;
+            border: none;
+            box-shadow: none;
+            min-width: 8px;
+        }
+        paned > separator:hover, paned > separator:active {
+            background-color: alpha(currentColor, 0.08);
         }
         .notification-overlay-root {
             border: 1px solid alpha(currentColor, 0.15);
@@ -7901,6 +8219,9 @@ fn load_static_css() {
             border-bottom: 1px solid alpha(currentColor, 0.12);
             padding: 6px 8px;
         }
+        .month-cell.month-cell-drop-target {
+            background-color: alpha(@accent_bg_color, 0.12);
+        }
         .weekday-label {
             font-size: 0.75em;
             font-weight: 600;
@@ -7923,6 +8244,9 @@ fn load_static_css() {
         .event-row:hover {
             background-color: alpha(currentColor, 0.1);
             opacity: 1;
+        }
+        .event-row.event-row-dragging {
+            opacity: 0.35;
         }
         .event-popover contents {
             padding: 0;
@@ -8041,9 +8365,9 @@ fn load_static_css() {
             color: white;
         }
         .calendar-customizer-button {
-            min-width: 22px;
-            min-height: 22px;
-            padding: 0;
+            min-width: 16px;
+            min-height: 16px;
+            padding: 2px;
             opacity: 0.6;
         }
         .calendar-customizer-button:hover, .calendar-customizer-button:checked {
@@ -8167,11 +8491,25 @@ fn load_static_css() {
             opacity: 0.55;
             padding-right: 8px;
         }
+        .day-hour-label-half {
+            font-size: 0.68em;
+            opacity: 0.45;
+        }
+        .day-hour-label-quarter {
+            font-size: 0.62em;
+            opacity: 0.35;
+        }
         .day-hour-cell {
             border-top: 1px solid alpha(currentColor, 0.12);
         }
         .day-hour-cell-first {
             border-top: none;
+        }
+        .day-hour-cell-half {
+            border-top: 1px solid alpha(currentColor, 0.09);
+        }
+        .day-hour-cell-quarter {
+            border-top: 1px solid alpha(currentColor, 0.07);
         }
         .day-hour-cell-minor {
             border-top: 1px solid alpha(currentColor, 0.06);
@@ -8496,12 +8834,21 @@ mod day_view_layout_tests {
         local_datetime(date, NaiveTime::from_hms_opt(hour, minute, 0).expect("valid time"))
     }
 
+    /// Single-day-view `dates`/`day_column_width`/`day_index` fixture for tests that
+    /// only exercise vertical (time-of-day) drag behavior — with only one column,
+    /// `compute_day_drag_times` can never resolve a different target day, so these
+    /// match the pre-cross-day-drag behavior exactly.
+    fn single_day(date: NaiveDate) -> (Vec<NaiveDate>, f64, usize) {
+        (vec![date], 100.0, 0)
+    }
+
     #[test]
     fn compute_drag_move_snaps_to_grid_and_preserves_duration() {
         let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
         let state = DayDragState { zone: DayDragZone::Move, original_start: dt(date, 12, 0), original_end: dt(date, 13, 0) };
+        let (dates, width, index) = single_day(date);
 
-        let result = compute_day_drag_times(&state, 22.0, 1.0, Some(15));
+        let result = compute_day_drag_times(&state, 0.0, 22.0, 1.0, width, &dates, index, Some(15));
 
         assert_eq!(result.start, dt(date, 12, 15));
         assert_eq!(result.end, dt(date, 13, 15), "duration must stay exactly 1h");
@@ -8511,11 +8858,12 @@ mod day_view_layout_tests {
     fn compute_drag_move_unsnapped_tracks_the_pointer_continuously() {
         let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
         let state = DayDragState { zone: DayDragZone::Move, original_start: dt(date, 12, 0), original_end: dt(date, 13, 0) };
+        let (dates, width, index) = single_day(date);
 
         // `None` (live-feedback path): rounds to the nearest whole minute, not the
         // nearest `scale_minutes` gridline — a 7-minute drag lands on 12:07, not
         // snapped away to 12:00/12:15 the way `Some(15)` would.
-        let result = compute_day_drag_times(&state, 7.0, 1.0, None);
+        let result = compute_day_drag_times(&state, 0.0, 7.0, 1.0, width, &dates, index, None);
 
         assert_eq!(result.start, dt(date, 12, 7));
         assert_eq!(result.end, dt(date, 13, 7));
@@ -8525,8 +8873,9 @@ mod day_view_layout_tests {
     fn compute_drag_move_clamps_at_midnight() {
         let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
         let state = DayDragState { zone: DayDragZone::Move, original_start: dt(date, 0, 5), original_end: dt(date, 1, 5) };
+        let (dates, width, index) = single_day(date);
 
-        let result = compute_day_drag_times(&state, -1000.0, 1.0, Some(15));
+        let result = compute_day_drag_times(&state, 0.0, -1000.0, 1.0, width, &dates, index, Some(15));
 
         assert_eq!(result.start, dt(date, 0, 0), "can't move before the start of the day");
         assert_eq!(result.end, dt(date, 1, 0), "duration preserved even when clamped");
@@ -8536,8 +8885,9 @@ mod day_view_layout_tests {
     fn compute_drag_move_clamps_at_day_end() {
         let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
         let state = DayDragState { zone: DayDragZone::Move, original_start: dt(date, 22, 0), original_end: dt(date, 23, 0) };
+        let (dates, width, index) = single_day(date);
 
-        let result = compute_day_drag_times(&state, 1000.0, 1.0, Some(15));
+        let result = compute_day_drag_times(&state, 0.0, 1000.0, 1.0, width, &dates, index, Some(15));
 
         assert_eq!(result.start, dt(date, 23, 0), "can't move past the end of the day");
         assert_eq!(result.end, dt(date, 0, 0) + Duration::days(1), "clamped end lands exactly at midnight");
@@ -8547,8 +8897,9 @@ mod day_view_layout_tests {
     fn compute_drag_resize_top_moves_start_only() {
         let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
         let state = DayDragState { zone: DayDragZone::ResizeTop, original_start: dt(date, 12, 0), original_end: dt(date, 13, 0) };
+        let (dates, width, index) = single_day(date);
 
-        let result = compute_day_drag_times(&state, -22.0, 1.0, Some(15));
+        let result = compute_day_drag_times(&state, 0.0, -22.0, 1.0, width, &dates, index, Some(15));
 
         assert_eq!(result.start, dt(date, 11, 45));
         assert_eq!(result.end, dt(date, 13, 0), "end must not move");
@@ -8559,8 +8910,9 @@ mod day_view_layout_tests {
         let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
         // A short 20-minute event: dragging the start far down can't compress it past 15m.
         let state = DayDragState { zone: DayDragZone::ResizeTop, original_start: dt(date, 12, 0), original_end: dt(date, 12, 20) };
+        let (dates, width, index) = single_day(date);
 
-        let result = compute_day_drag_times(&state, 1000.0, 1.0, Some(15));
+        let result = compute_day_drag_times(&state, 0.0, 1000.0, 1.0, width, &dates, index, Some(15));
 
         assert_eq!(result.start, dt(date, 12, 5), "clamped to end minus the 15-minute floor");
         assert_eq!(result.end, dt(date, 12, 20));
@@ -8570,10 +8922,86 @@ mod day_view_layout_tests {
     fn compute_drag_resize_bottom_clamps_at_min_duration() {
         let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
         let state = DayDragState { zone: DayDragZone::ResizeBottom, original_start: dt(date, 12, 0), original_end: dt(date, 12, 20) };
+        let (dates, width, index) = single_day(date);
 
-        let result = compute_day_drag_times(&state, -1000.0, 1.0, Some(15));
+        let result = compute_day_drag_times(&state, 0.0, -1000.0, 1.0, width, &dates, index, Some(15));
 
         assert_eq!(result.start, dt(date, 12, 0));
         assert_eq!(result.end, dt(date, 12, 15), "clamped to start plus the 15-minute floor");
+    }
+
+    #[test]
+    fn compute_drag_move_crosses_into_the_next_column() {
+        let mon = NaiveDate::from_ymd_opt(2026, 9, 7).expect("valid date"); // a Monday
+        let dates: Vec<NaiveDate> = (0..5).map(|i| mon + Duration::days(i)).collect();
+        let state = DayDragState { zone: DayDragZone::Move, original_start: dt(mon, 12, 0), original_end: dt(mon, 13, 0) };
+
+        // One column width to the right, no vertical movement: lands on Tuesday at
+        // the same time, and `column_index` reflects the new column.
+        let result = compute_day_drag_times(&state, 100.0, 0.0, 1.0, 100.0, &dates, 0, Some(15));
+
+        assert_eq!(result.start, dt(dates[1], 12, 0));
+        assert_eq!(result.end, dt(dates[1], 13, 0));
+        assert_eq!(result.column_index, 1);
+    }
+
+    #[test]
+    fn compute_drag_move_column_crossing_skips_hidden_weekends() {
+        // `five_day_window` can produce non-contiguous dates when weekends are
+        // hidden (Friday's column is immediately followed by Monday's, a 3-day
+        // calendar gap) — the column index must drive the target day, not raw
+        // day-arithmetic on `offset_x`.
+        let fri = NaiveDate::from_ymd_opt(2026, 9, 4).expect("valid date");
+        let mon = NaiveDate::from_ymd_opt(2026, 9, 7).expect("valid date");
+        let dates = vec![fri, mon];
+        let state = DayDragState { zone: DayDragZone::Move, original_start: dt(fri, 12, 0), original_end: dt(fri, 13, 0) };
+
+        let result = compute_day_drag_times(&state, 100.0, 0.0, 1.0, 100.0, &dates, 0, Some(15));
+
+        assert_eq!(result.start, dt(mon, 12, 0), "crossing one column jumps the full Fri->Mon gap");
+        assert_eq!(result.column_index, 1);
+    }
+
+    #[test]
+    fn compute_drag_move_column_crossing_clamps_to_visible_range() {
+        let mon = NaiveDate::from_ymd_opt(2026, 9, 7).expect("valid date");
+        let dates: Vec<NaiveDate> = (0..5).map(|i| mon + Duration::days(i)).collect();
+        let state = DayDragState { zone: DayDragZone::Move, original_start: dt(mon, 12, 0), original_end: dt(mon, 13, 0) };
+
+        // Dragging far past the last visible column clamps to it rather than
+        // resolving to a date outside `dates`.
+        let result = compute_day_drag_times(&state, 10_000.0, 0.0, 1.0, 100.0, &dates, 0, Some(15));
+
+        assert_eq!(result.column_index, dates.len() - 1);
+        assert_eq!(result.start, dt(dates[dates.len() - 1], 12, 0));
+    }
+
+    #[test]
+    fn compute_drag_resize_ignores_horizontal_movement() {
+        let mon = NaiveDate::from_ymd_opt(2026, 9, 7).expect("valid date");
+        let dates: Vec<NaiveDate> = (0..5).map(|i| mon + Duration::days(i)).collect();
+        let state = DayDragState { zone: DayDragZone::ResizeBottom, original_start: dt(mon, 12, 0), original_end: dt(mon, 13, 0) };
+
+        // A large horizontal offset must not move a resize drag to another day.
+        let result = compute_day_drag_times(&state, 500.0, 0.0, 1.0, 100.0, &dates, 0, Some(15));
+
+        assert_eq!(result.column_index, 0);
+        assert_eq!(result.start.date_naive(), mon);
+        assert_eq!(result.end.date_naive(), mon);
+    }
+
+    #[test]
+    fn shift_date_string_preserves_time_of_day_for_timed_events() {
+        assert_eq!(shift_date_string("2026-09-01T12:30:00+00:00", 3).as_deref(), Some("2026-09-04T12:30:00+00:00"));
+    }
+
+    #[test]
+    fn shift_date_string_stays_a_plain_date_for_all_day_events() {
+        assert_eq!(shift_date_string("2026-09-01", 3).as_deref(), Some("2026-09-04"));
+    }
+
+    #[test]
+    fn shift_date_string_rejects_unparseable_input() {
+        assert_eq!(shift_date_string("not a date", 1), None);
     }
 }

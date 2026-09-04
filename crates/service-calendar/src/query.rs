@@ -792,6 +792,20 @@ pub fn dismiss_all_active(storage: &Storage) -> anyhow::Result<()> {
     })
 }
 
+/// The floating dialog's "Snooze all" action — snoozes every currently *active*
+/// firing until `until` in one statement. Unlike `dismiss_all_active`, this leaves
+/// already-`snoozed` rows alone: they aren't shown in the active card list, so
+/// there's nothing on screen to justify silently re-snoozing them further.
+pub fn snooze_all_active(storage: &Storage, until: DateTime<Utc>) -> anyhow::Result<()> {
+    storage.with_conn(|conn| {
+        conn.execute(
+            "UPDATE reminder_notifications SET status = 'snoozed', snoozed_until = ?1 WHERE status = 'active'",
+            rusqlite::params![until.to_rfc3339()],
+        )?;
+        Ok(())
+    })
+}
+
 /// Currently active (undismissed, not currently snoozed) firings — what the floating
 /// dialog's card list renders. Read fresh on every dialog rebuild rather than trusted
 /// to stay in sync with in-memory state, so the dialog is correct even right after the
@@ -1788,5 +1802,55 @@ mod tests {
         dismiss_all_active(&storage).expect("dismiss all");
         assert!(active_reminder_notifications(&storage).expect("query").is_empty());
         assert_eq!(recent_reminder_history(&storage, 10).expect("history").len(), 1);
+    }
+
+    #[test]
+    fn snooze_all_active_snoozes_every_active_row_but_leaves_already_snoozed_rows_alone() {
+        let storage = setup();
+        let calendar_id = seed_calendar(&storage, AccountId(1));
+        seed_event_with_reminder(&storage, calendar_id, "2026-09-05T09:00:00Z", 10);
+        let now = DateTime::parse_from_rfc3339("2026-09-05T09:00:00Z").unwrap().with_timezone(&Utc);
+        let due = due_reminders(&storage, now).expect("query");
+        let active_id = record_fired(&storage, &due[0]).expect("record");
+
+        // A second, already-snoozed row for a different event shouldn't be touched.
+        let other_event_id = seed_event_with_reminder(&storage, calendar_id, "2026-09-05T10:00:00Z", 10);
+        let snoozed_id: i64 = storage
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO reminder_notifications \
+                     (event_id, event_title, event_start, reminder_minutes, status, snoozed_until) \
+                     VALUES (?1, 'Standup', '2026-09-05T10:00:00Z', 10, 'snoozed', ?2)",
+                    rusqlite::params![other_event_id, (now + Duration::minutes(5)).to_rfc3339()],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .expect("seed snoozed row");
+
+        let until = now + Duration::minutes(15);
+        snooze_all_active(&storage, until).expect("snooze all");
+
+        assert!(active_reminder_notifications(&storage).expect("query").is_empty());
+        let snoozed_until: String = storage
+            .with_conn(|conn| {
+                Ok(conn.query_row(
+                    "SELECT snoozed_until FROM reminder_notifications WHERE id = ?1",
+                    [active_id],
+                    |r| r.get(0),
+                )?)
+            })
+            .expect("read snoozed_until");
+        assert_eq!(snoozed_until, until.to_rfc3339());
+
+        let untouched_snoozed_until: String = storage
+            .with_conn(|conn| {
+                Ok(conn.query_row(
+                    "SELECT snoozed_until FROM reminder_notifications WHERE id = ?1",
+                    [snoozed_id],
+                    |r| r.get(0),
+                )?)
+            })
+            .expect("read untouched snoozed_until");
+        assert_eq!(untouched_snoozed_until, (now + Duration::minutes(5)).to_rfc3339(), "already-snoozed row is left alone");
     }
 }
