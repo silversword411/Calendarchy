@@ -1737,6 +1737,9 @@ fn populate_month_grid(
                 let more = gtk4::Label::new(Some(&format!("{} more", day_events.len() - max_visible_events)));
                 more.set_halign(gtk4::Align::Start);
                 more.add_css_class("more-label");
+                more.set_cursor_from_name(Some("pointer"));
+                let all_day_events: Vec<DisplayEvent> = day_events.iter().map(|e| (*e).clone()).collect();
+                wire_day_summary_hover(&more, date, all_day_events, ctx);
                 cell.append(&more);
             }
         }
@@ -1907,6 +1910,124 @@ fn wire_event_click(row: &gtk4::Box, event: &DisplayEvent, ctx: &EventCtx) {
         pending_popover.set(Some(id));
     });
     row.add_controller(gesture);
+}
+
+/// Hover delay before a month cell's `"N more"` label pops out `show_day_summary_popover`
+/// — long enough that a mouse merely passing over the grid doesn't spawn popovers, short
+/// enough to feel responsive when it's the actual target.
+const DAY_SUMMARY_HOVER_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Grace period after the pointer leaves the `"more"` label (or the popover itself)
+/// before it actually closes — gives the pointer time to travel from the label into the
+/// popover without it flickering shut in between.
+const DAY_SUMMARY_HOVER_CLOSE_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Wires a month cell's `"N more"` label so hovering it pops out `show_day_summary_popover`
+/// for that day — the on-hover counterpart to `wire_event_click`'s on-click popover for a
+/// single event chip, letting a busy day's full event list be previewed without switching
+/// to Day view. `day_events` is the day's *entire* event list (not just the hidden tail),
+/// matching how Google Calendar's own month-view overflow popup works.
+///
+/// Uses the same `timeout_add_local_once` + `Rc<Cell<Option<SourceId>>>` debounce idiom
+/// `wire_event_click`/`install_day_event_drag` use for their click-vs-double-click timing,
+/// applied here to hover-in/hover-out instead: `pending_show` defers actually building the
+/// popover by `DAY_SUMMARY_HOVER_DELAY` so a pointer just passing over the label doesn't
+/// spawn one, and `pending_hide` defers popping it down by `DAY_SUMMARY_HOVER_CLOSE_DELAY`
+/// so moving from the label into the popover doesn't read as "left" in between. The same
+/// enter/leave pair is attached to both the label and the popover itself, so the popover
+/// only actually closes once the pointer has left *both*.
+fn wire_day_summary_hover(label: &gtk4::Label, date: NaiveDate, day_events: Vec<DisplayEvent>, ctx: &EventCtx) {
+    // Cancels a pending close (used on entering either the label or the popover — in
+    // both cases the popover, if any, should just stay open).
+    fn cancel_hide(pending_hide: &Rc<Cell<Option<gtk4::glib::SourceId>>>) {
+        if let Some(id) = pending_hide.take() {
+            id.remove();
+        }
+    }
+
+    // Schedules a close after `DAY_SUMMARY_HOVER_CLOSE_DELAY`, replacing any close
+    // already pending, if a popover is actually open (used on leaving either the label
+    // or the popover — either one, alone, might just be the pointer passing between
+    // them, so the close itself is deferred rather than immediate).
+    fn schedule_hide(open: &Rc<Cell<Option<gtk4::Popover>>>, pending_hide: &Rc<Cell<Option<gtk4::glib::SourceId>>>) {
+        let Some(popover) = open.take() else { return };
+        open.set(Some(popover));
+        cancel_hide(pending_hide);
+        let open = open.clone();
+        let id = gtk4::glib::timeout_add_local_once(DAY_SUMMARY_HOVER_CLOSE_DELAY, move || {
+            if let Some(popover) = open.take() {
+                popover.popdown();
+            }
+        });
+        pending_hide.set(Some(id));
+    }
+
+    let open: Rc<Cell<Option<gtk4::Popover>>> = Rc::new(Cell::new(None));
+    let pending_show: Rc<Cell<Option<gtk4::glib::SourceId>>> = Rc::new(Cell::new(None));
+    let pending_hide: Rc<Cell<Option<gtk4::glib::SourceId>>> = Rc::new(Cell::new(None));
+
+    let label_motion = gtk4::EventControllerMotion::new();
+    {
+        let label = label.clone();
+        let ctx = ctx.clone();
+        let open = open.clone();
+        let pending_show = pending_show.clone();
+        let pending_hide = pending_hide.clone();
+        label_motion.connect_enter(move |_, _, _| {
+            cancel_hide(&pending_hide);
+            // Already open, or already scheduled to open: nothing more to do.
+            if let Some(popover) = open.take() {
+                open.set(Some(popover));
+                return;
+            }
+            if let Some(id) = pending_show.take() {
+                pending_show.set(Some(id));
+                return;
+            }
+            let label = label.clone();
+            let date_events = day_events.clone();
+            let ctx = ctx.clone();
+            let open = open.clone();
+            let pending_hide = pending_hide.clone();
+            let pending_show_for_timer = pending_show.clone();
+            let id = gtk4::glib::timeout_add_local_once(DAY_SUMMARY_HOVER_DELAY, move || {
+                pending_show_for_timer.set(None);
+                let popover = show_day_summary_popover(&label, date, &date_events, &ctx);
+
+                // Hovering into the popover itself keeps it open the same way hovering
+                // the label does; only leaving *both* actually schedules a close.
+                let popover_motion = gtk4::EventControllerMotion::new();
+                {
+                    let pending_hide = pending_hide.clone();
+                    popover_motion.connect_enter(move |_, _, _| cancel_hide(&pending_hide));
+                }
+                {
+                    let open = open.clone();
+                    let pending_hide = pending_hide.clone();
+                    popover_motion.connect_leave(move |_| schedule_hide(&open, &pending_hide));
+                }
+                popover.add_controller(popover_motion);
+
+                let open_for_closed = open.clone();
+                popover.connect_closed(move |_| open_for_closed.set(None));
+
+                open.set(Some(popover));
+            });
+            pending_show.set(Some(id));
+        });
+    }
+    {
+        let open = open.clone();
+        let pending_show = pending_show.clone();
+        let pending_hide = pending_hide.clone();
+        label_motion.connect_leave(move |_| {
+            if let Some(id) = pending_show.take() {
+                id.remove();
+            }
+            schedule_hide(&open, &pending_hide);
+        });
+    }
+    label.add_controller(label_motion);
 }
 
 /// Makes a Month view event chip (built by `event_row`) draggable to another day cell —
@@ -3578,6 +3699,55 @@ fn show_event_popover(anchor: &gtk4::Box, event: &DisplayEvent, ctx: &EventCtx) 
     root.append(&body);
     popover.set_child(Some(&root));
     popover.popup();
+}
+
+/// Builds and pops up a month cell's "N more" hover card: `date`'s full event list (not
+/// just the hidden tail past `compute_max_visible_events`), each rendered as the same
+/// `event_row` chip the month grid itself uses and wired the same way
+/// (`wire_event_click`), so clicking one opens the normal `show_event_popover`/editor —
+/// this popover only adds a day-scoped preview, not a second way to view event details.
+/// Parented to `anchor` (the "N more" label) like `show_event_popover` is to its event
+/// row, and left un-autohidden by hover/leave logic entirely: the caller
+/// (`wire_day_summary_hover`) owns when this closes, via the returned `Popover`'s
+/// `.popdown()`. A day with many events scrolls (`max_content_height`) rather than
+/// growing the popover unboundedly.
+fn show_day_summary_popover(anchor: &gtk4::Label, date: NaiveDate, day_events: &[DisplayEvent], ctx: &EventCtx) -> gtk4::Popover {
+    let popover = gtk4::Popover::new();
+    popover.add_css_class("day-summary-popover");
+    popover.set_parent(anchor);
+    popover.connect_closed(|popover| popover.unparent());
+
+    let root = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    root.set_width_request(280);
+    root.set_margin_top(10);
+    root.set_margin_bottom(10);
+    root.set_margin_start(14);
+    root.set_margin_end(14);
+
+    let header = gtk4::Label::new(Some(&format_popover_date(date, ctx.date_format)));
+    header.add_css_class("day-summary-header");
+    header.set_halign(gtk4::Align::Start);
+    header.set_xalign(0.0);
+    root.append(&header);
+
+    let list = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+    for event in day_events {
+        let row = event_row(event, ctx.time_format);
+        wire_event_click(&row, event, ctx);
+        list.append(&row);
+    }
+
+    let scroller = gtk4::ScrolledWindow::builder()
+        .max_content_height(320)
+        .propagate_natural_height(true)
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .child(&list)
+        .build();
+    root.append(&scroller);
+
+    popover.set_child(Some(&root));
+    popover.popup();
+    popover
 }
 
 /// Pops up a "Delete event?" confirmation (GNOME HIG: a destructive action with no
@@ -8309,6 +8479,11 @@ fn load_static_css() {
             font-size: 0.8em;
             font-weight: 600;
             opacity: 0.75;
+        }
+        .day-summary-header {
+            font-size: 0.95em;
+            font-weight: 700;
+            margin-bottom: 4px;
         }
         .mini-calendar-title {
             font-weight: 600;
