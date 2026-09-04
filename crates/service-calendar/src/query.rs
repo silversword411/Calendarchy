@@ -580,6 +580,15 @@ fn reminders_json(reminders: &[EventReminder]) -> serde_json::Value {
     )
 }
 
+fn edits_payload(edits: &EventEdits) -> serde_json::Value {
+    serde_json::json!({
+        "title": edits.title, "description": edits.description, "location": edits.location,
+        "start": edits.start, "end": edits.end, "allDay": edits.all_day, "color": edits.color,
+        "reminders": reminders_json(&edits.reminders), "transparency": edits.busy.as_str(),
+        "visibility": edits.visibility.as_str(), "recurrence": edits.recurrence,
+    })
+}
+
 /// Applies an edit made in the dialog: updates the local `events` row immediately, so
 /// the UI reflects it right away (§9's optimistic-local-write pattern), and queues a
 /// `pending_edits` row so a future sync-engine push (§9, roadmap phase 3) has
@@ -592,6 +601,24 @@ pub fn update_event(
     edits: &EventEdits,
 ) -> anyhow::Result<()> {
     storage.with_conn(|conn| {
+        let (old_calendar_id, old_account_id, old_payload): (i64, i64, String) = conn.query_row(
+            "SELECT events.calendar_id, calendars.account_id, json_object(
+                'title', events.title, 'description', events.description, 'location', events.location,
+                'start', events.start, 'end', events.end, 'allDay', events.all_day, 'color', events.color,
+                'transparency', events.transparency, 'visibility', events.visibility,
+                'recurrence', CASE WHEN events.recurrence_rule IS NULL THEN NULL
+                    ELSE substr(events.recurrence_rule, 7) END, 'reminders', json('[]')
+             ) FROM events JOIN calendars ON calendars.id = events.calendar_id WHERE events.id = ?1",
+            [event_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let mut old_payload: serde_json::Value = serde_json::from_str(&old_payload)?;
+        old_payload["reminders"] = reminders_json(&load_reminders(conn, event_id)?);
+        conn.execute(
+            "INSERT INTO event_edit_history (event_id, account_id, calendar_id, payload)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![event_id, old_account_id, old_calendar_id, old_payload.to_string()],
+        )?;
         let recurrence_rule = edits.recurrence.as_deref().map(|r| format!("RRULE:{r}"));
         conn.execute(
             "UPDATE events SET
@@ -616,25 +643,60 @@ pub fn update_event(
         )?;
         replace_reminders(conn, event_id, &edits.reminders)?;
 
-        let payload = serde_json::json!({
-            "title": edits.title,
-            "description": edits.description,
-            "location": edits.location,
-            "start": edits.start,
-            "end": edits.end,
-            "allDay": edits.all_day,
-            "color": edits.color,
-            "reminders": reminders_json(&edits.reminders),
-            "transparency": edits.busy.as_str(),
-            "visibility": edits.visibility.as_str(),
-            "recurrence": edits.recurrence,
-        });
+        let payload = edits_payload(edits);
         conn.execute(
             "INSERT INTO pending_edits (account_id, calendar_id, event_id, operation, payload)
              VALUES (?1, ?2, ?3, 'update', ?4)",
             rusqlite::params![account_id.0, calendar_id, event_id, payload.to_string()],
         )?;
         Ok(())
+    })
+}
+
+/// Restores the most recent event edit and queues the inverse update.
+pub fn undo_last_event_edit(storage: &Storage) -> anyhow::Result<bool> {
+    storage.with_conn(|conn| {
+        let Some((history_id, event_id, account_id, calendar_id, payload)) = conn
+            .query_row(
+                "SELECT id, event_id, account_id, calendar_id, payload FROM event_edit_history
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((
+                    row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?, row.get::<_, String>(4)?,
+                )),
+            )
+            .optional()?
+        else { return Ok(false); };
+        let payload: serde_json::Value = serde_json::from_str(&payload)?;
+        let reminders = payload.get("reminders").and_then(serde_json::Value::as_array)
+            .cloned().unwrap_or_default().into_iter().map(|reminder| EventReminder {
+                method: ReminderMethod::parse(reminder.get("method").and_then(serde_json::Value::as_str).unwrap_or("popup")),
+                minutes: reminder.get("minutes").and_then(serde_json::Value::as_i64).unwrap_or_default(),
+            }).collect::<Vec<_>>();
+        conn.execute(
+            "UPDATE events SET calendar_id = ?1, title = ?2, description = ?3, location = ?4,
+                start = ?5, end = ?6, all_day = ?7, color = ?8, transparency = ?9,
+                visibility = ?10, recurrence_rule = ?11 WHERE id = ?12",
+            rusqlite::params![
+                calendar_id, payload["title"].as_str().unwrap_or_default(),
+                payload["description"].as_str().map(str::to_string),
+                payload["location"].as_str().map(str::to_string),
+                payload["start"].as_str().unwrap_or_default(), payload["end"].as_str().unwrap_or_default(),
+                payload["allDay"].as_bool().unwrap_or(false) as i64, payload["color"].as_str().map(str::to_string),
+                payload["transparency"].as_str().unwrap_or("opaque"),
+                payload["visibility"].as_str().unwrap_or("default"),
+                payload["recurrence"].as_str().map(|value| format!("RRULE:{value}")), event_id,
+            ],
+        )?;
+        replace_reminders(conn, event_id, &reminders)?;
+        conn.execute(
+            "INSERT INTO pending_edits (account_id, calendar_id, event_id, operation, payload)
+             VALUES (?1, ?2, ?3, 'update', ?4)",
+            rusqlite::params![account_id, calendar_id, event_id, payload.to_string()],
+        )?;
+        conn.execute("DELETE FROM event_edit_history WHERE id = ?1", [history_id])?;
+        Ok(true)
     })
 }
 
@@ -1711,6 +1773,36 @@ mod tests {
                 minutes: 5
             }]
         );
+    }
+
+    #[test]
+    fn undo_last_event_edit_restores_previous_values() {
+        let storage = setup();
+        let account_id = AccountId(1);
+        let calendar_id = storage.with_conn(|conn| {
+            upsert_calendar(conn, account_id, &CalendarListEntry {
+                id: "jane@gmail.com".into(), summary: "Jane".into(), background_color: None,
+                access_role: "owner".into(), primary: true,
+            })
+        }).expect("calendar");
+        let event_id = seed_event(&storage, calendar_id);
+        let edits = EventEdits {
+            title: "Changed".into(), description: Some("new".into()), location: None,
+            start: "2026-09-05T11:00:00-04:00".into(), end: "2026-09-05T11:30:00-04:00".into(),
+            all_day: false, color: None, reminders: vec![], busy: EventBusyStatus::Free,
+            visibility: EventVisibility::Public, recurrence: Some("FREQ=DAILY".into()),
+        };
+        update_event(&storage, event_id, calendar_id, account_id, &edits).expect("update");
+        assert!(undo_last_event_edit(&storage).expect("undo"));
+        let detail = event_detail(&storage, event_id).expect("query").expect("found");
+        assert_eq!(detail.title, "Standup");
+        assert_eq!(detail.description.as_deref(), Some("Daily sync"));
+        assert_eq!(detail.location.as_deref(), Some("Room 1"));
+        assert_eq!(detail.start, "2026-09-05T09:00:00-04:00");
+        assert_eq!(detail.busy, EventBusyStatus::Busy);
+        assert_eq!(detail.visibility, EventVisibility::Default);
+        assert_eq!(detail.recurrence, None);
+        assert!(!undo_last_event_edit(&storage).expect("empty undo"));
     }
 
     #[test]
