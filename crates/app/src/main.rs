@@ -3129,24 +3129,37 @@ fn event_row(event: &DisplayEvent, time_format: TimeFormat) -> gtk4::Box {
 /// `.day-event-block` CSS class (background/border/radius/declined-opacity already
 /// defined there) plus the same `css_class_for_color` classes every colored dot in this
 /// file draws from, so no new color CSS is needed. `clipped_start`/`clipped_end` (from
-/// `AllDayEventLayout`) each add a small chevron at that edge when true, showing the
-/// event's real range extends past the currently visible dates. Unlike
+/// `AllDayEventLayout`) turn that edge into an arrow head when true (Google Calendar's
+/// own cue that an event's real range continues past the currently visible dates): the
+/// body drops its rounded corners and border on that side
+/// (`.day-all-day-event-clipped-*`) and an `all_day_arrow_head` painted in the same
+/// color is placed beside it. GTK CSS can't clip a widget to a non-rectangular shape,
+/// which is why the arrow is a separate drawn sibling rather than part of the body —
+/// and why the returned widget is a wrapper `Box` around body + arrows rather than the
+/// body itself: the wrapper carries the click target, the pointer cursor, and the
+/// hover/declined opacity (`.day-all-day-bar`), so the arrow head fades and highlights
+/// in lockstep with the body instead of reading as a separate piece. Unlike
 /// `day_event_block`, this needs no absolute positioning: `populate_day_header` attaches
 /// it straight into a `Grid` cell (or cell span), which sizes it for us.
 fn all_day_event_bar(event: &DisplayEvent, clipped_start: bool, clipped_end: bool) -> gtk4::Box {
-    let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-    bar.add_css_class("day-event-block");
-    bar.add_css_class("day-all-day-event");
+    let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    bar.add_css_class("day-all-day-bar");
     if event.self_response_status == Some(AttendeeResponseStatus::Declined) {
         bar.add_css_class("event-declined");
     }
-    if let Some(color) = &event.color {
-        bar.add_css_class(&css_class_for_color(color));
-    }
     bar.set_cursor_from_name(Some("pointer"));
 
+    let body = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    body.add_css_class("day-event-block");
+    body.add_css_class("day-all-day-event");
+    if let Some(color) = &event.color {
+        body.add_css_class(&css_class_for_color(color));
+    }
+    body.set_hexpand(true);
+
     if clipped_start {
-        bar.append(&gtk4::Image::from_icon_name("go-previous-symbolic"));
+        body.add_css_class("day-all-day-event-clipped-start");
+        bar.append(&all_day_arrow_head(event.color.as_deref(), false));
     }
 
     let subject = gtk4::Label::new(Some(&event.title));
@@ -3154,17 +3167,61 @@ fn all_day_event_bar(event: &DisplayEvent, clipped_start: bool, clipped_end: boo
     subject.set_halign(gtk4::Align::Start);
     subject.set_hexpand(true);
     subject.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    bar.append(&subject);
+    body.append(&subject);
 
     if let Some(badges) = event_badge_row(event) {
-        bar.append(&badges);
+        body.append(&badges);
     }
 
+    bar.append(&body);
+
     if clipped_end {
-        bar.append(&gtk4::Image::from_icon_name("go-next-symbolic"));
+        body.add_css_class("day-all-day-event-clipped-end");
+        bar.append(&all_day_arrow_head(event.color.as_deref(), true));
     }
 
     bar
+}
+
+/// Width of the arrow head `all_day_arrow_head` draws at a clipped all-day bar's edge.
+const ALL_DAY_ARROW_WIDTH_PX: i32 = 10;
+
+/// The arrow head `all_day_event_bar` puts at a clipped edge: a `DrawingArea` as tall
+/// as the bar, filled with a triangle whose flat side sits flush against the bar body
+/// and whose tip points away from it (`points_right` picks the side), in the event's
+/// own `color` (the same hex `css_class_for_color` registers as the body's background,
+/// parsed here since a drawn shape can't take a CSS class; a color-less event gets a
+/// neutral grey). The two slanted edges get the same quarter-alpha black hairline as
+/// `.day-event-block`'s border so the outline continues unbroken around the point.
+fn all_day_arrow_head(color: Option<&str>, points_right: bool) -> gtk4::DrawingArea {
+    let area = gtk4::DrawingArea::new();
+    area.add_css_class("day-all-day-arrow");
+    area.set_content_width(ALL_DAY_ARROW_WIDTH_PX);
+    area.set_valign(gtk4::Align::Fill);
+    let fill = color
+        .and_then(|hex| gtk4::gdk::RGBA::parse(hex).ok())
+        .unwrap_or_else(|| gtk4::gdk::RGBA::new(0.5, 0.5, 0.5, 1.0));
+    area.set_draw_func(move |_, cr, width, height| {
+        let (w, h) = (f64::from(width), f64::from(height));
+        let (base_x, tip_x) = if points_right { (0.0, w) } else { (w, 0.0) };
+        cr.move_to(base_x, 0.0);
+        cr.line_to(tip_x, h / 2.0);
+        cr.line_to(base_x, h);
+        cr.close_path();
+        cr.set_source_rgba(f64::from(fill.red()), f64::from(fill.green()), f64::from(fill.blue()), f64::from(fill.alpha()));
+        let _ = cr.fill();
+
+        // Hairline on the two slanted edges only — the flat edge meets the body's own
+        // fill. Inset half a pixel so a 1px stroke isn't clipped at the area's bounds.
+        let tip_inset = if points_right { tip_x - 0.5 } else { tip_x + 0.5 };
+        cr.move_to(base_x, 0.5);
+        cr.line_to(tip_inset, h / 2.0);
+        cr.line_to(base_x, h - 0.5);
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.25);
+        cr.set_line_width(1.0);
+        let _ = cr.stroke();
+    });
+    area
 }
 
 /// Max gap `wire_event_click`/`install_day_event_drag` wait after a first click before
@@ -10442,6 +10499,33 @@ fn load_static_css() {
         .day-all-day-event {
             padding: 3px 8px;
         }
+        /* Wrapper around an all-day bar's body and its arrow head(s): owns the opacity
+           so body and arrow fade/highlight together (see `all_day_event_bar`). */
+        .day-all-day-bar {
+            opacity: 0.92;
+        }
+        .day-all-day-bar:hover {
+            opacity: 1;
+        }
+        .day-all-day-bar.event-declined {
+            opacity: 0.5;
+        }
+        /* A clipped edge squares off and loses its border so `all_day_arrow_head`'s
+           triangle continues the body's shape seamlessly. Written as a compound
+           selector so it outranks `.day-event-block`'s own `border-radius`/`border`
+           (declared further down; at equal specificity the later rule would win). */
+        .day-event-block.day-all-day-event-clipped-start {
+            border-top-left-radius: 0;
+            border-bottom-left-radius: 0;
+            border-left-width: 0;
+            padding-left: 3px;
+        }
+        .day-event-block.day-all-day-event-clipped-end {
+            border-top-right-radius: 0;
+            border-bottom-right-radius: 0;
+            border-right-width: 0;
+            padding-right: 3px;
+        }
         .day-all-day-column-divider {
             border-right: 1px solid alpha(currentColor, 0.12);
         }
@@ -10508,6 +10592,11 @@ fn load_static_css() {
         }
         .day-event-block.event-declined {
             opacity: 0.5;
+        }
+        /* Inside an all-day bar the wrapper `.day-all-day-bar` already applies the
+           opacity above; without this the body would multiply it in a second time. */
+        .day-all-day-bar .day-event-block {
+            opacity: 1;
         }
         .day-event-subject {
             font-size: 0.85em;
