@@ -10062,8 +10062,10 @@ fn load_static_css() {
            bar — the handle *is* the gap between the sidebar and main content cards
            (which carry no margin of their own on this shared edge), sized just wide
            enough to show the window background as a seam and stay grabbable. No
-           grip dots, no divider line by default; a faint highlight appears only on
-           hover/drag so the resize affordance is still discoverable. */
+           grip dots, no divider line, and nothing on plain mouseover either (a
+           highlighted seam read as a stray vertical line between the panes); the
+           resize cursor alone signals the handle, and a faint tint appears only
+           while actually dragging it. */
         paned > separator {
             background: none;
             background-image: none;
@@ -10071,7 +10073,7 @@ fn load_static_css() {
             box-shadow: none;
             min-width: 8px;
         }
-        paned > separator:hover, paned > separator:active {
+        paned > separator:active {
             background-color: alpha(currentColor, 0.08);
         }
         .notification-overlay-root {
