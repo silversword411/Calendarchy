@@ -716,8 +716,7 @@ impl Component for App {
         widgets.day_view_container.set_visible(matches!(model.current_view, ViewMode::Day | ViewMode::FiveDay));
 
         populate_month_grid(&widgets.month_grid, today, today, &events, &ctx);
-        populate_day_header(&widgets.day_header_box, &widgets.day_all_day_box, &[today], today, &events, &ctx);
-        populate_day_view(
+        let gutter_px = populate_day_view(
             &widgets.day_overlay,
             &[today],
             today,
@@ -728,6 +727,7 @@ impl Component for App {
             settings.day_drag_snap_ctrl_shift_minutes,
             settings.day_drag_hold_ms,
         );
+        populate_day_header(&widgets.day_header_box, &widgets.day_all_day_box, &[today], today, &events, &ctx, gutter_px);
         {
             // The sidebar's mini calendar isn't inside a popover of its own, so
             // there's nothing to accidentally close early here — jumping a month and
@@ -1154,8 +1154,9 @@ impl App {
             ViewMode::Custom => self.custom_view_dates.clone(),
             ViewMode::Day | ViewMode::Month => vec![self.current_date],
         };
-        populate_day_header(&widgets.day_header_box, &widgets.day_all_day_box, &day_view_dates, today, &events, &ctx);
-        populate_day_view(
+        // Day view body first: it measures the hour grid's real gutter width, which
+        // the header row and all-day strip then align their own gutter column to.
+        let gutter_px = populate_day_view(
             &widgets.day_overlay,
             &day_view_dates,
             today,
@@ -1165,6 +1166,15 @@ impl App {
             settings.day_drag_snap_ctrl_minutes,
             settings.day_drag_snap_ctrl_shift_minutes,
             settings.day_drag_hold_ms,
+        );
+        populate_day_header(
+            &widgets.day_header_box,
+            &widgets.day_all_day_box,
+            &day_view_dates,
+            today,
+            &events,
+            &ctx,
+            gutter_px,
         );
         {
             let jump = jump_to_date_callback(sender);
@@ -3119,24 +3129,37 @@ fn event_row(event: &DisplayEvent, time_format: TimeFormat) -> gtk4::Box {
 /// `.day-event-block` CSS class (background/border/radius/declined-opacity already
 /// defined there) plus the same `css_class_for_color` classes every colored dot in this
 /// file draws from, so no new color CSS is needed. `clipped_start`/`clipped_end` (from
-/// `AllDayEventLayout`) each add a small chevron at that edge when true, showing the
-/// event's real range extends past the currently visible dates. Unlike
+/// `AllDayEventLayout`) turn that edge into an arrow head when true (Google Calendar's
+/// own cue that an event's real range continues past the currently visible dates): the
+/// body drops its rounded corners and border on that side
+/// (`.day-all-day-event-clipped-*`) and an `all_day_arrow_head` painted in the same
+/// color is placed beside it. GTK CSS can't clip a widget to a non-rectangular shape,
+/// which is why the arrow is a separate drawn sibling rather than part of the body —
+/// and why the returned widget is a wrapper `Box` around body + arrows rather than the
+/// body itself: the wrapper carries the click target, the pointer cursor, and the
+/// hover/declined opacity (`.day-all-day-bar`), so the arrow head fades and highlights
+/// in lockstep with the body instead of reading as a separate piece. Unlike
 /// `day_event_block`, this needs no absolute positioning: `populate_day_header` attaches
 /// it straight into a `Grid` cell (or cell span), which sizes it for us.
 fn all_day_event_bar(event: &DisplayEvent, clipped_start: bool, clipped_end: bool) -> gtk4::Box {
-    let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-    bar.add_css_class("day-event-block");
-    bar.add_css_class("day-all-day-event");
+    let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    bar.add_css_class("day-all-day-bar");
     if event.self_response_status == Some(AttendeeResponseStatus::Declined) {
         bar.add_css_class("event-declined");
     }
-    if let Some(color) = &event.color {
-        bar.add_css_class(&css_class_for_color(color));
-    }
     bar.set_cursor_from_name(Some("pointer"));
 
+    let body = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    body.add_css_class("day-event-block");
+    body.add_css_class("day-all-day-event");
+    if let Some(color) = &event.color {
+        body.add_css_class(&css_class_for_color(color));
+    }
+    body.set_hexpand(true);
+
     if clipped_start {
-        bar.append(&gtk4::Image::from_icon_name("go-previous-symbolic"));
+        body.add_css_class("day-all-day-event-clipped-start");
+        bar.append(&all_day_arrow_head(event.color.as_deref(), false));
     }
 
     let subject = gtk4::Label::new(Some(&event.title));
@@ -3144,17 +3167,61 @@ fn all_day_event_bar(event: &DisplayEvent, clipped_start: bool, clipped_end: boo
     subject.set_halign(gtk4::Align::Start);
     subject.set_hexpand(true);
     subject.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    bar.append(&subject);
+    body.append(&subject);
 
     if let Some(badges) = event_badge_row(event) {
-        bar.append(&badges);
+        body.append(&badges);
     }
 
+    bar.append(&body);
+
     if clipped_end {
-        bar.append(&gtk4::Image::from_icon_name("go-next-symbolic"));
+        body.add_css_class("day-all-day-event-clipped-end");
+        bar.append(&all_day_arrow_head(event.color.as_deref(), true));
     }
 
     bar
+}
+
+/// Width of the arrow head `all_day_arrow_head` draws at a clipped all-day bar's edge.
+const ALL_DAY_ARROW_WIDTH_PX: i32 = 10;
+
+/// The arrow head `all_day_event_bar` puts at a clipped edge: a `DrawingArea` as tall
+/// as the bar, filled with a triangle whose flat side sits flush against the bar body
+/// and whose tip points away from it (`points_right` picks the side), in the event's
+/// own `color` (the same hex `css_class_for_color` registers as the body's background,
+/// parsed here since a drawn shape can't take a CSS class; a color-less event gets a
+/// neutral grey). The two slanted edges get the same quarter-alpha black hairline as
+/// `.day-event-block`'s border so the outline continues unbroken around the point.
+fn all_day_arrow_head(color: Option<&str>, points_right: bool) -> gtk4::DrawingArea {
+    let area = gtk4::DrawingArea::new();
+    area.add_css_class("day-all-day-arrow");
+    area.set_content_width(ALL_DAY_ARROW_WIDTH_PX);
+    area.set_valign(gtk4::Align::Fill);
+    let fill = color
+        .and_then(|hex| gtk4::gdk::RGBA::parse(hex).ok())
+        .unwrap_or_else(|| gtk4::gdk::RGBA::new(0.5, 0.5, 0.5, 1.0));
+    area.set_draw_func(move |_, cr, width, height| {
+        let (w, h) = (f64::from(width), f64::from(height));
+        let (base_x, tip_x) = if points_right { (0.0, w) } else { (w, 0.0) };
+        cr.move_to(base_x, 0.0);
+        cr.line_to(tip_x, h / 2.0);
+        cr.line_to(base_x, h);
+        cr.close_path();
+        cr.set_source_rgba(f64::from(fill.red()), f64::from(fill.green()), f64::from(fill.blue()), f64::from(fill.alpha()));
+        let _ = cr.fill();
+
+        // Hairline on the two slanted edges only — the flat edge meets the body's own
+        // fill. Inset half a pixel so a 1px stroke isn't clipped at the area's bounds.
+        let tip_inset = if points_right { tip_x - 0.5 } else { tip_x + 0.5 };
+        cr.move_to(base_x, 0.5);
+        cr.line_to(tip_inset, h / 2.0);
+        cr.line_to(base_x, h - 0.5);
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.25);
+        cr.set_line_width(1.0);
+        let _ = cr.stroke();
+    });
+    area
 }
 
 /// Max gap `wire_event_click`/`install_day_event_drag` wait after a first click before
@@ -3487,9 +3554,16 @@ fn commit_month_drag(event_id: i64, target_date: NaiveDate, ctx: &EventCtx) {
 /// view is meant to scroll rather than shrink events to fit.
 const DAY_ROW_HEIGHT_PX: i32 = 60;
 
-/// Width reserved for the Day view's left-hand hour-label gutter (`populate_day_hour_grid`)
-/// — also used to align the header row's timezone label and to offset event blocks/the
-/// current-time line past the labels.
+/// *Minimum* width of the Day view's left-hand hour-label gutter (`populate_day_hour_grid`
+/// column 0). Only a floor: each hour label gets this as its `width_request`, but a
+/// label whose text plus `.day-hour-label` padding is wider (e.g. "11:00 PM" at a
+/// larger system font) makes `GtkGrid` widen the whole column to its natural width. So
+/// the gutter's *real* width is whatever the widest label measures, which
+/// `populate_day_hour_grid` returns — and that measured value, never this constant, is
+/// what the header row's timezone label, the all-day strip's gutter column, and the
+/// event blocks/current-time line all align to. Using this constant directly for those
+/// was exactly what left the all-day strip's dividers a few pixels left of the hour
+/// grid's whenever the labels overflowed 52px.
 const GUTTER_WIDTH_PX: i32 = 52;
 
 /// The allowed values for `AppSettings::day_time_scale_minutes` (§12's Time scale
@@ -3666,10 +3740,12 @@ fn build_view_switcher_popover(sender: &ComponentSender<App>, storage: &Storage)
 /// several dates this centering trick doesn't apply (each cell already evenly divides
 /// the remaining width, matching `populate_day_hour_grid`'s per-day hour cells), so the
 /// spacer is omitted. Also (re)builds the all-day strip directly underneath from any
-/// `all_day` events overlapping `dates` — a `gtk4::Grid` sharing the exact column
-/// scheme `populate_day_hour_grid` uses (a `GUTTER_WIDTH_PX` column 0, one hexpand
-/// column per date after it), so a bar's edges land exactly under the hour grid's day
-/// dividers instead of drifting the way three independently-laid-out containers could.
+/// `all_day` events overlapping `dates` — a column-homogeneous `gtk4::Grid` with one
+/// column per date, indented by `gutter_px` (the width `populate_day_hour_grid`'s label
+/// column actually measured, see `GUTTER_WIDTH_PX`), so a bar's edges land exactly
+/// under the hour grid's day columns instead of drifting the way three
+/// independently-laid-out containers could. Callers therefore run `populate_day_view`
+/// first and pass the gutter width it returns.
 /// `layout_all_day_events` computes each event's row/column span (clipped to `dates`,
 /// with multi-day events spanning every column they cover via `Grid::attach`'s
 /// `width` — a single widget rather than one per day, so the strip reads as one
@@ -3683,12 +3759,13 @@ fn populate_day_header(
     today: NaiveDate,
     events: &[DisplayEvent],
     ctx: &EventCtx,
+    gutter_px: i32,
 ) {
     clear_children(header);
 
     let tz_label = gtk4::Label::new(Some(&system_timezone_abbreviation(Local::now())));
     tz_label.add_css_class("day-tz-label");
-    tz_label.set_width_request(GUTTER_WIDTH_PX);
+    tz_label.set_width_request(gutter_px);
     tz_label.set_halign(gtk4::Align::Start);
     tz_label.set_valign(gtk4::Align::End);
     header.append(&tz_label);
@@ -3699,10 +3776,6 @@ fn populate_day_header(
         day_cell.set_halign(gtk4::Align::Center);
         day_cell.set_margin_top(4);
         day_cell.set_margin_bottom(4);
-        if dates.len() > 1 {
-            day_cell.add_css_class("day-header-cell");
-        }
-
         let weekday_label = gtk4::Label::new(Some(&date.format("%a").to_string().to_uppercase()));
         weekday_label.add_css_class("day-header-weekday");
         if date == today {
@@ -3724,31 +3797,53 @@ fn populate_day_header(
         // Balances the leading `tz_label` gutter so the single day cell is centered
         // over the hour grid's event column rather than the whole header row.
         let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        spacer.set_width_request(GUTTER_WIDTH_PX);
+        spacer.set_width_request(gutter_px);
         header.append(&spacer);
     }
 
     clear_children(all_day);
+    all_day.set_column_spacing(0);
+    // Homogeneous columns, one per date, so each gets exactly 1/N of the strip's width
+    // no matter what's in it. A plain (non-homogeneous) `GtkGrid` grants every column
+    // its content's *natural* width before sharing out the rest, so a column holding a
+    // long-titled bar ("Company Holiday" plus its badge row) came out ~150px wider
+    // than its empty neighbours and nothing lined up with the hour grid below. The
+    // gutter can't be a column of a homogeneous grid (it'd be forced to the same width
+    // as a day), so it's a start margin instead — `gutter_px`, the width the hour
+    // grid's label column actually measured. Both grids then split the same remaining
+    // width the same way (equal shares, leftover pixels to the leftmost columns), so
+    // each all-day column boundary lands on the hour grid's matching divider.
+    all_day.set_column_homogeneous(true);
+    all_day.set_margin_start(gutter_px);
+    all_day.set_hexpand(true);
 
-    // Row 0 is a "pinning" row that's never used for event bars: a `GtkGrid` only
-    // sizes a column from cells that actually touch it, so without this, a date with
-    // no all-day events of its own (and no spanning bar crossing it) would collapse to
-    // zero width instead of matching `header`/the hour grid's column for that date.
-    let gutter_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    gutter_spacer.set_width_request(GUTTER_WIDTH_PX);
-    all_day.attach(&gutter_spacer, 0, 0, 1, 1);
+    // Row 0 is a "pinning" row that's never used for event bars: a `GtkGrid` (even a
+    // homogeneous one) skips columns no cell touches, so without this, a date with no
+    // all-day events of its own (and no spanning bar crossing it) would collapse to
+    // zero width instead of taking its equal share.
     for day_index in 0..dates.len() {
         let day_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         day_spacer.set_hexpand(true);
         day_spacer.set_size_request(-1, 0);
-        all_day.attach(&day_spacer, 1 + day_index as i32, 0, 1, 1);
+        all_day.attach(&day_spacer, day_index as i32, 0, 1, 1);
     }
 
     let layout = layout_all_day_events(events, dates);
+    // Column dividers between adjacent dates, each spanning every row (the pinning
+    // row plus all bar rows) so the line runs the strip's full height and reads as a
+    // continuation of the hour grid's `.day-hour-cell-divider` below. Attached before
+    // the bars so a bar that crosses a boundary draws over the line, not under it.
+    let row_count = 1 + layout.iter().map(|item| item.row + 1).max().unwrap_or(0);
+    for day_index in 0..dates.len().saturating_sub(1) {
+        let divider = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        divider.add_css_class("day-all-day-column-divider");
+        divider.set_valign(gtk4::Align::Fill);
+        all_day.attach(&divider, day_index as i32, 0, 1, row_count as i32);
+    }
     for item in &layout {
         let bar = all_day_event_bar(item.event, item.clipped_start, item.clipped_end);
         wire_event_click(&bar, item.event, ctx);
-        all_day.attach(&bar, 1 + item.start_col as i32, 1 + item.row as i32, item.span_cols as i32, 1);
+        all_day.attach(&bar, item.start_col as i32, 1 + item.row as i32, item.span_cols as i32, 1);
     }
     all_day.set_visible(!layout.is_empty());
 }
@@ -3783,19 +3878,28 @@ fn day_hour_mark_tier(minute_of_hour: i64) -> DayHourMarkTier {
 /// finer residual tick a 5- or 10-minute scale adds, and blank at midnight — matching
 /// Google Calendar's own day view, which doesn't label the very top edge), each styled
 /// per `DayHourMarkTier` so hour labels read as most significant, then half-hour, then
-/// quarter-hour. `day_count` bordered cells to its right (one per day column; `1` for
-/// `ViewMode::Day`, `5` for `ViewMode::FiveDay`) draw that row's line, its border weight
-/// following the same tier (heaviest on the hour, lightest for a finer residual tick),
-/// plus a right-border divider between adjacent day columns when `day_count > 1`. Each
+/// quarter-hour. `day_count` cells to its right (one per day column; `1` for
+/// `ViewMode::Day`, `5` for `ViewMode::FiveDay`) draw that row's horizontal line, its
+/// weight following the same tier (heaviest on the hour, lightest for a finer residual tick). Each
 /// row is `DAY_ROW_HEIGHT_PX` tall regardless of the grid's allocated size, since
 /// (unlike `populate_month_grid`'s row-homogeneous stretch-to-fit grid) the Day view is
 /// meant to scroll, not shrink events to fit — so a finer `scale_minutes` (more, shorter
 /// intervals) makes the whole grid taller rather than each row shorter. Called on every
-/// `App::refresh` (cheap: no measurement pass like `compute_max_visible_events` needs,
-/// just plain fixed-size widgets).
-fn populate_day_hour_grid(grid: &gtk4::Grid, time_format: TimeFormat, scale_minutes: i64, day_count: usize) {
+/// `App::refresh`.
+///
+/// Returns the label column's resulting width in pixels: the widest label's natural
+/// width (measured right after attaching it, so its `.day-hour-label` CSS padding is
+/// already in — GTK resolves a fresh node's style lazily on first measure), never
+/// less than `GUTTER_WIDTH_PX`. That's exactly the width `GtkGrid` will allocate
+/// column 0 (a non-expanding column gets its natural width before any leftover goes to
+/// the hexpand day columns), so everything that has to line up with the day columns —
+/// the header/all-day strip via `populate_day_header`, the overlay children via
+/// `day_column_geometries` — keys off this value rather than the constant.
+fn populate_day_hour_grid(grid: &gtk4::Grid, time_format: TimeFormat, scale_minutes: i64, day_count: usize) -> i32 {
     clear_children(grid);
+    grid.set_column_spacing(0);
 
+    let mut gutter_px = GUTTER_WIDTH_PX;
     let row_count = 24 * 60 / scale_minutes;
     for row in 0..row_count {
         let minute_of_day = row * scale_minutes;
@@ -3824,6 +3928,8 @@ fn populate_day_hour_grid(grid: &gtk4::Grid, time_format: TimeFormat, scale_minu
         label.set_valign(gtk4::Align::Start);
         label.set_width_request(GUTTER_WIDTH_PX);
         grid.attach(&label, 0, row as i32, 1, 1);
+        let (_, natural_width, _, _) = label.measure(gtk4::Orientation::Horizontal, -1);
+        gutter_px = gutter_px.max(natural_width);
 
         for day_index in 0..day_count {
             let cell = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -3846,6 +3952,7 @@ fn populate_day_hour_grid(grid: &gtk4::Grid, time_format: TimeFormat, scale_minu
             grid.attach(&cell, 1 + day_index as i32, row as i32, 1, 1);
         }
     }
+    gutter_px
 }
 
 /// Removes every overlay child `populate_day_view` previously added on top of the
@@ -3877,7 +3984,8 @@ fn clear_day_overlay_extras(overlay: &gtk4::Overlay) {
 /// offset, confined to that date's column. Safe to call on every `App::refresh`, like
 /// every other `populate_*` function in this file. With `dates.len() == 1` this
 /// computes the exact same single day-column geometry as before generalizing to N
-/// days.
+/// days. Returns the hour grid's measured gutter width (see `populate_day_hour_grid`)
+/// so the caller can hand it to `populate_day_header`.
 fn populate_day_view(
     overlay: &gtk4::Overlay,
     dates: &[NaiveDate],
@@ -3888,31 +3996,28 @@ fn populate_day_view(
     ctrl_snap_minutes: i64,
     ctrl_shift_snap_minutes: i64,
     hold_ms: i64,
-) {
+) -> i32 {
     // The grid itself is the Overlay's persistent main child (declared in the `view!`
     // macro), so only its own children get cleared/rebuilt here — `Overlay`'s other
     // children (the previous call's now-line/dot/event blocks) go through
     // `clear_day_overlay_extras` instead.
-    if let Some(grid) = overlay.child().and_downcast::<gtk4::Grid>() {
-        populate_day_hour_grid(&grid, ctx.time_format, scale_minutes, dates.len());
-    }
+    let gutter_px = match overlay.child().and_downcast::<gtk4::Grid>() {
+        Some(grid) => populate_day_hour_grid(&grid, ctx.time_format, scale_minutes, dates.len()),
+        None => GUTTER_WIDTH_PX,
+    };
     clear_day_overlay_extras(overlay);
 
     let pixels_per_minute = DAY_ROW_HEIGHT_PX as f64 / scale_minutes as f64;
-    let day_count = dates.len().max(1) as i32;
     // `overlay.width()` reads 0 before the window's first real layout pass (same
     // Wayland/compositor-round-trip issue `compute_max_visible_events` documents for
     // the month grid's height) — `init`'s size-polling timer and the `default-width`
     // resize watcher both re-run this function once a real width is available, so a
     // brief undersized first frame self-corrects rather than needing special-casing
     // here.
-    let total_columns_width = (overlay.width() - GUTTER_WIDTH_PX - 8).max(60 * day_count);
-    let day_column_width = total_columns_width / day_count;
+    let columns = day_column_geometries(overlay.width(), gutter_px, dates.len());
 
-    for (day_index, &date) in dates.iter().enumerate() {
-        let day_x_offset = GUTTER_WIDTH_PX + day_index as i32 * day_column_width;
+    for (day_index, (&date, &column)) in dates.iter().zip(&columns).enumerate() {
         let date_key = date.format("%Y-%m-%d").to_string();
-        let column = DayColumnGeometry { width_px: day_column_width, x_offset_px: day_x_offset };
         for layout in layout_day_events(events, &date_key) {
             day_event_block(
                 overlay,
@@ -3939,12 +4044,12 @@ fn populate_day_view(
             line.add_css_class("day-now-line");
             line.set_valign(gtk4::Align::Start);
             line.set_margin_top(now_px);
-            line.set_margin_start(day_x_offset);
+            line.set_margin_start(column.x_offset_px);
             if dates.len() == 1 {
                 line.set_halign(gtk4::Align::Fill);
             } else {
                 line.set_halign(gtk4::Align::Start);
-                line.set_size_request(day_column_width, -1);
+                line.set_size_request(column.width_px, -1);
             }
             overlay.add_overlay(&line);
 
@@ -3953,10 +4058,11 @@ fn populate_day_view(
             dot.set_valign(gtk4::Align::Start);
             dot.set_halign(gtk4::Align::Start);
             dot.set_margin_top(now_px - 4);
-            dot.set_margin_start(day_x_offset - 4);
+            dot.set_margin_start(column.x_offset_px - 4);
             overlay.add_overlay(&dot);
         }
     }
+    gutter_px
 }
 
 /// The most columns overlapping events on the same day split into — beyond this,
@@ -4118,14 +4224,44 @@ fn layout_all_day_events<'a>(events: &'a [DisplayEvent], dates: &[NaiveDate]) ->
 
 /// One day's horizontal slot within the Day/5-day view's hour grid — `width_px` is
 /// that day's share of the grid's total width (the whole width for `ViewMode::Day`,
-/// one-fifth of it for `ViewMode::FiveDay`), `x_offset_px` is where that slot starts
-/// (`GUTTER_WIDTH_PX` for the single Day-view column, or that plus the day's index
-/// times `width_px` for a 5-day column). Bundled into one struct, rather than two
-/// more `day_event_block` parameters, to keep its argument count down.
-#[derive(Clone, Copy)]
+/// about one-fifth of it for `ViewMode::FiveDay`), `x_offset_px` is where that slot
+/// starts (the measured gutter width for the single Day-view column, or that plus the
+/// preceding columns' widths for a 5-day column — see `day_column_geometries`).
+/// Bundled into one struct, rather than two more `day_event_block` parameters, to keep
+/// its argument count down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DayColumnGeometry {
     width_px: i32,
     x_offset_px: i32,
+}
+
+/// Splits the hour grid's allocated `overlay_width` into one `DayColumnGeometry` per
+/// day, reproducing exactly how `GtkGrid` lays out `populate_day_hour_grid`'s columns:
+/// column 0 takes `gutter_px` (its natural width, which a non-expanding column is
+/// granted before any leftover is shared out), and what remains is divided among the
+/// `day_count` hexpand day columns — with the `remaining % day_count` pixels the
+/// integer division can't split going one each to the *leftmost* columns, which is the
+/// order `GtkGrid` hands out its remainder in. Reproducing that split, rather than a
+/// uniform `total / day_count` (or the previous version's guessed `- 8` for a scrollbar
+/// this overlay-scrolling `ScrolledWindow` never reserves), keeps every
+/// absolutely-positioned overlay child — event blocks, the current-time line and dot —
+/// on the same pixel as the gridline it belongs to, all the way to the last column.
+/// Floors the day columns at 60px each so a not-yet-laid-out first frame
+/// (`overlay_width == 0`, see `populate_day_view`) still yields usable geometry.
+fn day_column_geometries(overlay_width: i32, gutter_px: i32, day_count: usize) -> Vec<DayColumnGeometry> {
+    let day_count = day_count.max(1);
+    let total = (overlay_width - gutter_px).max(60 * day_count as i32);
+    let base = total / day_count as i32;
+    let remainder = (total % day_count as i32) as usize;
+    let mut x_offset_px = gutter_px;
+    (0..day_count)
+        .map(|index| {
+            let width_px = base + i32::from(index < remainder);
+            let column = DayColumnGeometry { width_px, x_offset_px };
+            x_offset_px += width_px;
+            column
+        })
+        .collect()
 }
 
 /// Threshold `day_event_block` collapses its time bubble to start-only at: below this
@@ -9926,8 +10062,10 @@ fn load_static_css() {
            bar — the handle *is* the gap between the sidebar and main content cards
            (which carry no margin of their own on this shared edge), sized just wide
            enough to show the window background as a seam and stay grabbable. No
-           grip dots, no divider line by default; a faint highlight appears only on
-           hover/drag so the resize affordance is still discoverable. */
+           grip dots, no divider line, and nothing on plain mouseover either (a
+           highlighted seam read as a stray vertical line between the panes); the
+           resize cursor alone signals the handle, and a faint tint appears only
+           while actually dragging it. */
         paned > separator {
             background: none;
             background-image: none;
@@ -9935,7 +10073,7 @@ fn load_static_css() {
             box-shadow: none;
             min-width: 8px;
         }
-        paned > separator:hover, paned > separator:active {
+        paned > separator:active {
             background-color: alpha(currentColor, 0.08);
         }
         .notification-overlay-root {
@@ -10313,6 +10451,16 @@ fn load_static_css() {
         }
         .day-header-row {
             padding: 4px 0 2px 0;
+            border: none;
+            background-color: transparent;
+        }
+        .day-header-row * {
+            border: none;
+            border-left: none;
+            border-right: none;
+            background-image: none;
+            box-shadow: none;
+            background-color: transparent;
         }
         .day-tz-label {
             font-size: 0.68em;
@@ -10344,12 +10492,43 @@ fn load_static_css() {
             padding: 2px;
         }
         .day-all-day-strip {
-            padding: 2px 4px 6px 0;
+            /* No horizontal padding: the strip's grid must span exactly the same width
+               as the hour grid below it, or its day columns (and their dividers) come
+               out fractionally narrower and drift left of the hour grid's toward the
+               last column. */
+            padding: 2px 0 6px 0;
         }
         .day-all-day-event {
             padding: 3px 8px;
         }
-        .day-header-cell {
+        /* Wrapper around an all-day bar's body and its arrow head(s): owns the opacity
+           so body and arrow fade/highlight together (see `all_day_event_bar`). */
+        .day-all-day-bar {
+            opacity: 0.92;
+        }
+        .day-all-day-bar:hover {
+            opacity: 1;
+        }
+        .day-all-day-bar.event-declined {
+            opacity: 0.5;
+        }
+        /* A clipped edge squares off and loses its border so `all_day_arrow_head`'s
+           triangle continues the body's shape seamlessly. Written as a compound
+           selector so it outranks `.day-event-block`'s own `border-radius`/`border`
+           (declared further down; at equal specificity the later rule would win). */
+        .day-event-block.day-all-day-event-clipped-start {
+            border-top-left-radius: 0;
+            border-bottom-left-radius: 0;
+            border-left-width: 0;
+            padding-left: 3px;
+        }
+        .day-event-block.day-all-day-event-clipped-end {
+            border-top-right-radius: 0;
+            border-bottom-right-radius: 0;
+            border-right-width: 0;
+            padding-right: 3px;
+        }
+        .day-all-day-column-divider {
             border-right: 1px solid alpha(currentColor, 0.12);
         }
         .day-hour-label {
@@ -10367,6 +10546,17 @@ fn load_static_css() {
         }
         .day-hour-cell {
             border-top: 1px solid alpha(currentColor, 0.12);
+            border-bottom: none;
+            border-left: none;
+            border-right: none;
+            background-image: none;
+            box-shadow: none;
+        }
+        .day-hour-grid * {
+            border-left: none;
+            border-right: none;
+            background-image: none;
+            box-shadow: none;
         }
         .day-hour-cell-first {
             border-top: none;
@@ -10404,6 +10594,11 @@ fn load_static_css() {
         }
         .day-event-block.event-declined {
             opacity: 0.5;
+        }
+        /* Inside an all-day bar the wrapper `.day-all-day-bar` already applies the
+           opacity above; without this the body would multiply it in a second time. */
+        .day-all-day-bar .day-event-block {
+            opacity: 1;
         }
         .day-event-subject {
             font-size: 0.85em;
@@ -10615,6 +10810,35 @@ mod day_view_layout_tests {
         let mut event = ev(id, start_date, end_date_exclusive);
         event.all_day = true;
         event
+    }
+
+    #[test]
+    fn day_column_geometries_match_gtk_grid_split() {
+        // 1004px overlay, 57px gutter → 947px for 5 hexpand columns: 189 each plus a
+        // 2px remainder that GtkGrid gives to the first two columns, one pixel each.
+        let columns = day_column_geometries(1004, 57, 5);
+        assert_eq!(columns.len(), 5);
+        assert_eq!(columns.iter().map(|c| c.width_px).collect::<Vec<_>>(), vec![190, 190, 189, 189, 189]);
+        assert_eq!(columns[0].x_offset_px, 57, "first day column starts right after the gutter");
+        for pair in columns.windows(2) {
+            assert_eq!(pair[1].x_offset_px, pair[0].x_offset_px + pair[0].width_px, "columns must tile with no gaps");
+        }
+        let last = columns.last().unwrap();
+        assert_eq!(last.x_offset_px + last.width_px, 1004, "columns must fill the overlay exactly");
+    }
+
+    #[test]
+    fn day_column_geometries_single_day_takes_everything_past_the_gutter() {
+        assert_eq!(day_column_geometries(800, 52, 1), vec![DayColumnGeometry { width_px: 748, x_offset_px: 52 }]);
+    }
+
+    #[test]
+    fn day_column_geometries_floors_an_unlaid_out_first_frame() {
+        // Width 0 (before the first real layout pass) still yields 60px-per-day columns
+        // rather than zero/negative widths.
+        let columns = day_column_geometries(0, 52, 5);
+        assert!(columns.iter().all(|c| c.width_px == 60));
+        assert_eq!(columns[4].x_offset_px, 52 + 4 * 60);
     }
 
     #[test]
