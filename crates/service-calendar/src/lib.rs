@@ -164,6 +164,15 @@ impl Service for CalendarService {
                 attempt_count  INTEGER NOT NULL DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS event_edit_history (
+                id          INTEGER PRIMARY KEY,
+                event_id    INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                account_id  INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                calendar_id INTEGER NOT NULL REFERENCES calendars(id) ON DELETE CASCADE,
+                payload     TEXT NOT NULL,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
             CREATE TABLE IF NOT EXISTS event_reminders (
                 id        INTEGER PRIMARY KEY,
                 event_id  INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
