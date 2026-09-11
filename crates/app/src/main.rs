@@ -4600,6 +4600,19 @@ fn compute_day_drag_times(
     DayDragResult { day_start, start, end, column_index: target_column }
 }
 
+/// Rebuilds the exact pre-drag geometry/time range from `state`, so an aborted drag can
+/// snap the live preview straight back to where it started without waiting for a full
+/// view refresh.
+fn original_day_drag_result(state: &DayDragState, day_index: usize) -> DayDragResult {
+    let midnight = NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is always valid");
+    DayDragResult {
+        day_start: local_datetime(state.original_start.date_naive(), midnight),
+        start: state.original_start,
+        end: state.original_end,
+        column_index: day_index,
+    }
+}
+
 /// Applies `result` to `card`'s geometry and `time_bubble`'s text — exactly the two
 /// properties `day_event_block` derives from an event's start/end at build time
 /// (`set_margin_top` / `set_size_request`'s height, and the time-bubble label), mutated
@@ -4940,6 +4953,49 @@ fn install_day_event_drag(
     }
 
     hit_box.add_controller(gesture);
+
+    let escape = gtk4::ShortcutController::new();
+    escape.set_scope(gtk4::ShortcutScope::Global);
+    {
+        let hit_box = hit_box.clone();
+        let card = card.clone();
+        let time_bubble = time_bubble.clone();
+        let drag_hint = drag_hint.clone();
+        let drag_state = drag_state.clone();
+        let held_engaged = held_engaged.clone();
+        let hold_timer = hold_timer.clone();
+        let time_format = ctx.time_format;
+        escape.add_shortcut(gtk4::Shortcut::new(
+            gtk4::ShortcutTrigger::parse_string("Escape"),
+            Some(gtk4::CallbackAction::new(move |_widget, _args| {
+                if let Some(id) = hold_timer.take() {
+                    id.remove();
+                }
+                hit_box.set_cursor_from_name(Some("pointer"));
+                drag_hint.set_visible(false);
+                held_engaged.set(false);
+                let Some(state) = drag_state.borrow_mut().take() else {
+                    return gtk4::glib::Propagation::Proceed;
+                };
+                let result = original_day_drag_result(&state, day_index);
+                apply_day_drag_geometry(
+                    &card,
+                    &time_bubble,
+                    &drag_hint,
+                    card_width,
+                    card_margin_start,
+                    day_index,
+                    day_column_width,
+                    &result,
+                    pixels_per_minute,
+                    time_format,
+                    start_only,
+                );
+                gtk4::glib::Propagation::Stop
+            })),
+        ));
+    }
+    hit_box.add_controller(escape);
 
     // Hover-only cursor affordance (no drag in progress): "grab" over the body,
     // "ns-resize" over either edge zone, falling back to "pointer" off the card —
@@ -10861,6 +10917,19 @@ mod day_view_layout_tests {
 
         assert_eq!(result.start, dt(date, 12, 7));
         assert_eq!(result.end, dt(date, 13, 7));
+    }
+
+    #[test]
+    fn original_drag_result_restores_the_pre_drag_slot() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
+        let state = DayDragState { zone: DayDragZone::Move, original_start: dt(date, 12, 0), original_end: dt(date, 13, 0) };
+
+        let result = original_day_drag_result(&state, 3);
+
+        assert_eq!(result.day_start, dt(date, 0, 0));
+        assert_eq!(result.start, state.original_start);
+        assert_eq!(result.end, state.original_end);
+        assert_eq!(result.column_index, 3);
     }
 
     #[test]
