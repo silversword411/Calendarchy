@@ -5119,6 +5119,19 @@ fn show_event_popover(anchor: &gtk4::Box, event: &DisplayEvent, ctx: &EventCtx) 
                 EventBusyStatus::Free => "Free",
             };
             body.append(&detail_row("view-reveal-symbolic", busy_text));
+            body.append(&detail_row("channel-secure-symbolic", event_visibility_label(detail.visibility)));
+
+            if let Some(recurrence) = event_recurrence_label(&detail) {
+                body.append(&detail_row("media-playlist-repeat-symbolic", &recurrence));
+            }
+
+            if let Some(organizer) = event_organizer_label(&detail) {
+                body.append(&detail_row("avatar-default-symbolic", &format!("Organizer: {organizer}")));
+            }
+
+            if let Some(status) = detail.self_response_status {
+                body.append(&detail_row("system-users-symbolic", &format!("Your response: {}", guest_status_label(status))));
+            }
 
             if !detail.attendees.is_empty() {
                 body.append(&guest_list_section(&detail.attendees, detail.organizer_email.as_deref()));
@@ -5129,36 +5142,23 @@ fn show_event_popover(anchor: &gtk4::Box, event: &DisplayEvent, ctx: &EventCtx) 
             }
 
             if let Some(link) = detail.hangout_link.as_deref().filter(|s| !s.is_empty()) {
-                // Not `detail_row` — that helper renders plain text, and this needs a
-                // real clickable action, so it's built directly with the same
-                // `.event-popover-detail-row` icon+content layout for visual
-                // consistency with the rows around it.
-                let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
-                row.add_css_class("event-popover-detail-row");
+                body.append(&uri_row("camera-web-symbolic", "Join video call", link));
+            }
 
-                let icon = gtk4::Image::from_icon_name("camera-web-symbolic");
-                icon.add_css_class("dim-label");
-                icon.set_valign(gtk4::Align::Start);
-                row.append(&icon);
-
-                let join_btn = gtk4::Button::with_label("Join video call");
-                join_btn.add_css_class("flat");
-                join_btn.set_halign(gtk4::Align::Start);
-                let link = link.to_string();
-                join_btn.connect_clicked(move |_| {
-                    if let Err(err) = gtk4::gio::AppInfo::launch_default_for_uri(&link, None::<&gtk4::gio::AppLaunchContext>)
-                    {
-                        tracing::warn!(%err, "failed to open video call link");
-                    }
-                });
-                row.append(&join_btn);
-
-                body.append(&row);
+            if let Some(link) = detail.url.as_deref().filter(|s| !s.is_empty()) {
+                body.append(&uri_row("insert-link-symbolic", "Open event link", link));
             }
 
             for attachment in &detail.attachments {
                 let label = attachment.title.as_deref().filter(|s| !s.is_empty()).unwrap_or(&attachment.file_url);
-                body.append(&detail_row("mail-attachment-symbolic", label));
+                body.append(&uri_row("mail-attachment-symbolic", label, &attachment.file_url));
+            }
+
+            if let Some(created_at) = detail.created_at.as_deref().filter(|s| !s.is_empty()) {
+                body.append(&detail_row(
+                    "document-open-recent-symbolic",
+                    &format!("Created {}", format_event_timestamp(created_at, ctx.date_format, ctx.time_format)),
+                ));
             }
         }
         Ok(None) => {
@@ -7374,6 +7374,30 @@ fn detail_row(icon_name: &str, text: &str) -> gtk4::Box {
     row
 }
 
+fn uri_row(icon_name: &str, label: &str, uri: &str) -> gtk4::Box {
+    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+    row.add_css_class("event-popover-detail-row");
+
+    let icon = gtk4::Image::from_icon_name(icon_name);
+    icon.add_css_class("dim-label");
+    icon.set_valign(gtk4::Align::Start);
+    row.append(&icon);
+
+    let button = gtk4::Button::with_label(label);
+    button.add_css_class("flat");
+    button.set_halign(gtk4::Align::Start);
+    button.set_tooltip_text(Some(uri));
+    let uri = uri.to_string();
+    button.connect_clicked(move |_| {
+        if let Err(err) = gtk4::gio::AppInfo::launch_default_for_uri(&uri, None::<&gtk4::gio::AppLaunchContext>) {
+            tracing::warn!(%err, "failed to open event link");
+        }
+    });
+    row.append(&button);
+
+    row
+}
+
 /// Rendered guest rows before the rest collapse into a "N more" line — same idea as
 /// `compute_max_visible_events`'s per-day cap in the month grid, just a fixed number
 /// here rather than measured, since the popover's width (`root.set_width_request(320)`
@@ -7469,6 +7493,45 @@ fn guest_status_label(status: AttendeeResponseStatus) -> &'static str {
         AttendeeResponseStatus::Tentative => "Maybe",
         AttendeeResponseStatus::NeedsAction => "Awaiting response",
     }
+}
+
+fn event_visibility_label(visibility: EventVisibility) -> &'static str {
+    match visibility {
+        EventVisibility::Default => "Default visibility",
+        EventVisibility::Public => "Public",
+        EventVisibility::Private => "Private",
+        EventVisibility::Confidential => "Confidential",
+    }
+}
+
+fn event_recurrence_label(detail: &EventDetail) -> Option<String> {
+    let recurrence = detail.recurrence.as_deref()?;
+    let start = if detail.all_day {
+        NaiveDate::parse_from_str(&detail.start, "%Y-%m-%d").ok()
+    } else {
+        DateTime::parse_from_rfc3339(&detail.start).ok().map(|dt| dt.date_naive())
+    };
+    Some(start.and_then(|start| Recurrence::from_rrule_string(recurrence).map(|rule| rule.describe(start))).unwrap_or_else(|| recurrence.to_string()))
+}
+
+fn event_organizer_label(detail: &EventDetail) -> Option<String> {
+    let name = detail.organizer_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let email = detail.organizer_email.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    match (name, email) {
+        (Some(name), Some(email)) => Some(format!("{name} <{email}>")),
+        (Some(name), None) => Some(name.to_string()),
+        (None, Some(email)) => Some(email.to_string()),
+        (None, None) => None,
+    }
+}
+
+fn format_event_timestamp(value: &str, date_format: DateFormat, time_format: TimeFormat) -> String {
+    DateTime::parse_from_rfc3339(value)
+        .map(|dt| {
+            let local = dt.with_timezone(&Local);
+            format!("{} · {}", format_popover_date(local.date_naive(), date_format), format_clock(local.time(), time_format))
+        })
+        .unwrap_or_else(|_| value.to_string())
 }
 
 /// Formats an event's date/time for the detail popover, e.g. "Monday, August 31 ·
@@ -10997,5 +11060,65 @@ mod day_view_layout_tests {
     #[test]
     fn shift_date_string_rejects_unparseable_input() {
         assert_eq!(shift_date_string("not a date", 1), None);
+    }
+
+    fn detail() -> EventDetail {
+        EventDetail {
+            id: 1,
+            calendar_id: 1,
+            title: "Event".into(),
+            description: None,
+            location: None,
+            start: "2026-09-01T12:00:00+00:00".into(),
+            end: "2026-09-01T13:00:00+00:00".into(),
+            all_day: false,
+            color: None,
+            reminders: Vec::new(),
+            busy: EventBusyStatus::Busy,
+            visibility: EventVisibility::Default,
+            recurrence: None,
+            organizer_email: None,
+            organizer_name: None,
+            hangout_link: None,
+            sequence: 0,
+            created_at: None,
+            self_response_status: None,
+            attendees: Vec::new(),
+            url: None,
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recurrence_label_prefers_human_description() {
+        let mut detail = detail();
+        detail.recurrence = Some("FREQ=WEEKLY;BYDAY=TU".into());
+
+        assert_eq!(event_recurrence_label(&detail).as_deref(), Some("Weekly on Tuesday"));
+    }
+
+    #[test]
+    fn organizer_label_combines_name_and_email_when_both_exist() {
+        let mut detail = detail();
+        detail.organizer_name = Some("A Person".into());
+        detail.organizer_email = Some("person@example.com".into());
+
+        assert_eq!(event_organizer_label(&detail).as_deref(), Some("A Person <person@example.com>"));
+    }
+
+    #[test]
+    fn timestamp_label_formats_rfc3339_values() {
+        assert_eq!(
+            format_event_timestamp("2026-09-01T12:30:00+00:00", DateFormat::MonthDayYear, TimeFormat::TwelveHour),
+            "Tuesday, September 1 · 12:30 PM"
+        );
+    }
+
+    #[test]
+    fn visibility_label_covers_every_supported_value() {
+        assert_eq!(event_visibility_label(EventVisibility::Default), "Default visibility");
+        assert_eq!(event_visibility_label(EventVisibility::Public), "Public");
+        assert_eq!(event_visibility_label(EventVisibility::Private), "Private");
+        assert_eq!(event_visibility_label(EventVisibility::Confidential), "Confidential");
     }
 }
