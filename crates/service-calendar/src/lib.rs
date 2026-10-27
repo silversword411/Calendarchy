@@ -106,10 +106,18 @@ impl Service for CalendarService {
         "Calendar"
     }
 
+    /// Kept as narrow as the client's actual usage (DESIGN_SPEC.md §16): `events`
+    /// covers `GET /calendars/{id}/events` plus the write-back queue, and
+    /// `calendarlist.readonly` covers `GET /users/me/calendarList`. The broader
+    /// `calendar.readonly` (all calendars' metadata, ACLs, and settings) is deliberately
+    /// not requested. Mutating the calendar list itself (color / visibility via
+    /// `calendarList.patch`, §11; subscribe via `calendarList.insert`, §12) will need
+    /// `calendar.calendarlist` instead — add it here when those land, and incremental
+    /// authorization (§7) upgrades existing accounts without a full re-auth.
     fn oauth_scopes(&self) -> &'static [&'static str] {
         &[
             "https://www.googleapis.com/auth/calendar.events",
-            "https://www.googleapis.com/auth/calendar.readonly",
+            "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
         ]
     }
 

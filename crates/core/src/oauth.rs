@@ -16,6 +16,13 @@ const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_REVOKE_URL: &str = "https://oauth2.googleapis.com/revoke";
 
+/// Account-level identity scopes requested on every add-account flow regardless of
+/// which services are enabled: `openid` + `email` are what let the Account Manager
+/// label the account row with the signed-in address (DESIGN_SPEC.md §6/§7). They
+/// grant no calendar (or other Workspace) data access — service data scopes come from
+/// each `Service::oauth_scopes` and are only added for enabled services.
+pub const IDENTITY_SCOPES: &[&str] = &["openid", "email"];
+
 /// Google OAuth "Desktop app" client credentials, created in Google Cloud Console
 /// (with the Calendar API enabled) before this module can be exercised end-to-end.
 /// Per RFC 8252 the client secret for an installed app isn't treated as confidential
@@ -55,7 +62,8 @@ fn http_client() -> anyhow::Result<oauth2::reqwest::Client> {
 /// ephemeral loopback port, sends the user to Google's consent screen in their system
 /// browser, captures the redirect locally, and exchanges the resulting code (with
 /// PKCE) for tokens. `scopes` should be exactly the OAuth scopes of the service(s)
-/// being enabled at add-account time (see `Service::oauth_scopes`).
+/// being enabled at add-account time (see `Service::oauth_scopes`); `IDENTITY_SCOPES`
+/// are always prepended so the account can be labelled, and callers need not pass them.
 pub async fn run_loopback_oauth_flow(
     config: &GoogleOAuthConfig,
     scopes: &[&str],
@@ -83,8 +91,9 @@ pub async fn run_loopback_oauth_flow(
         // without them, re-connecting an already-authorized account silently omits it.
         .add_extra_param("access_type", "offline")
         .add_extra_param("prompt", "consent");
-    for scope in scopes {
-        auth_request = auth_request.add_scope(Scope::new((*scope).to_string()));
+    let requested_scopes = requested_scopes(scopes);
+    for scope in &requested_scopes {
+        auth_request = auth_request.add_scope(Scope::new(scope.clone()));
     }
     let (auth_url, csrf_token) = auth_request.url();
 
@@ -129,7 +138,7 @@ pub async fn run_loopback_oauth_flow(
     let granted_scopes = token_result
         .scopes()
         .map(|scopes| scopes.iter().map(|s| s.to_string()).collect())
-        .unwrap_or_else(|| scopes.iter().map(|s| s.to_string()).collect());
+        .unwrap_or(requested_scopes);
 
     Ok(OAuthTokens {
         access_token: token_result.access_token().secret().clone(),
@@ -137,6 +146,18 @@ pub async fn run_loopback_oauth_flow(
         expires_at,
         granted_scopes,
     })
+}
+
+/// `IDENTITY_SCOPES` followed by `service_scopes`, de-duplicated and in request order,
+/// so a caller that already included an identity scope doesn't send it twice.
+fn requested_scopes(service_scopes: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(IDENTITY_SCOPES.len() + service_scopes.len());
+    for scope in IDENTITY_SCOPES.iter().chain(service_scopes.iter()) {
+        if !out.iter().any(|s| s == scope) {
+            out.push((*scope).to_string());
+        }
+    }
+    out
 }
 
 /// Exchanges a refresh token for a new access token, keeping the same refresh token
@@ -291,6 +312,22 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requested_scopes_prepends_identity_scopes_without_duplicates() {
+        let scopes = requested_scopes(&[
+            "https://www.googleapis.com/auth/calendar.events",
+            "email",
+        ]);
+        assert_eq!(
+            scopes,
+            vec![
+                "openid".to_string(),
+                "email".to_string(),
+                "https://www.googleapis.com/auth/calendar.events".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn parses_authorization_redirect_query() {
