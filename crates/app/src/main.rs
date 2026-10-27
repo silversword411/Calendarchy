@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use calendarchy_core::{
     load_settings, save_settings, Account, AccountId, AccountManager, AppSettings, DateFormat, EventEditorPanelMode,
-    InvitationAutoAdd, Keyring, SecretServiceKeyring, ServiceKind, ServiceRegistry, Storage, TimeFormat,
+    InvitationAutoAdd, Keyring, LastViewMode, SecretServiceKeyring, ServiceKind, ServiceRegistry, Storage, TimeFormat,
 };
 use calendarchy_service_calendar::query::{
     calendars_by_account, clear_calendar_cache, create_event, delete_event, delete_reminder_notification,
@@ -154,6 +154,12 @@ struct App {
     /// `AppMsg::PrevPeriod`/`NextPeriod`. Empty until the first drag-select; meaningless
     /// outside `ViewMode::Custom`.
     custom_view_dates: Vec<NaiveDate>,
+    /// The month the sidebar's mini calendar is paged to by its own prev/next arrows
+    /// or quick-jump popover (`AppMsg::PrevMonth`/`NextMonth`/`MiniCalendarJumpMonth`),
+    /// which only browse the mini calendar — the main view only moves once a day is
+    /// actually clicked. `None` means "follow `current_date`"; reset to `None` by every
+    /// handler that moves the main view, so the mini calendar snaps back to it.
+    mini_calendar_month: Option<NaiveDate>,
     /// Live text from the header bar's search popover; re-applied on every refresh
     /// so it survives month navigation instead of resetting.
     search_query: String,
@@ -181,11 +187,15 @@ enum AppMsg {
     ShowAllCalendarsForAccount { account_id: AccountId },
     Today,
     /// Always pages the mini calendar's own month navigator by a whole month,
-    /// regardless of which main view is active (DESIGN_SPEC.md §10) — the main
-    /// content toolbar's Prev/Next arrows send `PrevPeriod`/`NextPeriod` instead,
-    /// which page by whatever unit the active view uses.
+    /// regardless of which main view is active (DESIGN_SPEC.md §10), without moving
+    /// the main view (see `App::mini_calendar_month`) — the main content toolbar's
+    /// Prev/Next arrows send `PrevPeriod`/`NextPeriod` instead, which page by
+    /// whatever unit the active view uses.
     PrevMonth,
     NextMonth,
+    /// A month picked from the mini calendar title's quick-jump popover — like
+    /// `PrevMonth`/`NextMonth`, only renavigates the mini calendar itself.
+    MiniCalendarJumpMonth(NaiveDate),
     /// The main content toolbar's Prev/Next arrows: one day in `ViewMode::Day`, one
     /// month in `ViewMode::Month` (matching `PrevMonth`/`NextMonth`'s old behavior).
     PrevPeriod,
@@ -340,9 +350,12 @@ impl Component for App {
 
             adw::ToolbarView {
                 add_top_bar = &adw::HeaderBar {
+                    add_css_class: "main-headerbar",
+
                     pack_start = &gtk4::Button {
                         set_icon_name: "open-menu-symbolic",
                         add_css_class: "flat",
+                        add_css_class: "header-control",
                         set_tooltip_text: Some("Toggle sidebar"),
                         connect_clicked => AppMsg::ToggleSidebar,
                     },
@@ -350,6 +363,7 @@ impl Component for App {
                     pack_start = &gtk4::Button {
                         set_label: "Create",
                         add_css_class: "pill",
+                        add_css_class: "header-control",
                         add_css_class: "suggested-action",
                         connect_clicked => AppMsg::CreateEvent,
                     },
@@ -357,6 +371,7 @@ impl Component for App {
                     pack_start = &gtk4::Button {
                         set_label: "Today",
                         add_css_class: "pill",
+                        add_css_class: "header-control",
                         connect_clicked => AppMsg::Today,
                     },
 
@@ -366,11 +381,13 @@ impl Component for App {
 
                         gtk4::Button {
                             set_icon_name: "go-previous-symbolic",
+                            add_css_class: "header-control",
                             set_tooltip_text: Some("Previous"),
                             connect_clicked => AppMsg::PrevPeriod,
                         },
                         gtk4::Button {
                             set_icon_name: "go-next-symbolic",
+                            add_css_class: "header-control",
                             set_tooltip_text: Some("Next"),
                             connect_clicked => AppMsg::NextPeriod,
                         },
@@ -387,11 +404,13 @@ impl Component for App {
                         set_label: "Month",
                         add_css_class: "pill",
                         add_css_class: "view-switcher-button",
+                        add_css_class: "header-control",
                     },
 
                     pack_end = &gtk4::Button {
                         set_icon_name: "emblem-system-symbolic",
                         add_css_class: "flat",
+                        add_css_class: "header-control",
                         set_tooltip_text: Some("Preferences (Ctrl+,)"),
                         connect_clicked => AppMsg::ShowPreferences,
                     },
@@ -399,6 +418,7 @@ impl Component for App {
                     pack_end = &gtk4::Button {
                         set_icon_name: "dialog-question-symbolic",
                         add_css_class: "flat",
+                        add_css_class: "header-control",
                         set_tooltip_text: Some("Keyboard shortcuts"),
                         connect_clicked => AppMsg::ShowShortcuts,
                     },
@@ -406,6 +426,7 @@ impl Component for App {
                     #[name = "search_entry"]
                     pack_end = &gtk4::SearchEntry {
                         add_css_class: "search-field",
+                        add_css_class: "header-control",
                         set_placeholder_text: Some("Search events"),
                         set_width_request: 220,
                         set_valign: gtk4::Align::Center,
@@ -447,7 +468,6 @@ impl Component for App {
                             add_css_class: "card",
                             set_overflow: gtk4::Overflow::Hidden,
                             set_margin_start: 12,
-                            set_margin_top: 12,
                             set_margin_bottom: 12,
                             set_width_request: SIDEBAR_MIN_WIDTH_PX,
                             set_hexpand: false,
@@ -545,7 +565,6 @@ impl Component for App {
                                     set_hexpand: true,
                                     set_vexpand: true,
                                     set_spacing: 12,
-                                    set_margin_top: 12,
                                     set_margin_bottom: 12,
                                     set_margin_end: 12,
 
@@ -586,7 +605,8 @@ impl Component for App {
                                         gtk4::Grid {
                                             add_css_class: "day-all-day-strip",
                                             set_row_spacing: 2,
-                                            set_column_spacing: 2,
+                                            set_column_spacing: 0,
+                                            set_hexpand: true,
                                             set_visible: false,
                                         },
 
@@ -630,7 +650,6 @@ impl Component for App {
                                 set_overflow: gtk4::Overflow::Hidden,
                                 set_hexpand: true,
                                 set_vexpand: true,
-                                set_margin_top: 12,
                                 set_margin_bottom: 12,
                                 set_margin_end: 12,
                                 set_visible: false,
@@ -671,6 +690,23 @@ impl Component for App {
         // see `filter_events`'s doc comment for why this half lives app-side.
         let events = filter_events(&events, "", settings.show_declined_events);
 
+        // Restore whichever view was showing when the window last closed (`App::shutdown`
+        // saves it) — falling back to Month/today if nothing's been saved yet, or if a
+        // saved `Custom` mode somehow lost its date range (hand-edited/corrupted settings
+        // blob). The bootstrap just below always paints Month/today first regardless; a
+        // queued follow-up message right after `view_output!()` corrects it to this restored
+        // view, reusing the same handlers `AppMsg::SetView`/`SetCustomViewDates`/
+        // `JumpToDate` already use for a normal in-session view switch.
+        let restored_date = settings.last_view_date.unwrap_or(today);
+        let restored_custom_dates = settings.last_custom_view_dates.clone();
+        let restored_view = match settings.last_view_mode {
+            LastViewMode::Day => ViewMode::Day,
+            LastViewMode::FiveDay => ViewMode::FiveDay,
+            LastViewMode::Month => ViewMode::Month,
+            LastViewMode::Custom if !restored_custom_dates.is_empty() => ViewMode::Custom,
+            LastViewMode::Custom => ViewMode::Month,
+        };
+
         // `Storage` is a cheap `Arc`-backed clone (calendarchy_core::Storage) — cloned
         // here, before `core` moves into `model` below, since `ctx` itself can only be
         // built after `view_output!()` produces `widgets` (its `docks` field needs the
@@ -681,14 +717,25 @@ impl Component for App {
         let model = App {
             core,
             current_view: ViewMode::Month,
-            current_date: today,
-            custom_view_dates: Vec::new(),
+            current_date: restored_date,
+            custom_view_dates: restored_custom_dates.clone(),
+            mini_calendar_month: None,
             search_query: String::new(),
             sidebar_visible: true,
             overlay: Rc::new(RefCell::new(None)),
             open_editor_panel: open_editor_panel.clone(),
         };
         let widgets = view_output!();
+
+        // Correct the Month/today bootstrap above to the restored view, if it wasn't
+        // already Month/today — queued rather than applied directly here so it goes
+        // through the exact same, already-correct logic a normal view switch uses.
+        match (restored_view, restored_custom_dates.is_empty()) {
+            (ViewMode::Custom, false) => sender.input(AppMsg::SetCustomViewDates(restored_custom_dates)),
+            (ViewMode::Day, _) | (ViewMode::FiveDay, _) => sender.input(AppMsg::SetView(restored_view)),
+            (ViewMode::Month, _) if restored_date != today => sender.input(AppMsg::JumpToDate(restored_date)),
+            _ => {}
+        }
 
         // `root` (the app's one top-level window) is cloned here rather than
         // re-fetched later since nothing else needs an owned handle to it.
@@ -728,24 +775,7 @@ impl Component for App {
             settings.day_drag_hold_ms,
         );
         populate_day_header(&widgets.day_header_box, &widgets.day_all_day_box, &[today], today, &events, &ctx, gutter_px);
-        {
-            // The sidebar's mini calendar isn't inside a popover of its own, so
-            // there's nothing to accidentally close early here — jumping a month and
-            // picking a day both just page the main view (`AppMsg::JumpToDate`),
-            // unlike `date_picker`'s two callbacks, which mean different things.
-            let jump = jump_to_date_callback(&sender);
-            let range_pick = range_pick_callback(&sender);
-            populate_mini_calendar(
-                &widgets.mini_calendar_grid,
-                &widgets.mini_calendar_title,
-                today,
-                today,
-                &jump,
-                &jump,
-                Some(&range_pick),
-                &[],
-            );
-        }
+        model.refresh_mini_calendar(&widgets, &sender);
         populate_sidebar(&widgets.sidebar_list, &accounts, &calendars, &sender);
         populate_world_clock(&widgets.world_clock_box, &settings);
         install_search_shortcut(&root, &widgets.search_entry);
@@ -865,17 +895,23 @@ impl Component for App {
             }
             AppMsg::Today => {
                 self.current_date = Local::now().date_naive();
+                self.mini_calendar_month = None;
                 self.refresh(widgets, &sender, root);
             }
             AppMsg::PrevMonth => {
-                self.current_date = shift_month(self.current_date, -1);
-                self.refresh(widgets, &sender, root);
+                self.mini_calendar_month = Some(shift_month(self.mini_calendar_display_month(), -1));
+                self.refresh_mini_calendar(widgets, &sender);
             }
             AppMsg::NextMonth => {
-                self.current_date = shift_month(self.current_date, 1);
-                self.refresh(widgets, &sender, root);
+                self.mini_calendar_month = Some(shift_month(self.mini_calendar_display_month(), 1));
+                self.refresh_mini_calendar(widgets, &sender);
+            }
+            AppMsg::MiniCalendarJumpMonth(month) => {
+                self.mini_calendar_month = Some(month);
+                self.refresh_mini_calendar(widgets, &sender);
             }
             AppMsg::PrevPeriod => {
+                self.mini_calendar_month = None;
                 match self.current_view {
                     ViewMode::Month => self.current_date = shift_month(self.current_date, -1),
                     ViewMode::Day => self.current_date -= Duration::days(1),
@@ -900,6 +936,7 @@ impl Component for App {
                 self.refresh(widgets, &sender, root);
             }
             AppMsg::NextPeriod => {
+                self.mini_calendar_month = None;
                 match self.current_view {
                     ViewMode::Month => self.current_date = shift_month(self.current_date, 1),
                     ViewMode::Day => self.current_date += Duration::days(1),
@@ -936,20 +973,23 @@ impl Component for App {
                     // real one is allocated (see `poll_for_real_width_then_resize`).
                     poll_for_real_width_then_resize(&widgets.day_overlay, &sender);
                     let settings = load_settings(&self.core.storage).unwrap_or_default();
-                    let today = Local::now().date_naive();
-                    let today_visible = match view {
-                        ViewMode::Day => self.current_date == today,
-                        ViewMode::FiveDay => five_day_window(self.current_date, settings.show_weekends).contains(&today),
-                        ViewMode::Custom => self.custom_view_dates.contains(&today),
-                        ViewMode::Month => false,
+                    let visible_dates: Vec<NaiveDate> = match view {
+                        ViewMode::Day => vec![self.current_date],
+                        ViewMode::FiveDay => five_day_window(self.current_date, settings.show_weekends),
+                        ViewMode::Custom => self.custom_view_dates.clone(),
+                        ViewMode::Month => Vec::new(),
                     };
-                    if today_visible {
-                        scroll_day_view_to_now(&widgets.day_scroller, settings.day_time_scale_minutes);
-                    }
+                    scroll_day_view_to_default(
+                        &self.core.storage,
+                        &widgets.day_scroller,
+                        settings.day_time_scale_minutes,
+                        &visible_dates,
+                    );
                 }
             }
             AppMsg::SetCustomViewDates(dates) => {
                 self.current_view = ViewMode::Custom;
+                self.mini_calendar_month = None;
                 if let Some(&first) = dates.first() {
                     self.current_date = first;
                 }
@@ -962,11 +1002,13 @@ impl Component for App {
                 // was hidden until just now, so this refresh's column widths need a
                 // follow-up pass once real geometry is allocated.
                 poll_for_real_width_then_resize(&widgets.day_overlay, &sender);
-                let today = Local::now().date_naive();
-                if self.custom_view_dates.contains(&today) {
-                    let settings = load_settings(&self.core.storage).unwrap_or_default();
-                    scroll_day_view_to_now(&widgets.day_scroller, settings.day_time_scale_minutes);
-                }
+                let settings = load_settings(&self.core.storage).unwrap_or_default();
+                scroll_day_view_to_default(
+                    &self.core.storage,
+                    &widgets.day_scroller,
+                    settings.day_time_scale_minutes,
+                    &self.custom_view_dates,
+                );
             }
             AppMsg::ZoomDayTimeScale { finer } => {
                 let mut settings = load_settings(&self.core.storage).unwrap_or_default();
@@ -1003,6 +1045,7 @@ impl Component for App {
                     widgets.view_menu_button.set_label(view_mode_label(self.current_view));
                 }
                 self.current_date = date;
+                self.mini_calendar_month = None;
                 self.refresh(widgets, &sender, root);
             }
             AppMsg::EventUpdated => {
@@ -1107,6 +1150,28 @@ impl Component for App {
             }
         }
     }
+
+    /// Persists the current view (mode, anchor date, and — for `Custom` — the exact
+    /// visible date range) so `App::init` can restore it on next launch, instead of
+    /// always reopening to Month/today. Relm4 calls this on the root component when
+    /// its window closes. Settings are loaded fresh right before this targeted write,
+    /// like every other individual-setting write in this file, so it can't clobber a
+    /// preference changed elsewhere in the same session.
+    fn shutdown(&mut self, _widgets: &mut Self::Widgets, _output: relm4::Sender<Self::Output>) {
+        let mut settings = load_settings(&self.core.storage).unwrap_or_default();
+        settings.last_view_mode = match self.current_view {
+            ViewMode::Day => LastViewMode::Day,
+            ViewMode::FiveDay => LastViewMode::FiveDay,
+            ViewMode::Month => LastViewMode::Month,
+            ViewMode::Custom => LastViewMode::Custom,
+        };
+        settings.last_view_date = Some(self.current_date);
+        settings.last_custom_view_dates =
+            if self.current_view == ViewMode::Custom { self.custom_view_dates.clone() } else { Vec::new() };
+        if let Err(err) = save_settings(&self.core.storage, &settings) {
+            tracing::warn!(%err, "failed to save view state on close");
+        }
+    }
 }
 
 impl App {
@@ -1124,6 +1189,34 @@ impl App {
     fn refresh_overlay(&self, sender: &ComponentSender<App>, root: &adw::Window) {
         let handle = notifications::ensure_overlay(&self.overlay, &self.core.storage, sender);
         notifications::refresh_overlay(&handle, root);
+    }
+
+    /// The month the sidebar's mini calendar shows: its own paged month if its arrows
+    /// or quick-jump popover have moved it, otherwise whichever month the main view is on.
+    fn mini_calendar_display_month(&self) -> NaiveDate {
+        self.mini_calendar_month.unwrap_or(self.current_date)
+    }
+
+    /// Re-renders just the sidebar's mini calendar — on its own for its prev/next
+    /// arrows and quick-jump popover, which page it without touching the main view,
+    /// and as part of every full `refresh`.
+    fn refresh_mini_calendar(&self, widgets: &AppWidgets, sender: &ComponentSender<App>) {
+        let jump = jump_to_date_callback(sender);
+        let jump_month = {
+            let sender = sender.clone();
+            Rc::new(move |month| sender.input(AppMsg::MiniCalendarJumpMonth(month))) as Rc<dyn Fn(NaiveDate)>
+        };
+        let range_pick = range_pick_callback(sender);
+        populate_mini_calendar(
+            &widgets.mini_calendar_grid,
+            &widgets.mini_calendar_title,
+            self.mini_calendar_display_month(),
+            Local::now().date_naive(),
+            &jump,
+            &jump_month,
+            Some(&range_pick),
+            if self.current_view == ViewMode::Custom { &self.custom_view_dates } else { &[] },
+        );
     }
 
     fn refresh(&self, widgets: &mut AppWidgets, sender: &ComponentSender<App>, root: &adw::Window) {
@@ -1176,20 +1269,7 @@ impl App {
             &ctx,
             gutter_px,
         );
-        {
-            let jump = jump_to_date_callback(sender);
-            let range_pick = range_pick_callback(sender);
-            populate_mini_calendar(
-                &widgets.mini_calendar_grid,
-                &widgets.mini_calendar_title,
-                self.current_date,
-                today,
-                &jump,
-                &jump,
-                Some(&range_pick),
-                if self.current_view == ViewMode::Custom { &self.custom_view_dates } else { &[] },
-            );
-        }
+        self.refresh_mini_calendar(widgets, sender);
         let title = match self.current_view {
             ViewMode::Month => self.current_date.format("%B %Y").to_string(),
             ViewMode::Day => self.current_date.format("%A, %B %-d, %Y").to_string(),
@@ -2549,10 +2629,10 @@ fn menu_row_button_with_hotkey(text: &str, key: &str) -> gtk4::Button {
     button
 }
 
-/// Wraps `sender` into the `on_pick` callback `populate_mini_calendar` and
-/// `build_quick_jump_popover` take, so the sidebar's mini calendar — which should page
-/// the *main* view — can share that day-grid/quick-jump-popover code with the edit
-/// dialog's date pickers (`date_picker`), which instead just update their own field.
+/// Wraps `sender` into the `on_pick` callback `populate_mini_calendar` takes, so a day
+/// clicked on the sidebar's mini calendar — which should page the *main* view — can
+/// share that day-grid code with the edit dialog's date pickers (`date_picker`), which
+/// instead just update their own field.
 fn jump_to_date_callback(sender: &ComponentSender<App>) -> Rc<dyn Fn(NaiveDate)> {
     let sender = sender.clone();
     Rc::new(move |date| sender.input(AppMsg::JumpToDate(date)))
@@ -5105,18 +5185,53 @@ fn install_day_event_drag(
     hit_box.add_controller(motion);
 }
 
-/// Scrolls the Day view so "now" isn't right at the very top edge — a few hours of
-/// context above the current-time line, mirroring how Google Calendar's day view
-/// opens scrolled to roughly this position rather than to midnight. Called only when
-/// switching *into* Day view on today's date (`AppMsg::SetView`), not on every
-/// `refresh`, so a manual scroll (e.g. after toggling a calendar's visibility) isn't
-/// fought on every unrelated message.
-fn scroll_day_view_to_now(scroller: &gtk4::ScrolledWindow, scale_minutes: i64) {
+/// Scrolls the Day view to the most useful default position when switching *into* it
+/// (`AppMsg::SetView`/`SetCustomViewDates`), not on every `refresh`, so a manual scroll
+/// (e.g. after toggling a calendar's visibility) isn't fought on every unrelated
+/// message. If any of the newly visible dates has a timed event, the earliest one is
+/// scrolled to the top edge; otherwise the view opens at 6am, which is a more useful
+/// starting point than midnight for a typical day.
+fn scroll_day_view_to_default(
+    storage: &Storage,
+    scroller: &gtk4::ScrolledWindow,
+    scale_minutes: i64,
+    visible_dates: &[NaiveDate],
+) {
+    const DEFAULT_TOP_MINUTES: f64 = 6.0 * 60.0;
+
+    let events = events_for_visible_calendars(storage).unwrap_or_default();
+    let visible_keys: Vec<String> = visible_dates.iter().map(|d| d.format("%Y-%m-%d").to_string()).collect();
+    let earliest_event_minutes = events
+        .iter()
+        .filter(|e| !e.all_day && visible_keys.iter().any(|k| k == e.start_date()))
+        .filter_map(|e| DateTime::parse_from_rfc3339(&e.start).ok())
+        .map(|start| start.with_timezone(&Local))
+        .map(|start| start.hour() as f64 * 60.0 + start.minute() as f64)
+        .fold(None, |min, val| Some(min.map_or(val, |m: f64| m.min(val))));
+
+    let target_minutes = earliest_event_minutes.unwrap_or(DEFAULT_TOP_MINUTES);
     let pixels_per_minute = DAY_ROW_HEIGHT_PX as f64 / scale_minutes as f64;
-    let now = Local::now();
-    let now_px = (now.hour() as f64 * 60.0 + now.minute() as f64) * pixels_per_minute;
-    let target = (now_px - 3.0 * 60.0 * pixels_per_minute).max(0.0);
-    scroller.vadjustment().set_value(target);
+    let target = (target_minutes * pixels_per_minute).max(0.0);
+
+    // Called right after the day grid was made visible/repopulated (`AppMsg::SetView`/
+    // `SetCustomViewDates`), so `scroller`'s vadjustment hasn't necessarily been through
+    // a size-allocate pass yet — setting the value immediately is unreliable and can get
+    // silently clamped back toward 0 before the adjustment's `upper` catches up to the
+    // grid's real (24-hour-tall) content height. Same "bounds aren't reliable until laid
+    // out" issue as the time-picker popover's `connect_map`-deferred scroll-to-value
+    // above; poll briefly for a real content-sized bound first, mirroring
+    // `poll_for_real_width_then_resize`'s width/height poll.
+    let scroller = scroller.clone();
+    let mut attempts_left = 40; // ~2s at 50ms, generous for a slow compositor
+    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+        attempts_left -= 1;
+        let adj = scroller.vadjustment();
+        if adj.upper() > adj.page_size() || attempts_left <= 0 {
+            adj.set_value(target);
+            return gtk4::glib::ControlFlow::Break;
+        }
+        gtk4::glib::ControlFlow::Continue
+    });
 }
 
 /// Looks up `event_id`'s full `EventDetail` and the current calendar list, then opens
@@ -10495,6 +10610,54 @@ fn load_static_css() {
             border-radius: 6px;
             background-color: alpha(currentColor, 0.08);
             border: 1px solid alpha(currentColor, 0.15);
+        }
+        /* The main window's top toolbar row (Create/Today/search/view switcher…).
+           Stock libadwaita gives `headerbar` a 47px min-height and pads its inner
+           box 6px top / 7px bottom, so the row's content never sits quite centered —
+           visibly more room above the pills than below. Zero those out and set one
+           explicit, equal top/bottom inset instead, so the bar's height comes purely
+           from its content plus this symmetric padding. `.compact-density` (below)
+           tightens the same inset along with the rest of the dense layout. */
+        .main-headerbar {
+            min-height: 0;
+        }
+        .main-headerbar > windowhandle {
+            padding-top: 0;
+            padding-bottom: 0;
+        }
+        .main-headerbar > windowhandle > box {
+            padding-top: 6px;
+            padding-bottom: 6px;
+        }
+        .compact-density .main-headerbar > windowhandle > box {
+            padding-top: 2px;
+            padding-bottom: 2px;
+        }
+        /* Every control in the main header bar carries `.header-control` (an explicit
+           class rather than structural selectors, which would also catch the window's
+           own close button). Stock Adwaita makes `.pill` buttons 44px tall (10px
+           vertical padding) and plain buttons/entries 34px, so the pills alone set the
+           bar's height — these bring every control to one shared, shorter height:
+           30px normally, 24px under `.compact-density`. Only vertical sizing changes;
+           horizontal padding stays stock. A MenuButton's real clickable node is its
+           inner `button`, hence the `menubutton … > button` selectors. */
+        .main-headerbar button.header-control,
+        .main-headerbar menubutton.header-control > button {
+            min-height: 22px;
+            padding-top: 4px;
+            padding-bottom: 4px;
+        }
+        .main-headerbar entry.header-control {
+            min-height: 30px;
+        }
+        .compact-density .main-headerbar button.header-control,
+        .compact-density .main-headerbar menubutton.header-control > button {
+            min-height: 20px;
+            padding-top: 2px;
+            padding-bottom: 2px;
+        }
+        .compact-density .main-headerbar entry.header-control {
+            min-height: 24px;
         }
         .compact-density .month-cell {
             padding: 2px 4px;

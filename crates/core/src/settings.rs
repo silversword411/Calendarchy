@@ -1,3 +1,4 @@
+use chrono::NaiveDate;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
@@ -74,6 +75,25 @@ pub enum EventEditorPanelMode {
 impl Default for EventEditorPanelMode {
     fn default() -> Self {
         EventEditorPanelMode::Floating
+    }
+}
+
+/// Which top-level view (DESIGN_SPEC.md's Day/5-day/Month/Custom-range) the main
+/// window was showing when it last closed — restored on next launch instead of always
+/// reopening to Month. Mirrors `crates/app/src/main.rs`'s `ViewMode`; kept as a
+/// separate core-owned type since `ViewMode` lives in the app crate and `AppSettings`
+/// can't depend on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LastViewMode {
+    Day,
+    FiveDay,
+    Month,
+    Custom,
+}
+
+impl Default for LastViewMode {
+    fn default() -> Self {
+        LastViewMode::Month
     }
 }
 
@@ -296,6 +316,16 @@ pub struct AppSettings {
     /// "not yet customized, use the built-in default width" (matching the old fixed
     /// 560px dialog default against a typical window width).
     pub event_editor_right_width_fraction: Option<f64>,
+    /// The view mode active when the window was last closed — see `LastViewMode`.
+    /// Restored on next launch instead of always reopening to Month.
+    pub last_view_mode: LastViewMode,
+    /// The anchor date (`App::current_date`) active when the window was last closed —
+    /// applies to Day/FiveDay/Month. `None` before the first save (fresh install).
+    /// Custom view's own range is `last_custom_view_dates` instead.
+    pub last_view_date: Option<NaiveDate>,
+    /// The exact date range shown when the window was last closed in Custom view
+    /// (e.g. a 3-day span) — empty unless `last_view_mode` is `Custom`.
+    pub last_custom_view_dates: Vec<NaiveDate>,
 }
 
 impl Default for AppSettings {
@@ -349,6 +379,9 @@ impl Default for AppSettings {
             event_editor_floating_position: None,
             event_editor_bottom_height_fraction: None,
             event_editor_right_width_fraction: None,
+            last_view_mode: LastViewMode::Month,
+            last_view_date: None,
+            last_custom_view_dates: Vec::new(),
         }
     }
 }
@@ -440,6 +473,13 @@ mod tests {
         settings.event_editor_floating_position = Some((0.2, 0.4));
         settings.event_editor_bottom_height_fraction = Some(0.35);
         settings.event_editor_right_width_fraction = Some(0.45);
+        settings.last_view_mode = LastViewMode::Custom;
+        settings.last_view_date = Some(NaiveDate::from_ymd_opt(2026, 3, 4).unwrap());
+        settings.last_custom_view_dates = vec![
+            NaiveDate::from_ymd_opt(2026, 3, 4).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 3, 5).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 3, 6).unwrap(),
+        ];
         save_settings(&storage, &settings).expect("save");
 
         let loaded = load_settings(&storage).expect("load");

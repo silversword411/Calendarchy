@@ -12,6 +12,7 @@ pub use notifier::{DbusNotifier, NotifyRequest, SystemNotifier, Urgency};
 pub use oauth::GoogleOAuthConfig;
 pub use service::{Service, ServiceContext, ServiceKind, ServiceRegistry};
 pub use settings::{
-    load_settings, save_settings, AppSettings, DateFormat, EventEditorPanelMode, InvitationAutoAdd, TimeFormat,
+    load_settings, save_settings, AppSettings, DateFormat, EventEditorPanelMode, InvitationAutoAdd, LastViewMode,
+    TimeFormat,
 };
 pub use storage::Storage;
