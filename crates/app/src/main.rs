@@ -72,10 +72,11 @@ fn init_core() -> anyhow::Result<AppCore> {
 }
 
 /// Which main-content view is displayed (DESIGN_SPEC.md §10). `Month`, `Day`, and
-/// `FiveDay` are wired up — Schedule/Week/Year stay "coming soon" in the header bar's
+/// `FiveDay` and `Week` are wired up — Schedule/Year stay "coming soon" in the header bar's
 /// view-switcher popover (`build_view_switcher_popover`) per the phased roadmap (§19).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
+    Week,
     Month,
     Day,
     /// A rolling 5-day window centered on `App::current_date` (2 days before, the
@@ -710,6 +711,7 @@ impl Component for App {
         let restored_custom_dates = settings.last_custom_view_dates.clone();
         let restored_view = match settings.last_view_mode {
             LastViewMode::Day => ViewMode::Day,
+            LastViewMode::Week => ViewMode::Week,
             LastViewMode::FiveDay => ViewMode::FiveDay,
             LastViewMode::Month => ViewMode::Month,
             LastViewMode::Custom if !restored_custom_dates.is_empty() => ViewMode::Custom,
@@ -741,7 +743,7 @@ impl Component for App {
         // through the exact same, already-correct logic a normal view switch uses.
         match (restored_view, restored_custom_dates.is_empty()) {
             (ViewMode::Custom, false) => sender.input(AppMsg::SetCustomViewDates(restored_custom_dates)),
-            (ViewMode::Day, _) | (ViewMode::FiveDay, _) => sender.input(AppMsg::SetView(restored_view)),
+            (ViewMode::Day, _) | (ViewMode::Week, _) | (ViewMode::FiveDay, _) => sender.input(AppMsg::SetView(restored_view)),
             (ViewMode::Month, _) if restored_date != today => sender.input(AppMsg::JumpToDate(restored_date)),
             _ => {}
         }
@@ -769,7 +771,7 @@ impl Component for App {
         widgets.view_menu_button.set_popover(Some(&build_view_switcher_popover(&sender, &ctx.storage)));
         widgets.view_menu_button.set_label(view_mode_label(model.current_view));
         widgets.month_view_container.set_visible(model.current_view == ViewMode::Month);
-        widgets.day_view_container.set_visible(matches!(model.current_view, ViewMode::Day | ViewMode::FiveDay));
+        widgets.day_view_container.set_visible(matches!(model.current_view, ViewMode::Day | ViewMode::Week | ViewMode::FiveDay));
 
         populate_month_grid(&widgets.month_grid, today, today, &events, &ctx);
         let gutter_px = populate_day_view(
@@ -925,6 +927,7 @@ impl Component for App {
                 match self.current_view {
                     ViewMode::Month => self.current_date = shift_month(self.current_date, -1),
                     ViewMode::Day => self.current_date -= Duration::days(1),
+                    ViewMode::Week => self.current_date -= Duration::days(7),
                     ViewMode::FiveDay => {
                         let show_weekends = load_settings(&self.core.storage).unwrap_or_default().show_weekends;
                         self.current_date = if show_weekends {
@@ -950,6 +953,7 @@ impl Component for App {
                 match self.current_view {
                     ViewMode::Month => self.current_date = shift_month(self.current_date, 1),
                     ViewMode::Day => self.current_date += Duration::days(1),
+                    ViewMode::Week => self.current_date += Duration::days(7),
                     ViewMode::FiveDay => {
                         let show_weekends = load_settings(&self.core.storage).unwrap_or_default().show_weekends;
                         self.current_date = if show_weekends {
@@ -973,10 +977,10 @@ impl Component for App {
             AppMsg::SetView(view) => {
                 self.current_view = view;
                 widgets.month_view_container.set_visible(view == ViewMode::Month);
-                widgets.day_view_container.set_visible(matches!(view, ViewMode::Day | ViewMode::FiveDay | ViewMode::Custom));
+                widgets.day_view_container.set_visible(matches!(view, ViewMode::Day | ViewMode::Week | ViewMode::FiveDay | ViewMode::Custom));
                 widgets.view_menu_button.set_label(view_mode_label(view));
                 self.refresh(widgets, &sender, root);
-                if matches!(view, ViewMode::Day | ViewMode::FiveDay | ViewMode::Custom) {
+                if matches!(view, ViewMode::Day | ViewMode::Week | ViewMode::FiveDay | ViewMode::Custom) {
                     // `day_overlay` was hidden (inside `day_view_container`) until the
                     // `set_visible(true)` above, so the `refresh` just above computed
                     // its event columns off a stale/zero width — correct it once a
@@ -985,6 +989,7 @@ impl Component for App {
                     let settings = load_settings(&self.core.storage).unwrap_or_default();
                     let visible_dates: Vec<NaiveDate> = match view {
                         ViewMode::Day => vec![self.current_date],
+                        ViewMode::Week => week_window(self.current_date, settings.show_weekends, settings.start_of_week),
                         ViewMode::FiveDay => five_day_window(self.current_date, settings.show_weekends),
                         ViewMode::Custom => self.custom_view_dates.clone(),
                         ViewMode::Month => Vec::new(),
@@ -1178,6 +1183,7 @@ impl Component for App {
         let mut settings = load_settings(&self.core.storage).unwrap_or_default();
         settings.last_view_mode = match self.current_view {
             ViewMode::Day => LastViewMode::Day,
+            ViewMode::Week => LastViewMode::Week,
             ViewMode::FiveDay => LastViewMode::FiveDay,
             ViewMode::Month => LastViewMode::Month,
             ViewMode::Custom => LastViewMode::Custom,
@@ -1261,6 +1267,7 @@ impl App {
         };
         populate_month_grid(&widgets.month_grid, self.current_date, today, &events, &ctx);
         let day_view_dates: Vec<NaiveDate> = match self.current_view {
+            ViewMode::Week => week_window(self.current_date, settings.show_weekends, settings.start_of_week),
             ViewMode::FiveDay => five_day_window(self.current_date, settings.show_weekends),
             ViewMode::Custom => self.custom_view_dates.clone(),
             ViewMode::Day | ViewMode::Month => vec![self.current_date],
@@ -1291,6 +1298,7 @@ impl App {
         let title = match self.current_view {
             ViewMode::Month => self.current_date.format("%B %Y").to_string(),
             ViewMode::Day => self.current_date.format("%A, %B %-d, %Y").to_string(),
+            ViewMode::Week => date_span_title(day_view_dates[0], *day_view_dates.last().expect("week has dates")),
             ViewMode::FiveDay => five_day_title(&day_view_dates),
             ViewMode::Custom => custom_view_title(&day_view_dates),
         };
@@ -1335,6 +1343,17 @@ fn step_weekdays(date: NaiveDate, delta: i32) -> NaiveDate {
         }
     }
     d
+}
+
+/// The calendar week containing the anchor, ordered by the preferred first day.
+/// Hiding weekends filters this fixed week rather than creating a rolling window.
+fn week_window(anchor: NaiveDate, show_weekends: bool, start_of_week: Option<u8>) -> Vec<NaiveDate> {
+    let first_day = start_of_week.filter(|day| *day < 7)
+        .unwrap_or(if system_locale_prefers_month_first() { 0 } else { 1 });
+    let offset = (anchor.weekday().num_days_from_sunday() as i64 - first_day as i64).rem_euclid(7);
+    let start = anchor - Duration::days(offset);
+    (0..7).map(|day| start + Duration::days(day))
+        .filter(|date| show_weekends || !is_weekend(*date)).collect()
 }
 
 /// The 5 dates shown in `ViewMode::FiveDay`, centered on `anchor` — 2 days before, the
@@ -1561,9 +1580,9 @@ fn focus_is_editable(widget: &gtk4::Widget) -> bool {
 
 /// Binds Google Calendar's own single-letter view shortcuts (DESIGN_SPEC.md §10/§12's
 /// "reused as-is" scheme) for the views that actually exist yet — `d` for Day, `m` for
-/// Month, `x` for 5-day. `w`/`y`/`a` stay unbound, matching the shortcuts legend's
+/// Month, `w` for Week, `x` for 5-day. `y`/`a` stay unbound, matching the shortcuts legend's
 /// "documents the full intended scheme rather than only what's implemented so far"
-/// note (see `SHORTCUT_GROUPS`), until Week/Year/Schedule views themselves land (§19).
+/// note (see `SHORTCUT_GROUPS`), until Year/Schedule views themselves land (§19).
 ///
 /// `Global` scope, same as `install_search_shortcut`/`install_preferences_shortcut`, so
 /// it fires while the month grid or day view has focus rather than only the window
@@ -1575,7 +1594,7 @@ fn install_view_shortcuts(root: &impl IsA<gtk4::Widget>, sender: &ComponentSende
     let controller = gtk4::ShortcutController::new();
     controller.set_scope(gtk4::ShortcutScope::Global);
 
-    for (key, view) in [("d", ViewMode::Day), ("m", ViewMode::Month), ("x", ViewMode::FiveDay)] {
+    for (key, view) in [("w", ViewMode::Week), ("d", ViewMode::Day), ("m", ViewMode::Month), ("x", ViewMode::FiveDay)] {
         let sender = sender.clone();
         controller.add_shortcut(gtk4::Shortcut::new(
             gtk4::ShortcutTrigger::parse_string(key),
@@ -3741,6 +3760,7 @@ fn system_timezone_abbreviation(now: DateTime<Local>) -> String {
 /// similar UI-only mappings.
 fn view_mode_label(view: ViewMode) -> &'static str {
     match view {
+        ViewMode::Week => "Week",
         ViewMode::Month => "Month",
         ViewMode::Day => "Day",
         ViewMode::FiveDay => "5 days",
@@ -3766,7 +3786,7 @@ type SettingsCheckboxSpec = (&'static str, fn(&AppSettings) -> bool, fn(&mut App
 /// of view rows — Schedule/Day/5 day/Week/Month/Year, matching the reference
 /// screenshot's order — followed by a separator and the "Show weekends"/"Show declined
 /// events"/"Show completed tasks" view-option checkboxes it also shows in the same
-/// dropdown. Day, 5 day, and Month are live, wired to `AppMsg::SetView`; Schedule/Week/
+/// dropdown. Day, Week, 5 day, and Month are live, wired to `AppMsg::SetView`; Schedule/
 /// Year stay disabled "coming soon" rows, matching the treatment
 /// `calendar_customizer_button` gives "Settings and sharing", until those views exist
 /// (§19's phased roadmap). Each live row also carries its single-letter accelerator in
@@ -3793,7 +3813,7 @@ fn build_view_switcher_popover(sender: &ComponentSender<App>, storage: &Storage)
         ("Schedule", SwitcherRow::ComingSoon),
         ("Day", SwitcherRow::Live(ViewMode::Day, "D")),
         ("5 day", SwitcherRow::Live(ViewMode::FiveDay, "X")),
-        ("Week", SwitcherRow::ComingSoon),
+        ("Week", SwitcherRow::Live(ViewMode::Week, "W")),
         ("Month", SwitcherRow::Live(ViewMode::Month, "M")),
         ("Year", SwitcherRow::ComingSoon),
     ] {
@@ -8328,8 +8348,8 @@ struct ShortcutGroup {
 /// The bindings DESIGN_SPEC.md §10 defines for Calendarchy's keyboard navigation —
 /// the header bar's `?` button (and, per §12, the `?` key itself) opens a read-only
 /// cheat sheet listing exactly this set. Not every entry is wired up yet
-/// (Schedule/Week/Year views and event creation are later roadmap phases, §19 —
-/// D/M/X are live, see `install_view_shortcuts`), but the legend documents the full
+/// (Schedule/Year views are later roadmap phases, §19 —
+/// D/W/M/X are live, see `install_view_shortcuts`), but the legend documents the full
 /// intended scheme rather than only what's implemented so far — the same "coming
 /// soon" treatment the sidebar and header bar already give other not-yet-built
 /// features.
@@ -8338,7 +8358,7 @@ const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
         title: "Navigation",
         items: &[
             ("T", "Jump to today"),
-            ("← / →", "Previous / next month"),
+            ("← / →", "Previous / next period"),
             ("↑ ↓ ← → , h j k l", "Move between days or weeks"),
         ],
     },
@@ -10168,7 +10188,7 @@ fn show_preferences_window(ctx: SettingsCtx) {
     layout_group.add(
         &adw::ActionRow::builder()
             .title("Default view on launch")
-            .subtitle("Month — Day and 5-day views exist now but aren't selectable here yet; Week/Year/Schedule are still on the roadmap")
+            .subtitle("Month — Day and 5-day views exist now but aren't selectable here yet; Year/Schedule are still on the roadmap")
             .build(),
     );
 
@@ -10303,7 +10323,7 @@ fn show_preferences_window(ctx: SettingsCtx) {
     let view_events_group = adw::PreferencesGroup::builder().title("Events").build();
     let show_weekends_row = adw::SwitchRow::builder()
         .title("Show weekends")
-        .subtitle("Currently only affects the 5-day view — Month still shows every day")
+        .subtitle("Applies to Week and 5-day views — Month shows every day")
         .active(settings.borrow().show_weekends)
         .build();
     {
@@ -10379,10 +10399,8 @@ fn show_preferences_window(ctx: SettingsCtx) {
     );
     content_box.append(&view_events_group);
 
-    // Simple stored preferences (no grid behavior to gate them on yet), so — like the
-    // General page's time zone rows above — these stay interactive and persist
-    // immediately rather than sitting behind `sensitive(false)`, even though nothing
-    // reads them yet.
+    // Week view uses the first-day preference immediately; other calendar
+    // preferences remain stored for the views that support them.
     let week_group = adw::PreferencesGroup::builder().title("Week & Alternate Calendars").build();
 
     const START_OF_WEEK_CHOICES: &[(&str, u8)] = &[("Saturday", 6), ("Sunday", 0), ("Monday", 1)];
@@ -10403,6 +10421,7 @@ fn show_preferences_window(ctx: SettingsCtx) {
     {
         let settings = settings.clone();
         let storage = ctx.storage.clone();
+        let sender = ctx.sender.clone();
         start_of_week_combo.connect_selected_notify(move |row| {
             let selected = row.selected();
             let day = (selected > 0).then(|| START_OF_WEEK_CHOICES[selected as usize - 1].1);
@@ -10410,6 +10429,7 @@ fn show_preferences_window(ctx: SettingsCtx) {
             if let Err(err) = save_settings(&storage, &settings.borrow()) {
                 tracing::warn!(%err, "failed to save preferences");
             }
+            sender.input(AppMsg::EventUpdated);
         });
     }
     week_group.add(&start_of_week_combo);
@@ -11458,6 +11478,32 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod day_view_layout_tests {
+    #[test]
+    fn week_window_respects_first_day_and_year_boundary() {
+        let anchor = chrono::NaiveDate::from_ymd_opt(2027, 1, 1).unwrap();
+        for first in [0, 1, 6] {
+            let dates = super::week_window(anchor, true, Some(first));
+            assert_eq!(dates.len(), 7);
+            assert_eq!(dates[0].weekday().num_days_from_sunday(), first as u32);
+            assert!(dates.contains(&anchor));
+            assert_eq!((dates[6] - dates[0]).num_days(), 6);
+            assert_eq!(super::week_window(anchor + chrono::Duration::days(7), true, Some(first))[0], dates[0] + chrono::Duration::days(7));
+        }
+    }
+
+    #[test]
+    fn week_window_hides_weekends_within_the_same_week() {
+        let sunday = chrono::NaiveDate::from_ymd_opt(2026, 10, 25).unwrap();
+        let dates = super::week_window(sunday, false, Some(0));
+        assert_eq!(dates.len(), 5);
+        assert_eq!(dates[0], sunday + chrono::Duration::days(1));
+        assert_eq!(dates[4], sunday + chrono::Duration::days(5));
+        // A Monday-first week keeps a Sunday anchor in the preceding work week.
+        let dates = super::week_window(sunday, false, Some(1));
+        assert_eq!(dates[0], sunday - chrono::Duration::days(6));
+        assert_eq!(dates[4], sunday - chrono::Duration::days(2));
+    }
+
     use super::*;
 
     #[test]

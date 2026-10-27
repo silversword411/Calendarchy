@@ -86,6 +86,7 @@ impl Default for EventEditorPanelMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LastViewMode {
     Day,
+    Week,
     FiveDay,
     Month,
     Custom,
