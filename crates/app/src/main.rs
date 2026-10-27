@@ -4096,6 +4096,20 @@ fn populate_day_view(
     // here.
     let columns = day_column_geometries(overlay.width(), gutter_px, dates.len());
 
+    // Added before any event block so it sits *beneath* them in the Overlay's stacking
+    // order: a press on an existing event still reaches that event's own `hit_box`,
+    // while a press on empty grid falls through to this surface instead.
+    let create_preview = install_day_create_drag(
+        overlay,
+        dates,
+        pixels_per_minute,
+        &columns,
+        scale_minutes,
+        ctrl_snap_minutes,
+        ctrl_shift_snap_minutes,
+        ctx,
+    );
+
     for (day_index, (&date, &column)) in dates.iter().zip(&columns).enumerate() {
         let date_key = date.format("%Y-%m-%d").to_string();
         for layout in layout_day_events(events, &date_key) {
@@ -4142,7 +4156,153 @@ fn populate_day_view(
             overlay.add_overlay(&dot);
         }
     }
+
+    // Draw the drag preview above existing events.
+    overlay.add_overlay(&create_preview);
     gutter_px
+}
+
+/// Resolves a drag-to-create gesture's anchor (where the press landed) and current
+/// pointer position, both in minutes since midnight, into a snapped `(start, end)`
+/// minute range: whichever end is earlier floors to the `snap_minutes` gridline at or
+/// above it, the later one ceils to the gridline at or below it — so the range always
+/// covers every slot the pointer has swept through, the way Google Calendar's own
+/// drag-to-create does — never shorter than one `snap_minutes` slot, and clamped to the
+/// day (`0..=24*60`).
+fn compute_day_create_range(anchor_min: f64, current_min: f64, snap_minutes: i64) -> (i64, i64) {
+    let snap = snap_minutes.max(1) as f64;
+    let day_minutes = 24 * 60;
+    let (low, high) = if current_min < anchor_min { (current_min, anchor_min) } else { (anchor_min, current_min) };
+    let start = ((low / snap).floor() * snap) as i64;
+    let end = ((high / snap).ceil() * snap) as i64;
+    let start = start.clamp(0, day_minutes - snap_minutes.max(1));
+    let end = end.max(start + snap_minutes.max(1)).min(day_minutes);
+    (start, end)
+}
+
+/// Google Calendar-style drag-to-create for the Day/5-day view's empty grid: adds a
+/// transparent, full-size surface to `overlay` (beneath the event blocks, see
+/// `populate_day_view`) owning a `GestureDrag`. Pressing in a day column and dragging
+/// paints a live preview block over the swept time range (`compute_day_create_range`,
+/// snapped per `day_drag_snap_scale` — the time-scale gridlines by default, or the
+/// Ctrl/Ctrl+Shift overrides, same as moving an event); releasing opens
+/// `show_edit_event_dialog` for a brand-new event (`default_new_event`, so the default
+/// calendar/reminder still apply) covering exactly that range. A press that never
+/// moves past `DAY_EVENT_CLICK_MOVE_THRESHOLD_PX`, or one in the time-label gutter, does
+/// nothing. The day column stays the one the press started in for the whole gesture.
+///
+/// The surface is rebuilt on every `populate_day_view` (it's an overlay extra, removed
+/// by `clear_day_overlay_extras`), rather than attaching the gesture once to the
+/// persistent hour grid, so its captured `dates`/geometry never go stale. Returns the
+/// (hidden) preview widget for the caller to add on top of the event blocks.
+fn install_day_create_drag(
+    overlay: &gtk4::Overlay,
+    dates: &[NaiveDate],
+    pixels_per_minute: f64,
+    columns: &[DayColumnGeometry],
+    scale_minutes: i64,
+    ctrl_snap_minutes: i64,
+    ctrl_shift_snap_minutes: i64,
+    ctx: &EventCtx,
+) -> gtk4::Box {
+    let surface = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    surface.set_halign(gtk4::Align::Fill);
+    surface.set_valign(gtk4::Align::Fill);
+    overlay.add_overlay(&surface);
+
+    let preview = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    preview.add_css_class("day-create-preview");
+    preview.set_halign(gtk4::Align::Start);
+    preview.set_valign(gtk4::Align::Start);
+    preview.set_can_target(false);
+    preview.set_visible(false);
+    let preview_label = gtk4::Label::new(None);
+    preview_label.add_css_class("day-create-preview-time");
+    preview_label.set_halign(gtk4::Align::Start);
+    preview_label.set_margin_start(6);
+    preview_label.set_margin_top(3);
+    preview.append(&preview_label);
+
+    // `(day_index, anchor_minutes)` for the gesture in progress — `None` when the press
+    // landed in the gutter, so update/end ignore it.
+    let anchor: Rc<Cell<Option<(usize, f64)>>> = Rc::new(Cell::new(None));
+    let dates: Vec<NaiveDate> = dates.to_vec();
+    let time_format = ctx.time_format;
+
+    let range_for = move |gesture: &gtk4::GestureDrag, anchor_min: f64, offset_y: f64| {
+        let snap = day_drag_snap_scale(gesture.current_event_state(), scale_minutes, ctrl_snap_minutes, ctrl_shift_snap_minutes)
+            .unwrap_or(scale_minutes);
+        compute_day_create_range(anchor_min, anchor_min + offset_y / pixels_per_minute, snap)
+    };
+
+    let gesture = gtk4::GestureDrag::new();
+    {
+        let anchor = anchor.clone();
+        let columns = columns.to_vec();
+        gesture.connect_drag_begin(move |_, start_x, start_y| {
+            let Some(day_index) = columns.iter().position(|column| {
+                start_x >= column.x_offset_px as f64
+                    && start_x < (column.x_offset_px + column.width_px) as f64
+            }) else {
+                anchor.set(None);
+                return;
+            };
+            anchor.set(Some((day_index, start_y / pixels_per_minute)));
+        });
+    }
+    {
+        let anchor = anchor.clone();
+        let preview = preview.clone();
+        let columns = columns.to_vec();
+        gesture.connect_drag_update(move |gesture, offset_x, offset_y| {
+            let Some((day_index, anchor_min)) = anchor.get() else { return };
+            if !preview.is_visible() {
+                if (offset_x * offset_x + offset_y * offset_y).sqrt() < DAY_EVENT_CLICK_MOVE_THRESHOLD_PX {
+                    return;
+                }
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                preview.set_visible(true);
+            }
+            let (start_min, end_min) = range_for(gesture, anchor_min, offset_y);
+            let top = (start_min as f64 * pixels_per_minute).round() as i32;
+            let height = ((end_min - start_min) as f64 * pixels_per_minute).round() as i32;
+            preview.set_margin_top(top);
+            preview.set_margin_start(columns[day_index].x_offset_px + 4);
+            preview.set_size_request((columns[day_index].width_px - 2).max(20), height.max(18));
+            let clock = |m: i64| {
+                format_clock(NaiveTime::from_hms_opt((m / 60 % 24) as u32, (m % 60) as u32, 0).expect("valid time"), time_format)
+            };
+            preview_label.set_label(&format!("{}–{}", clock(start_min), clock(end_min)));
+        });
+    }
+    {
+        let preview = preview.clone();
+        let ctx = ctx.clone();
+        gesture.connect_drag_end(move |gesture, _offset_x, offset_y| {
+            let Some((day_index, anchor_min)) = anchor.take() else { return };
+            if !preview.is_visible() {
+                return;
+            }
+            preview.set_visible(false);
+            let (start_min, end_min) = range_for(gesture, anchor_min, offset_y);
+            let Some(&date) = dates.get(day_index) else { return };
+            let midnight = NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is always valid");
+            let day_start = local_datetime(date, midnight);
+
+            let calendars = calendars_by_account(&ctx.storage).unwrap_or_default();
+            let settings = load_settings(&ctx.storage).unwrap_or_default();
+            let Some(mut detail) = default_new_event(&calendars, &settings) else {
+                tracing::warn!("no calendars available; cannot create a new event");
+                return;
+            };
+            detail.start = (day_start + Duration::minutes(start_min)).to_rfc3339();
+            detail.end = (day_start + Duration::minutes(end_min)).to_rfc3339();
+            show_edit_event_dialog(detail, calendars, ctx.clone());
+        });
+    }
+    surface.add_controller(gesture);
+
+    preview
 }
 
 /// The most columns overlapping events on the same day split into — beyond this,
@@ -10778,6 +10938,16 @@ fn load_static_css() {
             border-radius: 999px;
             padding: 1px 8px;
         }
+        .day-create-preview {
+            border-radius: 6px;
+            background-color: alpha(@accent_bg_color, 0.85);
+            color: @accent_fg_color;
+            box-shadow: 0 2px 6px alpha(black, 0.3);
+        }
+        .day-create-preview-time {
+            font-size: 0.78em;
+            font-weight: 700;
+        }
         .day-drag-hint {
             font-size: 0.72em;
             font-weight: 500;
@@ -10877,6 +11047,28 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod day_view_layout_tests {
     use super::*;
+
+    #[test]
+    fn create_range_snaps_outward_to_cover_swept_slots() {
+        // 9:10 → 9:50 on a 15-minute grid covers 9:00–10:00.
+        assert_eq!(compute_day_create_range(550.0, 590.0, 15), (540, 600));
+    }
+
+    #[test]
+    fn create_range_handles_upward_drag() {
+        assert_eq!(compute_day_create_range(590.0, 550.0, 15), (540, 600));
+    }
+
+    #[test]
+    fn create_range_is_at_least_one_slot() {
+        assert_eq!(compute_day_create_range(540.0, 540.0, 30), (540, 570));
+    }
+
+    #[test]
+    fn create_range_clamps_to_the_day() {
+        assert_eq!(compute_day_create_range(1420.0, 1600.0, 15), (1410, 1440));
+        assert_eq!(compute_day_create_range(30.0, -100.0, 15), (0, 30));
+    }
 
     fn ev(id: i64, start: &str, end: &str) -> DisplayEvent {
         DisplayEvent {
