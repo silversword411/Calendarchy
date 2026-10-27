@@ -268,6 +268,14 @@ struct OpenEditorPanel {
     titlebar: gtk4::Box,
     mode: Rc<Cell<EventEditorPanelMode>>,
     relayout: Rc<dyn Fn(EventEditorPanelMode)>,
+    draft: Option<DraftTimeEditor>,
+}
+
+/// Live access to an unsaved event's editor fields, shared with the grid preview.
+#[derive(Clone)]
+struct DraftTimeEditor {
+    read: Rc<dyn Fn() -> Option<(DateTime<Local>, DateTime<Local>)>>,
+    write: Rc<dyn Fn(DateTime<Local>, DateTime<Local>)>,
 }
 
 /// The main window's editor-docking widgets (DESIGN_SPEC.md §10's redesigned
@@ -1221,6 +1229,7 @@ impl App {
             &widgets.mini_calendar_title,
             self.mini_calendar_display_month(),
             Local::now().date_naive(),
+            Some(self.current_date),
             &jump,
             &jump_month,
             Some(&range_pick),
@@ -2131,7 +2140,7 @@ fn install_panel_drag(overlay: &gtk4::Overlay, docks: &EditorDocks, storage: &St
     // wrong anyway, since a panel could close mid-drag (e.g. via Escape) and this
     // gesture shouldn't suddenly start acting on whatever opens next.
     let active_panel: Rc<RefCell<Option<OpenEditorPanel>>> = Rc::new(RefCell::new(None));
-    let last_offset: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((0.0, 0.0)));
+    let drag_origin: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((0, 0)));
     // The panel's logical top-left if it were floating right now — tracked
     // independently of `panel_root`'s actual on-screen margins, since those get
     // overwritten with a *dock-shaped* preview whenever `pending_mode` isn't
@@ -2153,7 +2162,7 @@ fn install_panel_drag(overlay: &gtk4::Overlay, docks: &EditorDocks, storage: &St
     {
         let docks = docks.clone();
         let active_panel = active_panel.clone();
-        let last_offset = last_offset.clone();
+        let drag_origin = drag_origin.clone();
         let drag_pos = drag_pos.clone();
         let pending_mode = pending_mode.clone();
         let applied_layout = applied_layout.clone();
@@ -2184,21 +2193,21 @@ fn install_panel_drag(overlay: &gtk4::Overlay, docks: &EditorDocks, storage: &St
             let current_mode = panel.mode.get();
             pending_mode.set(current_mode);
             applied_layout.set(current_mode);
-            last_offset.set((0.0, 0.0));
 
             let start_pos = if current_mode == EventEditorPanelMode::Floating {
                 (panel.root.margin_start(), panel.root.margin_top())
             } else {
-                // Starting docked: nothing to read a floating position from yet —
-                // seed it from the titlebar's current on-screen spot instead, so
-                // *if* this drag ends up resolving to Floating, it starts from
-                // wherever the panel visually was rather than jumping.
-                panel
-                    .titlebar
-                    .compute_point(&docks.overlay, &gtk4::graphene::Point::new(0.0, 0.0))
-                    .map(|point| (point.x().max(0.0).round() as i32, point.y().max(0.0).round() as i32))
-                    .unwrap_or(DEFAULT_EDITOR_FLOATING_MARGIN_PX)
+                // Preserve the relative horizontal grab point as the wide dock
+                // becomes a narrower floating panel, and keep the titlebar under
+                // the pointer rather than anchoring to the dock's left edge.
+                panel.root.compute_bounds(&docks.overlay).map(|bounds| {
+                    let fraction = ((start_x - bounds.x() as f64) / bounds.width().max(1.0) as f64).clamp(0.0, 1.0);
+                    let grab_y = start_y - bounds.y() as f64;
+                    ((start_x - fraction * DEFAULT_EDITOR_FLOATING_SIZE_PX.0 as f64).round() as i32,
+                     (start_y - grab_y).round() as i32)
+                }).unwrap_or(DEFAULT_EDITOR_FLOATING_MARGIN_PX)
             };
+            drag_origin.set(start_pos);
             drag_pos.set(start_pos);
             *active_panel.borrow_mut() = Some(panel);
         });
@@ -2207,12 +2216,30 @@ fn install_panel_drag(overlay: &gtk4::Overlay, docks: &EditorDocks, storage: &St
         let docks = docks.clone();
         let storage = storage.clone();
         let active_panel = active_panel.clone();
-        let last_offset = last_offset.clone();
+        let drag_origin = drag_origin.clone();
         let drag_pos = drag_pos.clone();
         let pending_mode = pending_mode.clone();
         let applied_layout = applied_layout.clone();
-        drag.connect_drag_update(move |_, offset_x, offset_y| {
+        drag.connect_drag_update(move |gesture, offset_x, offset_y| {
             let Some(panel) = active_panel.borrow().clone() else { return };
+
+            let overlay_w = docks.overlay.width().max(1);
+            let overlay_h = docks.overlay.height().max(1);
+            let (floating_w, _) = DEFAULT_EDITOR_FLOATING_SIZE_PX;
+            let (origin_x, origin_y) = drag_origin.get();
+            // Always derive position from the original press. Accumulating clamped
+            // deltas loses pointer travel at window edges and makes the panel lag.
+            let clamped_x = ((origin_x as f64 + offset_x).round() as i32)
+                .clamp(0, (overlay_w - floating_w).max(0));
+            // Keep the handle reachable while allowing the body below the window.
+            let clamped_y = ((origin_y as f64 + offset_y).round() as i32)
+                .clamp(0, (overlay_h - 40).max(0));
+            drag_pos.set((clamped_x, clamped_y));
+            let (_, press_y) = gesture.start_point().unwrap_or((0.0, 0.0));
+            // Snap when the panel reaches the right edge; the pointer remains
+            // inside its titlebar and need not reach the edge itself.
+            let distance_to_right = (overlay_w - (clamped_x + floating_w)).max(0) as f64;
+            let distance_to_bottom = (overlay_h as f64 - (press_y + offset_y)).max(0.0);
 
             // A docked-start panel can't preview live in place (see this
             // function's doc comment) — pop it out to floating for real instead.
@@ -2225,19 +2252,21 @@ fn install_panel_drag(overlay: &gtk4::Overlay, docks: &EditorDocks, storage: &St
             // firing again on the tick or two before the idle callback runs.
             if panel.mode.get() != EventEditorPanelMode::Floating {
                 panel.mode.set(EventEditorPanelMode::Floating);
+                pending_mode.set(EventEditorPanelMode::Floating);
                 applied_layout.set(EventEditorPanelMode::Floating);
                 let panel_root = panel.root.clone();
                 let docks = docks.clone();
                 let active_panel = active_panel.clone();
                 let relayout = panel.relayout.clone();
-                let (start_x, start_y) = drag_pos.get();
+                let drag_pos = drag_pos.clone();
                 gtk4::glib::idle_add_local_once(move || {
                     // Skip if `drag-end` already concluded this gesture (and
                     // reparented the panel itself, possibly into a dock rather
                     // than floating) before this had a chance to run —
                     // reparenting it again here would undo that.
                     if active_panel.borrow().is_some() {
-                        attach_floating(&panel_root, &docks, start_x, start_y);
+                        let (x, y) = drag_pos.get();
+                        attach_floating(&panel_root, &docks, x, y);
                         // Without this, the panel's field rows are still in
                         // whatever arrangement the dock it just left used (e.g.
                         // Bottom's wide two-column layout) — that content's own
@@ -2251,23 +2280,6 @@ fn install_panel_drag(overlay: &gtk4::Overlay, docks: &EditorDocks, storage: &St
                 return;
             }
 
-            let (last_x, last_y) = last_offset.get();
-            let (dx, dy) = (offset_x - last_x, offset_y - last_y);
-            last_offset.set((offset_x, offset_y));
-
-            let overlay_w = docks.overlay.width().max(1);
-            let overlay_h = docks.overlay.height().max(1);
-            let (floating_w, floating_h) = DEFAULT_EDITOR_FLOATING_SIZE_PX;
-
-            let (prev_x, prev_y) = drag_pos.get();
-            let clamped_x = (prev_x as f64 + dx).round() as i32;
-            let clamped_y = (prev_y as f64 + dy).round() as i32;
-            let clamped_x = clamped_x.clamp(0, (overlay_w - floating_w).max(0));
-            let clamped_y = clamped_y.clamp(0, (overlay_h - floating_h).max(0));
-            drag_pos.set((clamped_x, clamped_y));
-
-            let distance_to_right = (overlay_w - (clamped_x + floating_w)).max(0) as f64;
-            let distance_to_bottom = (overlay_h - (clamped_y + floating_h)).max(0) as f64;
             let new_pending = if distance_to_bottom < EDITOR_PANEL_SNAP_THRESHOLD_PX && distance_to_bottom <= distance_to_right
             {
                 EventEditorPanelMode::Bottom
@@ -2693,6 +2705,7 @@ fn populate_mini_calendar(
     title_button: &gtk4::MenuButton,
     display_month: NaiveDate,
     today: NaiveDate,
+    selected_date: Option<NaiveDate>,
     on_pick: &Rc<dyn Fn(NaiveDate)>,
     on_jump_month: &Rc<dyn Fn(NaiveDate)>,
     on_range_pick: Option<&Rc<dyn Fn(Vec<NaiveDate>)>>,
@@ -2738,6 +2751,9 @@ fn populate_mini_calendar(
         }
         if date == today {
             button.add_css_class("mini-calendar-today");
+        }
+        if selected_date == Some(date) {
+            button.add_css_class("mini-calendar-day-selected");
         }
         if selected_range.contains(&date) {
             button.add_css_class("mini-calendar-day-in-range");
@@ -4264,6 +4280,7 @@ fn install_day_create_drag(
     // landed in the gutter, so update/end ignore it.
     let anchor: Rc<Cell<Option<(usize, f64)>>> = Rc::new(Cell::new(None));
     let dates: Vec<NaiveDate> = dates.to_vec();
+    let dates_for_preview = dates.clone();
     let time_format = ctx.time_format;
 
     let range_for = move |gesture: &gtk4::GestureDrag, anchor_min: f64, offset_y: f64| {
@@ -4276,6 +4293,7 @@ fn install_day_create_drag(
     {
         let anchor = anchor.clone();
         let columns = columns.to_vec();
+        let preview = preview.clone();
         gesture.connect_drag_begin(move |_, start_x, start_y| {
             let Some(day_index) = columns.iter().position(|column| {
                 start_x >= column.x_offset_px as f64
@@ -4284,6 +4302,8 @@ fn install_day_create_drag(
                 anchor.set(None);
                 return;
             };
+            preview.set_visible(false);
+            preview.set_can_target(false);
             anchor.set(Some((day_index, start_y / pixels_per_minute)));
         });
     }
@@ -4291,6 +4311,7 @@ fn install_day_create_drag(
         let anchor = anchor.clone();
         let preview = preview.clone();
         let columns = columns.to_vec();
+        let preview_label = preview_label.clone();
         gesture.connect_drag_update(move |gesture, offset_x, offset_y| {
             let Some((day_index, anchor_min)) = anchor.get() else { return };
             if !preview.is_visible() {
@@ -4315,12 +4336,12 @@ fn install_day_create_drag(
     {
         let preview = preview.clone();
         let ctx = ctx.clone();
+        let anchor = anchor.clone();
         gesture.connect_drag_end(move |gesture, _offset_x, offset_y| {
             let Some((day_index, anchor_min)) = anchor.take() else { return };
             if !preview.is_visible() {
                 return;
             }
-            preview.set_visible(false);
             let (start_min, end_min) = range_for(gesture, anchor_min, offset_y);
             let Some(&date) = dates.get(day_index) else { return };
             let midnight = NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is always valid");
@@ -4329,6 +4350,7 @@ fn install_day_create_drag(
             let calendars = calendars_by_account(&ctx.storage).unwrap_or_default();
             let settings = load_settings(&ctx.storage).unwrap_or_default();
             let Some(mut detail) = default_new_event(&calendars, &settings) else {
+                preview.set_visible(false);
                 tracing::warn!("no calendars available; cannot create a new event");
                 return;
             };
@@ -4338,8 +4360,88 @@ fn install_day_create_drag(
         });
     }
     surface.add_controller(gesture);
+    install_draft_preview(&surface, &preview, &preview_label, &anchor, &dates_for_preview, columns, pixels_per_minute,
+        ctrl_snap_minutes, ctrl_shift_snap_minutes, ctx);
 
     preview
+}
+
+/// Renders the open draft from its editor fields, including after a grid rebuild.
+fn install_draft_preview(
+    surface: &gtk4::Box,
+    preview: &gtk4::Box,
+    label: &gtk4::Label,
+    create_anchor: &Rc<Cell<Option<(usize, f64)>>>,
+    dates: &[NaiveDate],
+    columns: &[DayColumnGeometry],
+    pixels_per_minute: f64,
+    ctrl_minutes: i64,
+    ctrl_shift_minutes: i64,
+    ctx: &EventCtx,
+) {
+    let panels = ctx.docks.current_panel.clone();
+    let anchor = create_anchor.clone();
+    let dates_tick = dates.to_vec();
+    let columns_tick = columns.to_vec();
+    let label = label.clone();
+    let time_format = ctx.time_format;
+    let preview_weak = preview.downgrade();
+    surface.add_tick_callback(move |_, _| {
+        let Some(preview) = preview_weak.upgrade() else { return gtk4::glib::ControlFlow::Break; };
+        if anchor.get().is_some() { return gtk4::glib::ControlFlow::Continue; }
+        let times = panels.borrow().as_ref().and_then(|p| p.draft.as_ref()).and_then(|d| (d.read)());
+        let visible = times.and_then(|(start, end)| {
+            dates_tick.iter().position(|date| *date == start.date_naive()).map(|index| (index, start, end))
+        });
+        if let Some((index, start, end)) = visible {
+            let start_min = start.hour() as f64 * 60.0 + start.minute() as f64;
+            let duration = (end - start).num_minutes().max(1) as f64;
+            preview.set_margin_top((start_min * pixels_per_minute).round() as i32);
+            preview.set_margin_start(columns_tick[index].x_offset_px + 4);
+            preview.set_size_request((columns_tick[index].width_px - 2).max(20), (duration * pixels_per_minute).round().max(18.0) as i32);
+            label.set_label(&format!("{}–{}", format_clock(start.time(), time_format), format_clock(end.time(), time_format)));
+            preview.set_can_target(true);
+            preview.set_visible(true);
+        } else {
+            preview.set_visible(false);
+            preview.set_can_target(false);
+        }
+        gtk4::glib::ControlFlow::Continue
+    });
+    preview.set_cursor_from_name(Some("grab"));
+    let drag = gtk4::GestureDrag::new();
+    drag.set_button(gtk4::gdk::BUTTON_PRIMARY);
+    let state = Rc::new(RefCell::new(None));
+    {
+        let state = state.clone();
+        let panels = ctx.docks.current_panel.clone();
+        let preview = preview.downgrade();
+        let dates = dates.to_vec();
+        drag.connect_drag_begin(move |gesture, _, y| {
+            let draft = panels.borrow().as_ref().and_then(|p| p.draft.clone());
+            let Some(draft) = draft else { return };
+            let Some((start, end)) = (draft.read)() else { return };
+            let Some(index) = dates.iter().position(|date| *date == start.date_naive()) else { return };
+            let Some(preview) = preview.upgrade() else { return };
+            let zone = classify_day_drag_zone(y, preview.height());
+            *state.borrow_mut() = Some((draft, DayDragState { zone, original_start: start, original_end: end }, index));
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+        });
+    }
+    {
+        let state = state.clone();
+        let dates = dates.to_vec();
+        let columns = columns.to_vec();
+        drag.connect_drag_update(move |gesture, x, y| {
+            let state = state.borrow();
+            let Some((draft, original, index)) = state.as_ref() else { return };
+            let snap = day_drag_snap_scale(gesture.current_event_state(), ctrl_minutes, ctrl_shift_minutes);
+            let result = compute_day_drag_times(original, x, y, pixels_per_minute, columns[*index].width_px as f64, &dates, *index, snap);
+            (draft.write)(result.start, result.end);
+        });
+    }
+    drag.connect_drag_end(move |_, _, _| { state.borrow_mut().take(); });
+    preview.add_controller(drag);
 }
 
 /// The most columns overlapping events on the same day split into — beyond this,
@@ -5809,15 +5911,33 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
     // regardless of what's in its toolbar underneath, so this panel gets one too,
     // and it's the one and only widget `install_panel_drag`'s `GestureDrag` attaches
     // to (both floating and docked — undocking needs a drag handle just as much as
-    // floating does). Left blank (no title text) — the actual editable title field
-    // lives in the row underneath, which already reads as "this is titled X".
+    // floating does). A centered six-dot grip marks the draggable region; the
+    // editable title field lives in the row underneath.
     let titlebar = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    titlebar.set_hexpand(true);
     titlebar.add_css_class("event-editor-titlebar");
     titlebar.set_margin_start(10);
     titlebar.set_margin_end(10);
     titlebar.set_margin_top(4);
     titlebar.set_margin_bottom(4);
     titlebar.set_cursor_from_name(Some("grab"));
+    titlebar.set_tooltip_text(Some("Drag to move or dock the event editor"));
+    let grip = gtk4::Box::new(gtk4::Orientation::Vertical, 3);
+    grip.add_css_class("event-editor-drag-grip");
+    grip.set_hexpand(true);
+    grip.set_halign(gtk4::Align::Center);
+    grip.set_valign(gtk4::Align::Center);
+    grip.set_can_target(false);
+    for _ in 0..2 {
+        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 3);
+        for _ in 0..3 {
+            let dot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+            dot.add_css_class("event-editor-grip-dot");
+            row.append(&dot);
+        }
+        grip.append(&row);
+    }
+    titlebar.append(&grip);
 
     // A plain `Box`, not `adw::HeaderBar` — deliberately, even though it means giving
     // up `HeaderBar`'s automatic centered-title layout. `HeaderBar`/`AdwHeaderBar`
@@ -5834,7 +5954,9 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
 
     let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
     close_btn.add_css_class("flat");
-    close_btn.set_tooltip_text(Some("Close"));
+    close_btn.set_tooltip_text(Some("Close editor"));
+    close_btn.set_valign(gtk4::Align::Center);
+    close_btn.set_margin_end(6);
     {
         let panel_root = panel_root.clone();
         let docks = ctx.docks.clone();
@@ -5846,7 +5968,10 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
             confirm_close(&window, &dirty, move || close_panel(&panel_root, &docks));
         });
     }
-    header.append(&close_btn);
+    // Keep Close outside the draggable region so pressing it cannot start a drag.
+    let titlebar_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    titlebar_row.append(&titlebar);
+    titlebar_row.append(&close_btn);
 
     let title_entry = gtk4::Entry::new();
     // `.flat` alone still leaves a visible border/focus outline in this theme —
@@ -5858,6 +5983,7 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
     title_entry.set_placeholder_text(Some("Add title"));
     title_entry.set_text(&event.title);
     title_entry.set_hexpand(true);
+    let initial_focus = title_entry.downgrade();
     {
         let dirty = dirty.clone();
         title_entry.connect_changed(move |_| dirty.set(true));
@@ -5875,8 +6001,16 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
     let body = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
     body.set_margin_all(18);
 
-    let (start_button, start_picked) = date_picker(start_date, dirty.clone(), ctx.date_format);
-    let (end_button, end_picked) = date_picker(end_date, dirty.clone(), ctx.date_format);
+    let follow_date: Rc<dyn Fn(NaiveDate)> = {
+        let sender = ctx.sender.clone();
+        Rc::new(move |date| sender.input(AppMsg::JumpToDate(date)))
+    };
+    let (start_button, start_picked) = date_picker_with_on_pick(
+        start_date, dirty.clone(), ctx.date_format, Some(follow_date.clone()),
+    );
+    let (end_button, end_picked) = date_picker_with_on_pick(
+        end_date, dirty.clone(), ctx.date_format, Some(follow_date),
+    );
 
     let (start_time_entry, start_time_picked) = time_picker(start_time, dirty.clone(), ctx.time_format);
     let (end_time_entry, end_time_picked) = time_picker(end_time, dirty.clone(), ctx.time_format);
@@ -6070,7 +6204,7 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
         .child(&body)
         .build();
 
-    panel_root.add_top_bar(&titlebar);
+    panel_root.add_top_bar(&titlebar_row);
     panel_root.add_top_bar(&header);
     panel_root.set_content(Some(&scroller));
     install_panel_escape_to_close(&panel_root, {
@@ -6084,6 +6218,37 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
             confirm_close(&window, &dirty, move || close_panel(&panel_root, &docks));
         }
     });
+
+    let draft = if event.id <= 0 {
+        let start_date = start_picked.clone();
+        let end_date = end_picked.clone();
+        let start_time = start_time_picked.clone();
+        let end_time = end_time_picked.clone();
+        let all_day = all_day_check.clone();
+        let read = Rc::new(move || {
+            if all_day.is_active() { return None; }
+            Some((local_datetime(start_date.get(), start_time.get()), local_datetime(end_date.get(), end_time.get())))
+        });
+        let start_date = start_picked.clone();
+        let end_date = end_picked.clone();
+        let start_time = start_time_picked.clone();
+        let end_time = end_time_picked.clone();
+        let dirty = dirty.clone();
+        let date_format = ctx.date_format;
+        let time_format = ctx.time_format;
+        let write = Rc::new(move |start: DateTime<Local>, end: DateTime<Local>| {
+            start_date.set(start.date_naive());
+            end_date.set(end.date_naive());
+            start_time.set(start.time());
+            end_time.set(end.time());
+            start_button.set_label(&format_picker_date(start.date_naive(), date_format));
+            end_button.set_label(&format_picker_date(end.date_naive(), date_format));
+            start_time_entry.set_text(&format_clock(start.time(), time_format));
+            end_time_entry.set_text(&format_clock(end.time(), time_format));
+            dirty.set(true);
+        });
+        Some(DraftTimeEditor { read, write })
+    } else { None };
 
     let event_id = event.id;
     {
@@ -6191,6 +6356,14 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
     mode.set(settings.event_editor_panel_mode);
     dock_panel(&panel_root, mode.get(), &ctx.docks, &ctx.storage);
     relayout_body(mode.get());
+    // Wait until the editor has been attached and laid out before taking focus.
+    gtk4::glib::idle_add_local_once(move || {
+        if let Some(entry) = initial_focus.upgrade() {
+            if entry.is_mapped() {
+                entry.grab_focus();
+            }
+        }
+    });
     // Makes this panel visible to the one persistent drag gesture installed on
     // `editor_overlay` at `init` time — see `install_panel_drag`'s doc comment for
     // why that gesture lives there instead of on this panel's own titlebar.
@@ -6199,6 +6372,7 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
         titlebar: titlebar.clone(),
         mode: mode.clone(),
         relayout: relayout_body,
+        draft,
     });
 }
 
@@ -6627,7 +6801,15 @@ fn non_empty(s: String) -> Option<String> {
 /// currently-picked date, read back on Save. `dirty` is marked on every pick, same as
 /// the dialog's other fields, for `install_close_guard`.
 fn date_picker(initial: NaiveDate, dirty: Rc<Cell<bool>>, date_format: DateFormat) -> (gtk4::MenuButton, Rc<Cell<NaiveDate>>) {
-    let today = Local::now().date_naive();
+    date_picker_with_on_pick(initial, dirty, date_format, None)
+}
+
+fn date_picker_with_on_pick(
+    initial: NaiveDate,
+    dirty: Rc<Cell<bool>>,
+    date_format: DateFormat,
+    on_date_changed: Option<Rc<dyn Fn(NaiveDate)>>,
+) -> (gtk4::MenuButton, Rc<Cell<NaiveDate>>) {
     let state = Rc::new(Cell::new(initial));
     let display_month = Rc::new(Cell::new(initial));
 
@@ -6678,19 +6860,37 @@ fn date_picker(initial: NaiveDate, dirty: Rc<Cell<bool>>, date_format: DateForma
             button.set_label(&format_picker_date(date, date_format));
             dirty.set(true);
             popover.popdown();
+            if let Some(on_date_changed) = &on_date_changed {
+                on_date_changed(date);
+            }
         })
     };
 
-    refresh_date_picker(&day_grid, &title_button, &display_month, today, &on_pick);
+    refresh_date_picker(&day_grid, &title_button, &display_month, &state, &on_pick);
 
     for (delta, nav_btn) in [(-1, &prev_btn), (1, &next_btn)] {
         let day_grid = day_grid.clone();
         let title_button = title_button.clone();
         let display_month = display_month.clone();
         let on_pick = on_pick.clone();
+        let state = state.clone();
         nav_btn.connect_clicked(move |_| {
             display_month.set(shift_month(display_month.get(), delta));
-            refresh_date_picker(&day_grid, &title_button, &display_month, today, &on_pick);
+            refresh_date_picker(&day_grid, &title_button, &display_month, &state, &on_pick);
+        });
+    }
+
+    // Reopen on the current field value, including changes made by dragging
+    // the draft, rather than retaining an old month or today's highlight.
+    {
+        let state = state.clone();
+        let display_month = display_month.clone();
+        let day_grid = day_grid.clone();
+        let title_button = title_button.clone();
+        let on_pick = on_pick.clone();
+        popover.connect_show(move |_| {
+            display_month.set(state.get());
+            refresh_date_picker(&day_grid, &title_button, &display_month, &state, &on_pick);
         });
     }
 
@@ -6709,7 +6909,7 @@ fn refresh_date_picker(
     day_grid: &gtk4::Grid,
     title_button: &gtk4::MenuButton,
     display_month: &Rc<Cell<NaiveDate>>,
-    today: NaiveDate,
+    selected: &Rc<Cell<NaiveDate>>,
     on_pick: &Rc<dyn Fn(NaiveDate)>,
 ) {
     let on_jump_month: Rc<dyn Fn(NaiveDate)> = {
@@ -6717,17 +6917,18 @@ fn refresh_date_picker(
         let title_button = title_button.clone();
         let display_month = display_month.clone();
         let on_pick = on_pick.clone();
+        let selected = selected.clone();
         Rc::new(move |date: NaiveDate| {
             display_month.set(date);
-            refresh_date_picker(&day_grid, &title_button, &display_month, today, &on_pick);
+            refresh_date_picker(&day_grid, &title_button, &display_month, &selected, &on_pick);
         })
     };
-    populate_mini_calendar(day_grid, title_button, display_month.get(), today, on_pick, &on_jump_month, None, &[]);
+    populate_mini_calendar(day_grid, title_button, display_month.get(), Local::now().date_naive(), Some(selected.get()), on_pick, &on_jump_month, None, &[]);
 }
 
 /// A Google-Calendar-style time field for the edit dialog's start/end time (reference
 /// screenshot): a directly-editable `Entry` — type a time and press Enter or click
-/// away — paired with a scrollable quarter-hour popover list that opens on focus, for
+/// away — paired with a scrollable quarter-hour popover list that opens on click, for
 /// picking instead of typing. Both the entry and the list show times using the
 /// resolved `time_format`, but *typed* input is parsed leniently regardless of that
 /// display format (`parse_time_input` accepts "14:30" and "2:30pm" either way).
@@ -6747,6 +6948,7 @@ fn time_picker(initial: NaiveTime, dirty: Rc<Cell<bool>>, time_format: TimeForma
 
     let list_box = gtk4::ListBox::new();
     list_box.set_selection_mode(gtk4::SelectionMode::None);
+    list_box.set_focusable(false);
     for quarter in 0..QUARTER_HOURS {
         let total_minutes = quarter * 15;
         let time = NaiveTime::from_hms_opt((total_minutes / 60) as u32, (total_minutes % 60) as u32, 0).expect("valid quarter-hour");
@@ -6757,6 +6959,7 @@ fn time_picker(initial: NaiveTime, dirty: Rc<Cell<bool>>, time_format: TimeForma
         label.set_margin_top(4);
         label.set_margin_bottom(4);
         let row = gtk4::ListBoxRow::new();
+        row.set_focusable(false);
         row.set_child(Some(&label));
         list_box.append(&row);
     }
@@ -6769,6 +6972,11 @@ fn time_picker(initial: NaiveTime, dirty: Rc<Cell<bool>>, time_format: TimeForma
         .build();
 
     let popover = gtk4::Popover::new();
+    // A non-modal suggestion list must not grab the keyboard away from the
+    // editable field. Its rows remain clickable while typing stays in the entry.
+    popover.set_autohide(false);
+    popover.set_focusable(false);
+    scroller.set_focusable(false);
     popover.add_css_class("time-picker-popover");
     popover.set_child(Some(&scroller));
     popover.set_parent(&entry);
@@ -6810,7 +7018,7 @@ fn time_picker(initial: NaiveTime, dirty: Rc<Cell<bool>>, time_format: TimeForma
     // Scrolls the popover so the current value sits centered in the visible list
     // (rather than just barely scrolled into view, which is all `row.grab_focus()` +
     // the `ScrolledWindow`'s default focus-follow behavior would give) — computed on
-    // `map`, not on the focus-in that triggers `popup()` below, since the row's
+    // `map`, not when triggering `popup()` below, since the row's
     // `measure()` and the scrolled window's adjustment bounds aren't reliable until
     // the popover has actually been shown and laid out.
     {
@@ -6830,13 +7038,55 @@ fn time_picker(initial: NaiveTime, dirty: Rc<Cell<bool>>, time_format: TimeForma
         });
     }
 
-    let focus_controller = gtk4::EventControllerFocus::new();
+    // Opening on focus-enter and closing on focus-leave creates a focus loop:
+    // the popover takes focus, closes, then restores focus to the entry and opens
+    // again. Open only on an explicit click (or Down key), and dismiss when
+    // focus leaves the field.
+    let click = gtk4::GestureClick::new();
+    click.set_button(gtk4::gdk::BUTTON_PRIMARY);
+    // GtkEntry's internal text widget claims the click for cursor placement,
+    // preventing a bubbling release handler from seeing it. Observe the press
+    // first, then open after GTK finishes dispatching it without claiming it.
+    click.set_propagation_phase(gtk4::PropagationPhase::Capture);
     {
-        let popover = popover.clone();
-        focus_controller.connect_enter(move |_| {
-            popover.popup();
+        let popover = popover.downgrade();
+        click.connect_pressed(move |_, _, _, _| {
+            let popover = popover.clone();
+            gtk4::glib::idle_add_local_once(move || {
+                if let Some(popover) = popover.upgrade() {
+                    if popover.parent().is_some_and(|entry| entry.is_mapped()) {
+                        popover.popup();
+                    }
+                }
+            });
         });
     }
+    entry.add_controller(click);
+    let keys = gtk4::EventControllerKey::new();
+    keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    {
+        let popover = popover.clone();
+        let commit = commit.clone();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk4::gdk::Key::Tab || key == gtk4::gdk::Key::ISO_Left_Tab {
+                // Remove the suggestion list before GTK determines the next
+                // focus target, then allow normal Tab/Shift+Tab navigation.
+                commit();
+                popover.popdown();
+                gtk4::glib::Propagation::Proceed
+            } else if key == gtk4::gdk::Key::Down {
+                popover.popup();
+                gtk4::glib::Propagation::Stop
+            } else if key == gtk4::gdk::Key::Escape && popover.is_visible() {
+                popover.popdown();
+                gtk4::glib::Propagation::Stop
+            } else {
+                gtk4::glib::Propagation::Proceed
+            }
+        });
+    }
+    entry.add_controller(keys);
+    let focus_controller = gtk4::EventControllerFocus::new();
     {
         let commit = commit.clone();
         let popover = popover.clone();
@@ -10558,19 +10808,20 @@ fn load_static_css() {
             box-shadow: none;
             outline: none;
         }
-        /* The slim titlebar strip above .event-editor-header — a plain, obvious
-           grab-anywhere drag handle. Same background as the panel itself
-           (@window_bg_color, matching .floating-editor-panel) rather than a
-           contrasting tint, so it reads as part of one continuous panel with a
-           dedicated drag region at top instead of a mismatched bar; the hairline
-           border below is what actually separates it from the header row beneath.
-           It carries no label/content of its own (blank by design), so it needs an
-           explicit min-height here — without one, a childless Box collapses to
-           just its own margins, leaving almost nothing left to see or grab. */
+        /* A visible grip marks the full-width drag target in every dock mode. */
         .event-editor-titlebar {
             background-color: @window_bg_color;
             border-bottom: 1px solid alpha(currentColor, 0.1);
             min-height: 28px;
+        }
+        .event-editor-grip-dot {
+            min-width: 3px;
+            min-height: 3px;
+            border-radius: 999px;
+            background-color: alpha(currentColor, 0.45);
+        }
+        .event-editor-titlebar:hover .event-editor-grip-dot {
+            background-color: alpha(currentColor, 0.8);
         }
         menubutton.view-switcher-button {
             border: 1px solid white;
@@ -10758,8 +11009,13 @@ fn load_static_css() {
             background-color: alpha(@accent_bg_color, 0.35);
         }
         .mini-calendar-day.mini-calendar-day-selected {
+            background-color: alpha(@accent_bg_color, 0.35);
+            color: @window_fg_color;
+        }
+        .mini-calendar-day.mini-calendar-day-selected.mini-calendar-today {
             background-color: @accent_bg_color;
             color: @accent_fg_color;
+            box-shadow: inset 0 0 0 2px alpha(@accent_fg_color, 0.65);
         }
         .sidebar-section-header {
             font-size: 0.78em;

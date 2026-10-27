@@ -18,6 +18,26 @@
             "problemMatcher": ["$rustc"]
         },
         {
+            "label": "Calendarchy: Watch and run",
+            "type": "process",
+            "command": "${env:HOME}/.cargo/bin/watchexec",
+            "args": [
+                "--restart",
+                "-w", "crates",
+                "-w", "Cargo.toml",
+                "-w", "Cargo.lock",
+                "--", "cargo", "run", "-p", "calendarchy"
+            ],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": ["$rustc"],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            },
+            "runOptions": { "instanceLimit": 1 }
+        },
+        {
             "label": "cargo test",
             "type": "shell",
             "command": "cargo",
