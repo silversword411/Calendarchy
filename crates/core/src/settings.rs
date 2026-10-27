@@ -85,6 +85,9 @@ impl Default for EventEditorPanelMode {
 /// can't depend on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LastViewMode {
+    #[serde(alias = "Schedule")]
+    Table,
+    Agenda,
     Year,
     Day,
     Week,
@@ -328,6 +331,16 @@ pub struct AppSettings {
     /// The exact date range shown when the window was last closed in Custom view
     /// (e.g. a 3-day span) — empty unless `last_view_mode` is `Custom`.
     pub last_custom_view_dates: Vec<NaiveDate>,
+    /// Table view layout and filters (legacy schedule_* keys preserve saved layouts). Empty column order uses the default layout.
+    pub schedule_columns: Vec<String>,
+    pub schedule_hidden_columns: Vec<String>,
+    pub schedule_column_widths: std::collections::HashMap<String, i32>,
+    pub schedule_sort_column: String,
+    pub schedule_sort_descending: bool,
+    /// Zero means all cached events; other values are a forward-looking day range.
+    pub schedule_range_days: u32,
+    /// all, timed, or all_day.
+    pub schedule_event_kind: String,
 }
 
 impl Default for AppSettings {
@@ -384,6 +397,13 @@ impl Default for AppSettings {
             last_view_mode: LastViewMode::Month,
             last_view_date: None,
             last_custom_view_dates: Vec::new(),
+            schedule_columns: Vec::new(),
+            schedule_hidden_columns: Vec::new(),
+            schedule_column_widths: std::collections::HashMap::new(),
+            schedule_sort_column: "start".into(),
+            schedule_sort_descending: false,
+            schedule_range_days: 30,
+            schedule_event_kind: "all".into(),
         }
     }
 }
@@ -416,6 +436,13 @@ pub fn save_settings(storage: &Storage, settings: &AppSettings) -> anyhow::Resul
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_schedule_view_restores_as_table() {
+        let mode: super::LastViewMode = serde_json::from_str("\"Schedule\"").unwrap();
+        assert_eq!(mode, super::LastViewMode::Table);
+        assert_eq!(serde_json::to_string(&super::LastViewMode::Agenda).unwrap(), "\"Agenda\"");
+    }
+
     use super::*;
 
     #[test]

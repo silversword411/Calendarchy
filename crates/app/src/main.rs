@@ -26,6 +26,8 @@ use relm4::adw::prelude::*;
 use relm4::prelude::*;
 
 mod notifications;
+mod table;
+mod schedule;
 
 /// Core wiring (DESIGN_SPEC.md §6, roadmap phase 0) plumbed into the app so the UI
 /// layer never talks to storage/services directly — it goes through this handle.
@@ -71,11 +73,11 @@ fn init_core() -> anyhow::Result<AppCore> {
     Ok(AppCore { accounts, storage })
 }
 
-/// Which main-content view is displayed (DESIGN_SPEC.md §10). `Month`, `Day`, and
-/// `FiveDay`, `Week`, and `Year` are wired up — Schedule stays "coming soon" in the header bar's
-/// view-switcher popover (`build_view_switcher_popover`) per the phased roadmap (§19).
+/// Main calendar presentation, including Table and the day-grouped Schedule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
+    Table,
+    Schedule,
     Year,
     Week,
     Month,
@@ -597,6 +599,22 @@ impl Component for App {
                                         },
                                     },
 
+                                    #[name = "schedule_view_container"]
+                                    gtk4::Box {
+                                        set_orientation: gtk4::Orientation::Vertical,
+                                        set_hexpand: true,
+                                        set_vexpand: true,
+                                        set_visible: false,
+                                    },
+
+                                    #[name = "table_view_container"]
+                                    gtk4::Box {
+                                        set_orientation: gtk4::Orientation::Vertical,
+                                        set_hexpand: true,
+                                        set_vexpand: true,
+                                        set_visible: false,
+                                    },
+
                                     #[name = "year_view_container"]
                                     gtk4::ScrolledWindow {
                                         add_css_class: "card",
@@ -735,6 +753,8 @@ impl Component for App {
             LastViewMode::Day => ViewMode::Day,
             LastViewMode::Week => ViewMode::Week,
             LastViewMode::Year => ViewMode::Year,
+            LastViewMode::Table => ViewMode::Table,
+            LastViewMode::Agenda => ViewMode::Schedule,
             LastViewMode::FiveDay => ViewMode::FiveDay,
             LastViewMode::Month => ViewMode::Month,
             LastViewMode::Custom if !restored_custom_dates.is_empty() => ViewMode::Custom,
@@ -766,7 +786,7 @@ impl Component for App {
         // through the exact same, already-correct logic a normal view switch uses.
         match (restored_view, restored_custom_dates.is_empty()) {
             (ViewMode::Custom, false) => sender.input(AppMsg::SetCustomViewDates(restored_custom_dates)),
-            (ViewMode::Year, _) | (ViewMode::Day, _) | (ViewMode::Week, _) | (ViewMode::FiveDay, _) => sender.input(AppMsg::SetView(restored_view)),
+            (ViewMode::Schedule, _) | (ViewMode::Table, _) | (ViewMode::Year, _) | (ViewMode::Day, _) | (ViewMode::Week, _) | (ViewMode::FiveDay, _) => sender.input(AppMsg::SetView(restored_view)),
             (ViewMode::Month, _) if restored_date != today => sender.input(AppMsg::JumpToDate(restored_date)),
             _ => {}
         }
@@ -950,6 +970,11 @@ impl Component for App {
                 match self.current_view {
                     ViewMode::Month => self.current_date = shift_month(self.current_date, -1),
                     ViewMode::Day => self.current_date -= Duration::days(1),
+                    ViewMode::Schedule => self.current_date -= Duration::days(30),
+                    ViewMode::Table => {
+                        let days = load_settings(&self.core.storage).unwrap_or_default().schedule_range_days.max(1);
+                        self.current_date -= Duration::days(days as i64);
+                    }
                     ViewMode::Year => self.current_date = shift_month(self.current_date, -12),
                     ViewMode::Week => self.current_date -= Duration::days(7),
                     ViewMode::FiveDay => {
@@ -977,6 +1002,11 @@ impl Component for App {
                 match self.current_view {
                     ViewMode::Month => self.current_date = shift_month(self.current_date, 1),
                     ViewMode::Day => self.current_date += Duration::days(1),
+                    ViewMode::Schedule => self.current_date += Duration::days(30),
+                    ViewMode::Table => {
+                        let days = load_settings(&self.core.storage).unwrap_or_default().schedule_range_days.max(1);
+                        self.current_date += Duration::days(days as i64);
+                    }
                     ViewMode::Year => self.current_date = shift_month(self.current_date, 12),
                     ViewMode::Week => self.current_date += Duration::days(7),
                     ViewMode::FiveDay => {
@@ -1001,7 +1031,7 @@ impl Component for App {
             }
             AppMsg::SetView(view) => {
                 self.current_view = view;
-                if view == ViewMode::Year && !root.is_maximized() {
+                if matches!(view, ViewMode::Year | ViewMode::Table) && !root.is_maximized() {
                     root.set_default_width(root.width().max(1400));
                 }
                 widgets.month_view_container.set_visible(view == ViewMode::Month);
@@ -1020,7 +1050,7 @@ impl Component for App {
                         ViewMode::Week => week_window(self.current_date, settings.show_weekends, settings.start_of_week),
                         ViewMode::FiveDay => five_day_window(self.current_date, settings.show_weekends),
                         ViewMode::Custom => self.custom_view_dates.clone(),
-                        ViewMode::Month | ViewMode::Year => Vec::new(),
+                        ViewMode::Month | ViewMode::Year | ViewMode::Table | ViewMode::Schedule => Vec::new(),
                     };
                     scroll_day_view_to_default(
                         &self.core.storage,
@@ -1211,6 +1241,8 @@ impl Component for App {
         let mut settings = load_settings(&self.core.storage).unwrap_or_default();
         settings.last_view_mode = match self.current_view {
             ViewMode::Day => LastViewMode::Day,
+            ViewMode::Table => LastViewMode::Table,
+            ViewMode::Schedule => LastViewMode::Agenda,
             ViewMode::Year => LastViewMode::Year,
             ViewMode::Week => LastViewMode::Week,
             ViewMode::FiveDay => LastViewMode::FiveDay,
@@ -1294,9 +1326,17 @@ impl App {
                 current_panel: self.open_editor_panel.clone(),
             },
         };
+        widgets.schedule_view_container.set_visible(self.current_view == ViewMode::Schedule);
+        if self.current_view == ViewMode::Schedule {
+            schedule::populate(&widgets.schedule_view_container, self.current_date, &events, &ctx);
+        }
+        widgets.table_view_container.set_visible(self.current_view == ViewMode::Table);
+        if self.current_view == ViewMode::Table {
+            table::populate(&widgets.table_view_container, self.current_date, &events, &settings, &ctx);
+        }
         widgets.year_view_container.set_visible(self.current_view == ViewMode::Year);
         widgets.month_view_container.set_visible(self.current_view == ViewMode::Month);
-        widgets.day_view_container.set_visible(!matches!(self.current_view, ViewMode::Month | ViewMode::Year));
+        widgets.day_view_container.set_visible(!matches!(self.current_view, ViewMode::Month | ViewMode::Year | ViewMode::Table | ViewMode::Schedule));
         if self.current_view == ViewMode::Year {
             populate_year_view(&widgets.year_months, self.current_date, today, &events, &settings, &ctx);
         }
@@ -1305,7 +1345,7 @@ impl App {
             ViewMode::Week => week_window(self.current_date, settings.show_weekends, settings.start_of_week),
             ViewMode::FiveDay => five_day_window(self.current_date, settings.show_weekends),
             ViewMode::Custom => self.custom_view_dates.clone(),
-            ViewMode::Day | ViewMode::Month | ViewMode::Year => vec![self.current_date],
+            ViewMode::Day | ViewMode::Month | ViewMode::Year | ViewMode::Table | ViewMode::Schedule => vec![self.current_date],
         };
         // Day view body first: it measures the hour grid's real gutter width, which
         // the header row and all-day strip then align their own gutter column to.
@@ -1331,6 +1371,8 @@ impl App {
         );
         self.refresh_mini_calendar(widgets, sender);
         let title = match self.current_view {
+            ViewMode::Schedule => date_span_title(self.current_date, self.current_date + Duration::days(29)),
+            ViewMode::Table => table::range_title(self.current_date, settings.schedule_range_days),
             ViewMode::Year => self.current_date.year().to_string(),
             ViewMode::Month => self.current_date.format("%B %Y").to_string(),
             ViewMode::Day => self.current_date.format("%A, %B %-d, %Y").to_string(),
@@ -1614,11 +1656,7 @@ fn focus_is_editable(widget: &gtk4::Widget) -> bool {
     widget.root().and_then(|root| root.focus()).is_some_and(|focus| focus.is::<gtk4::Text>() || focus.is::<gtk4::TextView>())
 }
 
-/// Binds Google Calendar's own single-letter view shortcuts (DESIGN_SPEC.md §10/§12's
-/// "reused as-is" scheme) for the views that actually exist yet — `d` for Day, `m` for
-/// Month, `w` for Week, `y` for Year, `x` for 5-day. `a` stays unbound, matching the shortcuts legend's
-/// "documents the full intended scheme rather than only what's implemented so far"
-/// note (see `SHORTCUT_GROUPS`), until Schedule view lands (§19).
+/// Binds D/W/M/Y/L/A/X to Day/Week/Month/Year/Table/Schedule/5-day views.
 ///
 /// `Global` scope, same as `install_search_shortcut`/`install_preferences_shortcut`, so
 /// it fires while the month grid or day view has focus rather than only the window
@@ -1630,7 +1668,7 @@ fn install_view_shortcuts(root: &impl IsA<gtk4::Widget>, sender: &ComponentSende
     let controller = gtk4::ShortcutController::new();
     controller.set_scope(gtk4::ShortcutScope::Global);
 
-    for (key, view) in [("y", ViewMode::Year), ("w", ViewMode::Week), ("d", ViewMode::Day), ("m", ViewMode::Month), ("x", ViewMode::FiveDay)] {
+    for (key, view) in [("a", ViewMode::Schedule), ("l", ViewMode::Table), ("y", ViewMode::Year), ("w", ViewMode::Week), ("d", ViewMode::Day), ("m", ViewMode::Month), ("x", ViewMode::FiveDay)] {
         let sender = sender.clone();
         controller.add_shortcut(gtk4::Shortcut::new(
             gtk4::ShortcutTrigger::parse_string(key),
@@ -3865,6 +3903,8 @@ fn system_timezone_abbreviation(now: DateTime<Local>) -> String {
 /// similar UI-only mappings.
 fn view_mode_label(view: ViewMode) -> &'static str {
     match view {
+        ViewMode::Table => "Table",
+        ViewMode::Schedule => "Schedule",
         ViewMode::Year => "Year",
         ViewMode::Week => "Week",
         ViewMode::Month => "Month",
@@ -3874,28 +3914,17 @@ fn view_mode_label(view: ViewMode) -> &'static str {
     }
 }
 
-/// One row of the header bar's view-switcher popover (`build_view_switcher_popover`):
-/// either a live view, wired to `AppMsg::SetView` with its single-letter accelerator
-/// (`install_view_shortcuts`), or a disabled "coming soon" placeholder for a view that
-/// doesn't exist yet.
-enum SwitcherRow {
-    Live(ViewMode, &'static str),
-    ComingSoon,
-}
-
 /// One row of the view-switcher popover's view-option checkbox group: a label, a
 /// getter, and a setter for one `AppSettings` field — keeps `build_view_switcher_popover`
 /// from needing three near-identical `gtk4::CheckButton` blocks.
 type SettingsCheckboxSpec = (&'static str, fn(&AppSettings) -> bool, fn(&mut AppSettings, bool));
 
 /// Builds the header bar's view-switcher popover (DESIGN_SPEC.md §10): an ordered list
-/// of view rows — Schedule/Day/5 day/Week/Month/Year, matching the reference
+/// of view rows — Day/Week/Month/Year/Table/Schedule/5 day, matching the requested
 /// screenshot's order — followed by a separator and the "Show weekends"/"Show declined
 /// events"/"Show completed tasks" view-option checkboxes it also shows in the same
-/// dropdown. Day, Week, Year, 5 day, and Month are live, wired to `AppMsg::SetView`;
-/// Schedule stays a disabled "coming soon" row, matching the treatment
-/// `calendar_customizer_button` gives "Settings and sharing", until those views exist
-/// (§19's phased roadmap). Each live row also carries its single-letter accelerator in
+/// dropdown. All view rows are wired to `AppMsg::SetView`.
+/// Each row also carries its single-letter accelerator in
 /// a right-aligned `.shortcut-key` badge (`menu_row_button_with_hotkey`), so the hotkey
 /// is discoverable straight from the menu rather than only from the `?` shortcuts
 /// window. Built once in `init` (mirroring `calendar_customizer_button`'s imperative-
@@ -3915,34 +3944,23 @@ fn build_view_switcher_popover(sender: &ComponentSender<App>, storage: &Storage)
     root.set_margin_all(6);
     root.set_width_request(200);
 
-    for (label, row) in [
-        ("Schedule", SwitcherRow::ComingSoon),
-        ("Day", SwitcherRow::Live(ViewMode::Day, "D")),
-        ("5 day", SwitcherRow::Live(ViewMode::FiveDay, "X")),
-        ("Week", SwitcherRow::Live(ViewMode::Week, "W")),
-        ("Month", SwitcherRow::Live(ViewMode::Month, "M")),
-        ("Year", SwitcherRow::Live(ViewMode::Year, "Y")),
+    for (label, view, key) in [
+        ("Day", ViewMode::Day, "D"),
+        ("Week", ViewMode::Week, "W"),
+        ("Month", ViewMode::Month, "M"),
+        ("Year", ViewMode::Year, "Y"),
+        ("Table", ViewMode::Table, "L"),
+        ("Schedule", ViewMode::Schedule, "A"),
+        ("5 day", ViewMode::FiveDay, "X"),
     ] {
-        match row {
-            SwitcherRow::Live(view, key) => {
-                let button = menu_row_button_with_hotkey(label, key);
-                let sender = sender.clone();
-                let popover_weak = popover.downgrade();
-                button.connect_clicked(move |_| {
-                    sender.input(AppMsg::SetView(view));
-                    if let Some(popover) = popover_weak.upgrade() {
-                        popover.popdown();
-                    }
-                });
-                root.append(&button);
-            }
-            SwitcherRow::ComingSoon => {
-                let disabled = gtk4::Label::new(Some(&format!("{label} (coming soon)")));
-                disabled.set_halign(gtk4::Align::Start);
-                disabled.set_sensitive(false);
-                root.append(&disabled);
-            }
-        }
+        let button = menu_row_button_with_hotkey(label, key);
+        let sender = sender.clone();
+        let popover_weak = popover.downgrade();
+        button.connect_clicked(move |_| {
+            sender.input(AppMsg::SetView(view));
+            if let Some(popover) = popover_weak.upgrade() { popover.popdown(); }
+        });
+        root.append(&button);
     }
 
     root.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
@@ -8468,14 +8486,7 @@ struct ShortcutGroup {
     items: &'static [(&'static str, &'static str)],
 }
 
-/// The bindings DESIGN_SPEC.md §10 defines for Calendarchy's keyboard navigation —
-/// the header bar's `?` button (and, per §12, the `?` key itself) opens a read-only
-/// cheat sheet listing exactly this set. Not every entry is wired up yet
-/// (Schedule view is a later roadmap phase, §19 —
-/// D/W/M/Y/X are live, see `install_view_shortcuts`), but the legend documents the full
-/// intended scheme rather than only what's implemented so far — the same "coming
-/// soon" treatment the sidebar and header bar already give other not-yet-built
-/// features.
+/// The keyboard navigation cheat sheet, available from the header and `?`.
 const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
     ShortcutGroup {
         title: "Navigation",
@@ -8492,6 +8503,7 @@ const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             ("W", "Week view"),
             ("M", "Month view"),
             ("Y", "Year view"),
+            ("L", "Table view"),
             ("A", "Schedule view"),
             ("X", "5-day view"),
         ],
@@ -10311,7 +10323,7 @@ fn show_preferences_window(ctx: SettingsCtx) {
     layout_group.add(
         &adw::ActionRow::builder()
             .title("Default view on launch")
-            .subtitle("Month — Day and 5-day views exist now but aren't selectable here yet; Schedule is still on the roadmap")
+            .subtitle("Month — the last active view is restored when the app starts")
             .build(),
     );
 
@@ -11129,6 +11141,26 @@ fn load_static_css() {
             font-size: 0.95em;
             font-weight: 700;
             margin-bottom: 4px;
+        }
+        .schedule-date {
+            padding: 4px 8px;
+        }
+        .schedule-date-number {
+            font-size: 1.65em;
+            font-weight: 600;
+        }
+        .schedule-date-detail {
+            font-size: 0.9em;
+            font-weight: 500;
+            letter-spacing: 1px;
+            opacity: 0.75;
+        }
+        .schedule-date-today .schedule-date-number {
+            color: @accent_fg_color;
+            background-color: @accent_bg_color;
+            border-radius: 999px;
+            min-width: 36px;
+            min-height: 36px;
         }
         .year-day-with-events {
             font-weight: 800;
