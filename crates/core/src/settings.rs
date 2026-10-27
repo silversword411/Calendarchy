@@ -220,8 +220,8 @@ pub struct AppSettings {
     /// reflects the other's changes.
     pub day_time_scale_minutes: i64,
     /// Snap granularity (minutes) for a Day view drag while Ctrl is held — one of two
-    /// configurable overrides of the plain-drag default (which snaps to
-    /// `day_time_scale_minutes`'s gridlines instead). Checked live for the whole
+    /// configurable overrides of the plain-drag default (15-minute increments).
+    /// Checked live for the whole
     /// gesture (`crates/app/src/main.rs`'s `install_day_event_drag`), not just at
     /// drag-start, so releasing/re-pressing Ctrl mid-drag changes the snap immediately.
     pub day_drag_snap_ctrl_minutes: i64,

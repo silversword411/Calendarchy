@@ -2998,6 +2998,17 @@ fn populate_month_grid(
         if date == today {
             date_label.add_css_class("today-badge");
         }
+        date_label.set_cursor_from_name(Some("pointer"));
+        date_label.set_tooltip_text(Some("Open day view"));
+        let date_click = gtk4::GestureClick::new();
+        date_click.set_button(gtk4::gdk::BUTTON_PRIMARY);
+        let sender = ctx.sender.clone();
+        date_click.connect_released(move |gesture, _, _, _| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            sender.input(AppMsg::JumpToDate(date));
+            sender.input(AppMsg::SetView(ViewMode::Day));
+        });
+        date_label.add_controller(date_click);
         cell.append(&date_label);
 
         let date_key = date.format("%Y-%m-%d").to_string();
@@ -4210,7 +4221,7 @@ fn compute_day_create_range(anchor_min: f64, current_min: f64, snap_minutes: i64
 /// transparent, full-size surface to `overlay` (beneath the event blocks, see
 /// `populate_day_view`) owning a `GestureDrag`. Pressing in a day column and dragging
 /// paints a live preview block over the swept time range (`compute_day_create_range`,
-/// snapped per `day_drag_snap_scale` — the time-scale gridlines by default, or the
+/// snapped per `day_drag_snap_scale` — 15-minute increments by default, or the
 /// Ctrl/Ctrl+Shift overrides, same as moving an event); releasing opens
 /// `show_edit_event_dialog` for a brand-new event (`default_new_event`, so the default
 /// calendar/reminder still apply) covering exactly that range. A press that never
@@ -4256,7 +4267,7 @@ fn install_day_create_drag(
     let time_format = ctx.time_format;
 
     let range_for = move |gesture: &gtk4::GestureDrag, anchor_min: f64, offset_y: f64| {
-        let snap = day_drag_snap_scale(gesture.current_event_state(), scale_minutes, ctrl_snap_minutes, ctrl_shift_snap_minutes)
+        let snap = day_drag_snap_scale(gesture.current_event_state(), ctrl_snap_minutes, ctrl_shift_snap_minutes)
             .unwrap_or(scale_minutes);
         compute_day_create_range(anchor_min, anchor_min + offset_y / pixels_per_minute, snap)
     };
@@ -4884,7 +4895,7 @@ fn classify_day_drag_zone(y: f64, card_height: i32) -> DayDragZone {
 /// gesture's current modifier state: Ctrl+Shift held snaps to `ctrl_shift_minutes`
 /// (`AppSettings::day_drag_snap_ctrl_shift_minutes`, 1 minute by default), plain Ctrl to
 /// `ctrl_minutes` (`day_drag_snap_ctrl_minutes`, 5 by default), and neither to
-/// `scale_minutes` (the Day view's own time-scale gridlines). Checking the Ctrl+Shift
+/// 15-minute increments. Checking the Ctrl+Shift
 /// combo before plain Ctrl matters — `state.contains(CONTROL_MASK)` alone is also `true`
 /// when Shift is additionally held, so the more specific combo has to be tested first to
 /// resolve to the finer tier. Shared by `install_day_event_drag`'s `connect_drag_update`
@@ -4892,7 +4903,6 @@ fn classify_day_drag_zone(y: f64, card_height: i32) -> DayDragZone {
 /// its persisted result always agree.
 fn day_drag_snap_scale(
     state: gtk4::gdk::ModifierType,
-    scale_minutes: i64,
     ctrl_minutes: i64,
     ctrl_shift_minutes: i64,
 ) -> Option<i64> {
@@ -4901,7 +4911,7 @@ fn day_drag_snap_scale(
     } else if state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
         Some(ctrl_minutes)
     } else {
-        Some(scale_minutes)
+        Some(15)
     }
 }
 
@@ -5123,7 +5133,7 @@ fn commit_day_drag(event_id: i64, result: &DayDragResult, ctx: &EventCtx) {
 /// classifies the press into a `DayDragZone` (`classify_day_drag_zone`) and snapshots
 /// the event's pre-drag start/end; `connect_drag_update` live-mutates `card`'s
 /// geometry/time-bubble label on every pointer move (`apply_day_drag_geometry`, snapped
-/// per `day_drag_snap_scale` — the current time-scale gridline by default, or one of the
+/// per `day_drag_snap_scale` — 15-minute increments by default, or one of the
 /// two configurable overrides while Ctrl/Ctrl+Shift is held, checked live via
 /// `current_event_state()` — same convention `install_day_zoom_controller` uses for its
 /// own Ctrl+scroll check) without ever touching `AppMsg`; `connect_drag_end`, if total
@@ -5170,7 +5180,7 @@ fn install_day_event_drag(
     card_width: i32,
     card_margin_start: i32,
     pixels_per_minute: f64,
-    scale_minutes: i64,
+    _scale_minutes: i64,
     ctrl_snap_minutes: i64,
     ctrl_shift_snap_minutes: i64,
     hold_ms: i64,
@@ -5262,7 +5272,7 @@ fn install_day_event_drag(
             // flips the snap granularity immediately — same convention
             // `install_day_zoom_controller` already uses for its own Ctrl+scroll check.
             let scale =
-                day_drag_snap_scale(gesture.current_event_state(), scale_minutes, ctrl_snap_minutes, ctrl_shift_snap_minutes);
+                day_drag_snap_scale(gesture.current_event_state(), ctrl_snap_minutes, ctrl_shift_snap_minutes);
             let result = compute_day_drag_times(
                 state,
                 offset_x,
@@ -5339,7 +5349,7 @@ fn install_day_event_drag(
             // `connect_drag_update`'s own live check, so the persisted value always
             // matches what was last shown on screen).
             let scale =
-                day_drag_snap_scale(gesture.current_event_state(), scale_minutes, ctrl_snap_minutes, ctrl_shift_snap_minutes);
+                day_drag_snap_scale(gesture.current_event_state(), ctrl_snap_minutes, ctrl_shift_snap_minutes);
             let result = compute_day_drag_times(
                 &state,
                 offset_x,
