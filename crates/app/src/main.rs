@@ -3519,15 +3519,12 @@ fn all_day_arrow_head(color: Option<&str>, points_right: bool) -> gtk4::DrawingA
     area
 }
 
-/// Max gap `wire_event_click`/`install_day_event_drag` wait after a first click before
-/// giving up on it turning into a double-click and actually popping `show_event_popover`
-/// open — both defer that popover by this long (`gtk4::glib::timeout_add_local_once`,
-/// same debounce idiom `install_sidebar_resize_persistence` uses for its own
-/// cancel-and-reschedule timer) so a genuine double-click can cancel the pending
-/// popover and call `open_event_editor` instead, with the popover never having been
-/// shown at all. 400ms matches the default `gtk-double-click-time` most GTK apps ship
-/// with.
-const EVENT_DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+/// Match the desktop's double-click interval, with a small scheduling margin so
+/// the single-click popover cannot steal the second press at the boundary.
+fn event_double_click_window() -> std::time::Duration {
+    let millis = gtk4::Settings::default().map(|s| s.gtk_double_click_time()).unwrap_or(400).max(1);
+    std::time::Duration::from_millis(millis as u64 + 50)
+}
 
 /// Wires an on-grid event row (built by `event_row`) so a single click pops up
 /// `show_event_popover` anchored to it — the "nice summary with other controls" the
@@ -3540,33 +3537,33 @@ fn wire_event_click(row: &gtk4::Box, event: &DisplayEvent, ctx: &EventCtx) {
     let anchor = row.clone();
     let event = event.clone();
     let ctx = ctx.clone();
-    // The popover from a first press is deferred by `EVENT_DOUBLE_CLICK_WINDOW` rather
-    // than shown immediately: GTK's `GestureClick` fires `pressed` once per physical
-    // press (`n_press == 1` for the first, `n_press == 2` for the second of a
-    // double-click), so showing the popover synchronously on every press would make it
-    // visibly flash open before the edit dialog replaced it. Deferring lets the
-    // `n_press >= 2` branch cancel that pending popover outright, so a double-click
-    // never shows it at all.
+    gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
     let pending_popover: Rc<Cell<Option<gtk4::glib::SourceId>>> = Rc::new(Cell::new(None));
-    gesture.connect_pressed(move |gesture, n_press, _x, _y| {
-        gesture.set_state(gtk4::EventSequenceState::Claimed);
-        if n_press >= 2 {
-            if let Some(id) = pending_popover.take() {
-                id.remove();
+    {
+        let pending_popover = pending_popover.clone();
+        gesture.connect_pressed(move |gesture, n_press, _, _| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            if n_press >= 2 {
+                if let Some(id) = pending_popover.take() { id.remove(); }
             }
+        });
+    }
+    gesture.connect_released(move |_, n_press, _, _| {
+        if let Some(id) = pending_popover.take() { id.remove(); }
+        if n_press == 2 {
             open_event_editor(event.id, &ctx);
             return;
         }
-        if let Some(id) = pending_popover.take() {
-            id.remove();
-        }
-        let anchor = anchor.clone();
+        if n_press > 2 { return; }
+        let anchor = anchor.downgrade();
         let event = event.clone();
         let ctx = ctx.clone();
         let pending_popover_for_timer = pending_popover.clone();
-        let id = gtk4::glib::timeout_add_local_once(EVENT_DOUBLE_CLICK_WINDOW, move || {
+        let id = gtk4::glib::timeout_add_local_once(event_double_click_window(), move || {
             pending_popover_for_timer.set(None);
-            show_event_popover(&anchor, &event, &ctx);
+            if let Some(anchor) = anchor.upgrade().filter(|a| a.is_mapped()) {
+                show_event_popover(&anchor, &event, &ctx);
+            }
         });
         pending_popover.set(Some(id));
     });
@@ -5385,7 +5382,7 @@ fn commit_day_drag(event_id: i64, result: &DayDragResult, ctx: &EventCtx) {
 /// own Ctrl+scroll check) without ever touching `AppMsg`; `connect_drag_end`, if total
 /// movement stayed under
 /// `DAY_EVENT_CLICK_MOVE_THRESHOLD_PX`, treats it as a plain click — deferring
-/// `show_event_popover` by `EVENT_DOUBLE_CLICK_WINDOW` exactly like `wire_event_click`
+/// `show_event_popover` by `event_double_click_window` exactly like `wire_event_click`
 /// does, so a second such click arriving before that timer fires cancels the pending
 /// popover and calls `open_event_editor` instead, rather than committing a move/resize
 /// (`commit_day_drag`, snapped the same way — matching whichever granularity was in
@@ -5438,10 +5435,11 @@ fn install_day_event_drag(
 ) {
     let gesture = gtk4::GestureDrag::new();
     let drag_state: Rc<RefCell<Option<DayDragState>>> = Rc::new(RefCell::new(None));
-    // The popover for a plain-click release is deferred by `EVENT_DOUBLE_CLICK_WINDOW`
+    // The popover for a plain-click release is deferred by `event_double_click_window`
     // rather than shown immediately — see `wire_event_click`'s doc comment for why —
     // so a following double-click can cancel it via this handle before it ever shows.
     let pending_popover: Rc<Cell<Option<gtk4::glib::SourceId>>> = Rc::new(Cell::new(None));
+    let second_click = Rc::new(Cell::new(false));
     // `AppSettings::day_drag_hold_ms`'s hold gate: move/resize only actually engages
     // (cursor change, `drag_hint`, and `connect_drag_update` applying geometry) once
     // a press has been held this long — `held_engaged` tracks whether that's
@@ -5458,8 +5456,15 @@ fn install_day_event_drag(
         let drag_state = drag_state.clone();
         let held_engaged = held_engaged.clone();
         let hold_timer = hold_timer.clone();
+        let pending_popover = pending_popover.clone();
+        let second_click = second_click.clone();
         gesture.connect_drag_begin(move |gesture, _start_x, start_y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
+            // Cancel at the second press, before its release can race the timer.
+            second_click.set(if let Some(id) = pending_popover.take() {
+                id.remove();
+                true
+            } else { false });
             let start = DateTime::parse_from_rfc3339(&event.start).ok().map(|d| d.with_timezone(&Local));
             let end = DateTime::parse_from_rfc3339(&event.end).ok().map(|d| d.with_timezone(&Local));
             let (Some(original_start), Some(original_end)) = (start, end) else { return };
@@ -5555,6 +5560,7 @@ fn install_day_event_drag(
         let held_engaged = held_engaged.clone();
         let hold_timer = hold_timer.clone();
         let pending_popover = pending_popover.clone();
+        let second_click = second_click.clone();
         let dates = dates.clone();
         gesture.connect_drag_end(move |gesture, offset_x, offset_y| {
             if let Some(id) = hold_timer.take() {
@@ -5565,10 +5571,7 @@ fn install_day_event_drag(
             let Some(state) = drag_state.borrow_mut().take() else { return };
             let moved = (offset_x * offset_x + offset_y * offset_y).sqrt();
             if moved < DAY_EVENT_CLICK_MOVE_THRESHOLD_PX {
-                if let Some(id) = pending_popover.take() {
-                    // A popover from the previous click is still pending: this is its
-                    // double-click, so cancel that popover and edit instead.
-                    id.remove();
+                if second_click.replace(false) {
                     open_event_editor(event.id, &ctx);
                     return;
                 }
@@ -5576,7 +5579,7 @@ fn install_day_event_drag(
                 let event = event.clone();
                 let ctx = ctx.clone();
                 let pending_popover_for_timer = pending_popover.clone();
-                let id = gtk4::glib::timeout_add_local_once(EVENT_DOUBLE_CLICK_WINDOW, move || {
+                let id = gtk4::glib::timeout_add_local_once(event_double_click_window(), move || {
                     pending_popover_for_timer.set(None);
                     show_event_popover(&card, &event, &ctx);
                 });
@@ -6156,6 +6159,9 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
 
     let save_btn = gtk4::Button::with_label("Save");
     save_btn.add_css_class("suggested-action");
+    save_btn.add_css_class("pill");
+    save_btn.add_css_class("header-control");
+    save_btn.set_valign(gtk4::Align::Center);
     header.append(&save_btn);
     header.append(&more_actions_button(&event, &calendars, &ctx, &panel_root));
 
@@ -6551,7 +6557,9 @@ fn show_edit_event_dialog(event: EventDetail, calendars: Vec<CalendarSummary>, c
 fn more_actions_button(event: &EventDetail, calendars: &[CalendarSummary], ctx: &EventCtx, panel_root: &adw::ToolbarView) -> gtk4::MenuButton {
     let button = gtk4::MenuButton::new();
     button.set_label("More actions");
-    button.add_css_class("flat");
+    button.add_css_class("pill");
+    button.add_css_class("header-control");
+    button.set_valign(gtk4::Align::Center);
 
     let popover = gtk4::Popover::new();
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
@@ -11330,7 +11338,9 @@ fn load_static_css() {
            horizontal padding stays stock. A MenuButton's real clickable node is its
            inner `button`, hence the `menubutton … > button` selectors. */
         .main-headerbar button.header-control,
-        .main-headerbar menubutton.header-control > button {
+        .main-headerbar menubutton.header-control > button,
+        .event-editor-header button.header-control,
+        .event-editor-header menubutton.header-control > button {
             min-height: 22px;
             padding-top: 4px;
             padding-bottom: 4px;
@@ -11339,7 +11349,9 @@ fn load_static_css() {
             min-height: 30px;
         }
         .compact-density .main-headerbar button.header-control,
-        .compact-density .main-headerbar menubutton.header-control > button {
+        .compact-density .main-headerbar menubutton.header-control > button,
+        .compact-density .event-editor-header button.header-control,
+        .compact-density .event-editor-header menubutton.header-control > button {
             min-height: 20px;
             padding-top: 2px;
             padding-bottom: 2px;
